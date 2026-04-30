@@ -47,7 +47,10 @@ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 # export SMTP_PASSWORD="SMTP key"
 # export MAIL_FROM="Section Fitness <tonadresse@gmail.com>"
 SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+try:
+    SMTP_PORT = int(str(os.getenv("SMTP_PORT", "465")).strip().strip('"').strip("'"))
+except ValueError:
+    SMTP_PORT = 465
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "section-fitness@local")
@@ -486,41 +489,41 @@ def admin_email_signature_html(body):
 
 
 def send_email(to, subject, body, attachments=None, html_body=None, inline_images=None):
-    attachments = attachments or []
-    inline_images = inline_images or {}
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
-        print("\n--- EMAIL NON ENVOYÉ : SMTP NON CONFIGURÉ ---")
-        print("To:", to)
-        print("Subject:", subject)
-        print(body)
-        if html_body:
-            print("HTML:", html_body)
-        for cid, image_path in inline_images.items():
-            print("Inline image:", cid, image_path)
-        for attachment_path in attachments:
-            print("Attachment:", attachment_path)
-        print("--------------------------------------------\n")
-        return False
-
-    msg = EmailMessage()
-    msg["From"] = MAIL_FROM
-    msg["To"] = to
-    msg["Subject"] = subject
-    msg.set_content(body)
-    if html_body:
-        msg.add_alternative(html_body, subtype="html")
-        html_part = msg.get_payload()[-1]
-        for cid, image_path in inline_images.items():
-            path = Path(image_path)
-            if path.exists():
-                html_part.add_related(path.read_bytes(), maintype="image", subtype=path.suffix.lstrip(".").lower() or "png", cid=f"<{cid}>")
-
-    for attachment_path in attachments:
-        path = Path(attachment_path)
-        if path.exists():
-            msg.add_attachment(path.read_bytes(), maintype="image", subtype="png", filename=path.name)
-
     try:
+        attachments = attachments or []
+        inline_images = inline_images or {}
+        if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
+            print("\n--- EMAIL NON ENVOYÉ : SMTP NON CONFIGURÉ ---")
+            print("To:", to)
+            print("Subject:", subject)
+            print(body)
+            if html_body:
+                print("HTML:", html_body)
+            for cid, image_path in inline_images.items():
+                print("Inline image:", cid, image_path)
+            for attachment_path in attachments:
+                print("Attachment:", attachment_path)
+            print("--------------------------------------------\n")
+            return False
+
+        msg = EmailMessage()
+        msg["From"] = MAIL_FROM
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.set_content(body)
+        if html_body:
+            msg.add_alternative(html_body, subtype="html")
+            html_part = msg.get_payload()[-1]
+            for cid, image_path in inline_images.items():
+                path = Path(image_path)
+                if path.exists():
+                    html_part.add_related(path.read_bytes(), maintype="image", subtype=path.suffix.lstrip(".").lower() or "png", cid=f"<{cid}>")
+
+        for attachment_path in attachments:
+            path = Path(attachment_path)
+            if path.exists():
+                msg.add_attachment(path.read_bytes(), maintype="image", subtype="png", filename=path.name)
+
         context = ssl.create_default_context(cafile=certifi.where())
 
         if SMTP_PORT == 465:
@@ -1782,6 +1785,17 @@ def export_excel():
     wb.save(file)
     file.seek(0)
     return send_file(file, as_attachment=True, download_name="presences_fitness.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route("/admin/email-diagnostic")
+@login_required
+def admin_email_diagnostic():
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    ok = send_email(current_user.email, "Test email Section Fitness", "Bonjour,\n\nCeci est un test d'envoi email depuis la Section Fitness.\n\nSection Fitness")
+    flash("Email test envoyé. Vérifiez votre boîte mail." if ok else "Email test non envoyé. Vérifiez les variables SMTP dans Render et les logs.")
+    return redirect(url_for("index"))
 
 
 @app.route("/infos-utiles", methods=["GET", "POST"])

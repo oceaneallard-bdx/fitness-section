@@ -39,9 +39,10 @@ SMTP_PORT=587
 SMTP_USER=<utilisateur SMTP Brevo>
 SMTP_PASSWORD=<mot de passe SMTP Brevo>
 MAIL_FROM=Section Fitness <adresse@email.fr>
+BREVO_API_KEY=<clé API Brevo recommandée sur Render Free>
 ```
 
-Le port `587` utilise STARTTLS. Le port `465` reste compatible avec SMTP_SSL.
+Sur Render Free, les ports SMTP `25`, `465` et `587` peuvent être bloqués. La variable `BREVO_API_KEY` est donc recommandée : l'application envoie alors les emails via l'API HTTPS de Brevo. Le SMTP reste disponible en local ou sur une instance Render payante.
 
 Au premier accès au site, l'application crée automatiquement les tables et le compte admin initial si la base PostgreSQL est vide. Si `ADMIN_EMAIL` et `ADMIN_PASSWORD` ne sont pas définis, les identifiants de secours sont :
 

@@ -3,12 +3,17 @@ from calendar import monthrange
 from html import escape
 from io import BytesIO
 from pathlib import Path
+import base64
+import json
 import os
 import re
 import secrets
 import smtplib
 import ssl
+import urllib.error
+import urllib.request
 import certifi
+from email.utils import parseaddr
 from email.message import EmailMessage
 
 from flask import Flask, render_template_string, redirect, url_for, request, flash, send_file
@@ -58,6 +63,7 @@ except ValueError:
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "section-fitness@local")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 LAST_DAILY_TASK_FILE = BASE_DIR / ".last_daily_fitness_tasks"
 SCHEMA_READY = False
 
@@ -431,6 +437,12 @@ def send_activation_email(user):
     return send_email(user.email, "Activation de votre compte Section Fitness", f"Bonjour {user.display_name()},\n\nVotre compte {role_label} Section Fitness a été pré-enregistré. Merci de créer votre mot de passe avec ce lien :\n{link}\n\nCe lien est valable 14 jours.\n\nSection Fitness")
 
 
+def create_activation_link(user):
+    token = make_activation_token(user)
+    db.session.commit()
+    return url_for("activate_account", token=token, _external=True)
+
+
 def send_password_reset_email(user):
     token = make_activation_token(user)
     db.session.commit()
@@ -492,10 +504,61 @@ def admin_email_signature_html(body):
     return f"""<!doctype html><html><body style="font-family:Arial,sans-serif;font-size:15px;line-height:1.45;color:#111827">{escaped_body}<br><br>Sportivement,<br>Bureau Fitness,{logo_html}</body></html>"""
 
 
+def mail_sender_payload():
+    name, email = parseaddr(MAIL_FROM)
+    if not email:
+        email = MAIL_FROM
+        name = "Section Fitness"
+    payload = {"email": email}
+    if name:
+        payload["name"] = name
+    return payload
+
+
+def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
+    attachments = attachments or []
+    payload = {
+        "sender": mail_sender_payload(),
+        "to": [{"email": to}],
+        "subject": subject,
+        "textContent": body,
+    }
+    if html_body:
+        payload["htmlContent"] = html_body
+
+    api_attachments = []
+    for attachment_path in attachments:
+        path = Path(attachment_path)
+        if path.exists():
+            api_attachments.append({
+                "name": path.name,
+                "content": base64.b64encode(path.read_bytes()).decode("ascii"),
+            })
+    if api_attachments:
+        payload["attachment"] = api_attachments
+
+    request_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=request_data,
+        headers={
+            "accept": "application/json",
+            "api-key": BREVO_API_KEY,
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=SMTP_TIMEOUT, context=ssl.create_default_context(cafile=certifi.where())) as response:
+        return 200 <= response.status < 300
+
+
 def send_email(to, subject, body, attachments=None, html_body=None, inline_images=None):
     try:
         attachments = attachments or []
         inline_images = inline_images or {}
+        if BREVO_API_KEY:
+            return send_email_brevo_api(to, subject, body, attachments=attachments, html_body=html_body)
+
         if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
             print("\n--- EMAIL NON ENVOYÉ : SMTP NON CONFIGURÉ ---")
             print("To:", to)
@@ -545,6 +608,8 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
     except Exception as e:
         print("\n--- ERREUR ENVOI EMAIL ---")
         print(e)
+        if isinstance(e, urllib.error.HTTPError):
+            print(e.read().decode("utf-8", errors="replace"))
         print("--------------------------\n")
         return False
 
@@ -1797,6 +1862,15 @@ def admin_email_diagnostic():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
+    print("\n--- DIAGNOSTIC SMTP ---")
+    print("SMTP_HOST:", SMTP_HOST or "NON DEFINI")
+    print("SMTP_PORT:", SMTP_PORT)
+    print("SMTP_TIMEOUT:", SMTP_TIMEOUT)
+    print("SMTP_USER défini:", bool(SMTP_USER))
+    print("SMTP_PASSWORD défini:", bool(SMTP_PASSWORD))
+    print("MAIL_FROM:", MAIL_FROM)
+    print("BREVO_API_KEY défini:", bool(BREVO_API_KEY))
+    print("-----------------------\n")
     ok = send_email(current_user.email, "Test email Section Fitness", "Bonjour,\n\nCeci est un test d'envoi email depuis la Section Fitness.\n\nSection Fitness")
     flash("Email test envoyé. Vérifiez votre boîte mail." if ok else "Email test non envoyé. Vérifiez les variables SMTP dans Render et les logs.")
     return redirect(url_for("index"))
@@ -2179,8 +2253,12 @@ def admin_office():
             user.set_password(secrets.token_urlsafe(12))
             db.session.add(user)
             db.session.commit()
-            send_activation_email(user)
-            flash("Admin ajouté. Un lien d'activation a été envoyé si le SMTP est configuré.")
+            activation_link = create_activation_link(user)
+            sent = send_email(user.email, "Activation de votre compte Section Fitness", f"Bonjour {user.display_name()},\n\nVotre compte admin Section Fitness a été pré-enregistré. Merci de créer votre mot de passe avec ce lien :\n{activation_link}\n\nCe lien est valable 14 jours.\n\nSection Fitness")
+            if sent:
+                flash("Admin ajouté. Un lien d'activation a été envoyé.")
+            else:
+                flash(f"Admin ajouté. Email non envoyé : copiez ce lien d'activation et envoyez-le manuellement : {activation_link}")
         else:
             user.role = "admin"
             user.full_name = full_name

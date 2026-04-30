@@ -1,0 +1,10 @@
+flask
+flask_sqlalchemy
+flask_login
+werkzeug
+openpyxl
+pillow
+apscheduler
+certifi
+gunicorn
+psycopg2-binary

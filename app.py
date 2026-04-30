@@ -51,6 +51,10 @@ try:
     SMTP_PORT = int(str(os.getenv("SMTP_PORT", "465")).strip().strip('"').strip("'"))
 except ValueError:
     SMTP_PORT = 465
+try:
+    SMTP_TIMEOUT = int(str(os.getenv("SMTP_TIMEOUT", "10")).strip().strip('"').strip("'"))
+except ValueError:
+    SMTP_TIMEOUT = 10
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "section-fitness@local")
@@ -527,11 +531,11 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
         context = ssl.create_default_context(cafile=certifi.where())
 
         if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT, context=context) as server:
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
                 server.starttls(context=context)
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.send_message(msg)

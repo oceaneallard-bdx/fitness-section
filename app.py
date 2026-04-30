@@ -985,6 +985,8 @@ def before_each_request():
         global SCHEMA_READY
         if not SCHEMA_READY:
             ensure_schema()
+            create_default_admin()
+            seed_default_course_templates()
             SCHEMA_READY = True
         run_daily_automation()
 
@@ -2871,13 +2873,16 @@ def ensure_schema():
 
 
 def create_default_admin():
-    admin = User.query.filter_by(email="admin@fitness.local").first()
+    admin_email = os.getenv("ADMIN_EMAIL", "admin@fitness.local").strip().lower()
+    admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
+    admin_name = os.getenv("ADMIN_NAME", "Admin Fitness")
+    admin = User.query.filter_by(email=admin_email).first()
     if not admin:
-        admin = User(email="admin@fitness.local", role="admin", status="autre", full_name="Admin Fitness", admin_role="presidente", account_status="active")
-        admin.set_password("admin123")
+        admin = User(email=admin_email, role="admin", status="autre", full_name=admin_name, admin_role="presidente", account_status="active")
+        admin.set_password(admin_password)
         db.session.add(admin)
         db.session.commit()
-        print("Admin créé : admin@fitness.local / admin123")
+        print(f"Admin créé : {admin_email}")
     elif not admin.admin_role:
         admin.admin_role = "presidente"
         db.session.commit()

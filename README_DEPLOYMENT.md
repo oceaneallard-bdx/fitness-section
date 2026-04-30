@@ -31,6 +31,9 @@ Ajouter aussi les variables suivantes dans Render :
 
 ```bash
 SECRET_KEY=<clé longue et aléatoire>
+ADMIN_EMAIL=<email admin>
+ADMIN_PASSWORD=<mot de passe admin initial>
+ADMIN_NAME=<nom affiché admin>
 SMTP_HOST=<serveur SMTP Brevo>
 SMTP_PORT=587
 SMTP_USER=<utilisateur SMTP Brevo>
@@ -39,6 +42,12 @@ MAIL_FROM=Section Fitness <adresse@email.fr>
 ```
 
 Le port `587` utilise STARTTLS. Le port `465` reste compatible avec SMTP_SSL.
+
+Au premier accès au site, l'application crée automatiquement les tables et le compte admin initial si la base PostgreSQL est vide. Si `ADMIN_EMAIL` et `ADMIN_PASSWORD` ne sont pas définis, les identifiants de secours sont :
+
+```text
+admin@fitness.local / admin123
+```
 
 ## 4. Usage local
 

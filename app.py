@@ -228,6 +228,13 @@ def is_coach_or_admin():
     return current_user.is_authenticated and current_user.role in ["admin", "coach"]
 
 
+def next_url(default_endpoint="index"):
+    target = request.args.get("next") or request.form.get("next")
+    if target and target.startswith("/"):
+        return target
+    return url_for(default_endpoint)
+
+
 def coach_display_names():
     coaches = [c.display_name() for c in User.query.filter_by(role="coach", coach_type="titulaire").order_by(User.full_name, User.email).all()]
     defaults = ["Hayate", "Malika", "Maud", "Mathieu", "Mélanie"]
@@ -491,6 +498,36 @@ def notify_admins_of_coach_absence(coach_name, start_date, end_date, status, rep
     for admin in admins:
         if send_email(admin.email, "Absence / congé coach déclaré", body):
             sent += 1
+    return sent
+
+
+def notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement_name="", notes=""):
+    if status not in ["absent", "conge"]:
+        return 0
+    sessions = CourseSession.query.filter(
+        CourseSession.coach_name == coach_name,
+        CourseSession.course_date >= start_date,
+        CourseSession.course_date <= end_date,
+    ).order_by(CourseSession.course_date, CourseSession.start_time).all()
+    sent = 0
+    for session in sessions:
+        bookings = Booking.query.filter(
+            Booking.session_id == session.id,
+            Booking.status.in_(["booked", "waiting_list"]),
+        ).all()
+        for booking in bookings:
+            body = (
+                f"Bonjour {booking.user.display_name()},\n\n"
+                f"Le coach {coach_name} a déclaré une absence pour le cours {session.course_name} "
+                f"du {session.course_date.strftime('%d/%m/%Y')} à {session.start_time.strftime('%H:%M')}.\n"
+            )
+            if replacement_name:
+                body += f"\nRemplaçant prévu : {replacement_name}.\n"
+            if notes:
+                body += f"\nInformation complémentaire : {notes}\n"
+            body += "\nSection Fitness"
+            if send_email(booking.user.email, "Information cours - absence coach", body):
+                sent += 1
     return sent
 
 
@@ -775,6 +812,42 @@ def waitlist_rank(booking):
 
 def waitlist_capacity(session):
     return session.waitlist_capacity if session.waitlist_capacity is not None else 5
+
+
+def absence_display_label(absence):
+    if not absence:
+        return ""
+    if absence.followup_status == "remplacement_trouve" or absence.status == "replaced":
+        return "remplacé"
+    labels = {"absent": "absent", "conge": "congé", "present": "présent"}
+    return labels.get(absence.status, absence.status)
+
+
+def absence_badge_class(absence):
+    if not absence:
+        return ""
+    if absence.followup_status == "remplacement_trouve" or absence.status in ["present", "replaced"]:
+        return ""
+    if absence.status in ["absent", "conge"]:
+        return "full"
+    return "wait"
+
+
+def absence_blocks_booking(absence):
+    if not absence:
+        return False
+    if absence.followup_status == "remplacement_trouve" or absence.status in ["present", "replaced"]:
+        return False
+    return absence.status in ["absent", "conge"]
+
+
+@app.context_processor
+def template_helpers():
+    return {
+        "absence_badge_class": absence_badge_class,
+        "absence_blocks_booking": absence_blocks_booking,
+        "absence_display_label": absence_display_label,
+    }
 
 
 def user_has_active_booking(user_id, session_id):
@@ -1089,7 +1162,10 @@ def index():
         "members": User.query.filter_by(role="adherent").count(),
         "blocked": User.query.filter(User.blocked_until >= today).count(),
     }
-    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot)
+    latest_bookings = Booking.query.join(CourseSession).join(Booking.user).filter(
+        User.role == "adherent"
+    ).order_by(Booking.created_at.desc(), Booking.id.desc()).limit(12).all() if is_admin() else []
+    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot)
 
 
 @app.route("/admin/statistics")
@@ -1188,6 +1264,58 @@ def member_profile():
     return render_template_string(TEMPLATE_MEMBER_PROFILE, preference_options=preference_options())
 
 
+@app.route("/planning-coachs")
+@login_required
+def member_coach_planning():
+    if current_user.role != "adherent":
+        flash("Accès réservé aux adhérents.")
+        return redirect(url_for("index"))
+    ensure_coach_absence_schema()
+    today = date.today()
+    year = int(request.args.get("year", today.year))
+    month = int(request.args.get("month", today.month))
+    if month < 1 or month > 12:
+        month = today.month
+    start = date(year, month, 1)
+    end = date(year, month, monthrange(year, month)[1])
+    sessions = CourseSession.query.filter(
+        CourseSession.course_date >= start,
+        CourseSession.course_date <= end,
+    ).order_by(CourseSession.course_date, CourseSession.start_time).all()
+    absences = CoachAbsence.query.filter(
+        CoachAbsence.absence_date >= start,
+        CoachAbsence.absence_date <= end,
+    ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
+    abs_by_key = {(a.coach_name, a.absence_date): a for a in absences}
+    coach_names = sorted({s.coach_name for s in sessions if s.coach_name and coach_type_for_name(s.coach_name) == "titulaire"} | set(titular_coach_names()))
+    planning_weekdays = set(get_coach_planning_weekdays())
+    month_days = [start + timedelta(days=i) for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() in planning_weekdays]
+    coach_agenda = {}
+    for session in sessions:
+        if session.coach_name in coach_names:
+            coach_agenda.setdefault((session.coach_name or "-", session.course_date), []).append(session)
+    active_bookings = Booking.query.join(CourseSession).filter(
+        Booking.user_id == current_user.id,
+        Booking.status.in_(["booked", "waiting_list"]),
+        CourseSession.course_date >= start,
+        CourseSession.course_date <= end,
+    ).all()
+    active_booking_by_session = {booking.session_id: booking for booking in active_bookings}
+    return render_template_string(
+        TEMPLATE_MEMBER_COACH_PLANNING,
+        abs_by_key=abs_by_key,
+        active_booking_by_session=active_booking_by_session,
+        booked_count=booked_count,
+        coach_agenda=coach_agenda,
+        coach_names=coach_names,
+        month_days=month_days,
+        waitlist_rank=waitlist_rank,
+        weekday_labels=WEEKDAY_LABELS,
+        year=year,
+        month=month,
+    )
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -1270,18 +1398,19 @@ def logout():
 @login_required
 def book(session_id):
     session = db.session.get(CourseSession, session_id) or CourseSession.query.get_or_404(session_id)
+    redirect_target = next_url()
     if current_user.role != "adherent":
         flash("Seuls les adhérents peuvent réserver.")
-        return redirect(url_for("index"))
+        return redirect(redirect_target)
     if not session.is_reservable:
         flash("Ce cours ne nécessite pas de réservation.")
-        return redirect(url_for("index"))
+        return redirect(redirect_target)
     if current_user.is_blocked():
         flash(f"Vous êtes bloqué jusqu'au {current_user.blocked_until}.")
-        return redirect(url_for("index"))
+        return redirect(redirect_target)
     if monday_midday_priority_applies(session) and current_user.status != "mensuel":
         flash("Priorité réservée aux adhérents mensuels pendant les 7 premiers jours.")
-        return redirect(url_for("index"))
+        return redirect(redirect_target)
 
     booking, result = create_booking_for_user(current_user, session)
     if result == "duplicate":
@@ -1292,26 +1421,27 @@ def book(session_id):
         flash("Réservation confirmée.")
     elif result == "waiting_list":
         flash(f"Cours complet. Vous êtes inscrit en liste d’attente — rang {waitlist_rank(booking)}.")
-    return redirect(url_for("index"))
+    return redirect(redirect_target)
 
 
 @app.route("/cancel/<int:booking_id>")
 @login_required
 def cancel(booking_id):
     booking = Booking.query.get_or_404(booking_id)
+    redirect_target = next_url()
     if booking.user_id != current_user.id and not is_admin():
         flash("Action non autorisée.")
-        return redirect(url_for("index"))
+        return redirect(redirect_target)
     session_datetime = datetime.combine(booking.session.course_date, booking.session.start_time)
     if datetime.now() > session_datetime - timedelta(hours=2):
         flash("Annulation impossible à moins de 2h du cours.")
-        return redirect(url_for("index"))
+        return redirect(redirect_target)
     promoted = cancel_booking_and_promote(booking, cancelled_by_admin=is_admin() and booking.user_id != current_user.id)
     if promoted:
         flash(f"Réservation annulée. {promoted.user.display_name()} a été promu depuis la liste d’attente.")
     else:
         flash("Réservation annulée.")
-    return redirect(url_for("index"))
+    return redirect(redirect_target)
 
 
 @app.route("/admin/generate", methods=["GET", "POST"])
@@ -1680,9 +1810,11 @@ def coach_profile():
         db.session.commit()
         if current_user.role == "coach":
             sent = notify_admins_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
-            flash(f"Absence/congé enregistré sur {saved} jour(s). Email envoyé à {sent} admin(s)." if sent else f"Absence/congé enregistré sur {saved} jour(s). SMTP non configuré : l'email admin apparaît dans la console.")
+            member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
+            flash(f"Absence/congé enregistré sur {saved} jour(s). Email envoyé à {sent} admin(s) et {member_sent} adhérent(s) inscrit(s)." if sent or member_sent else f"Absence/congé enregistré sur {saved} jour(s). Aucun email envoyé.")
         else:
-            flash(f"Absence/congé enregistré sur {saved} jour(s).")
+            member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
+            flash(f"Absence/congé enregistré sur {saved} jour(s). Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else f"Absence/congé enregistré sur {saved} jour(s).")
         return redirect(url_for("coach_profile", coach_name=coach_name))
     today = date.today()
     absences = CoachAbsence.query.filter(
@@ -1720,11 +1852,17 @@ def coach_schedule():
         CoachAbsence.absence_date <= end,
         CoachAbsence.replacement_name.in_(identities),
     ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
+    own_absences = CoachAbsence.query.filter(
+        CoachAbsence.absence_date >= start,
+        CoachAbsence.absence_date <= end,
+        CoachAbsence.coach_name.in_(identities),
+    ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
+    abs_by_key = {(a.coach_name, a.absence_date): a for a in own_absences}
     replacements = []
     for absence in absences:
         session = CourseSession.query.filter_by(coach_name=absence.coach_name, course_date=absence.absence_date).order_by(CourseSession.start_time).first()
         replacements.append({"absence": absence, "session": session})
-    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
+    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/coach/profile/delete/<int:absence_id>")
@@ -1948,6 +2086,7 @@ def shell(content, active=""):
     if current_user.is_authenticated and current_user.role == "adherent":
         member_links = (
             f'<a class="{"active" if active=="member_profile" else ""}" href="{url_for("member_profile")}">Mon profil</a>'
+            f'<a class="{"active" if active=="member_coach_planning" else ""}" href="{url_for("member_coach_planning")}">Planning coachs</a>'
             f'<a class="{"active" if active=="useful_info" else ""}" href="{url_for("useful_info")}">Infos utiles</a>'
         )
     coach_links = ""
@@ -1974,7 +2113,7 @@ TEMPLATE_INDEX = """
 {% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
 {% if current_user.is_blocked() %}<div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Votre compte est bloqué jusqu'au {{ current_user.blocked_until }}.</div>{% endif %}
 <div class="content-grid"><section class="card"><h2>Prochaines séances</h2>{% if current_user.role not in ['admin','coach'] %}<form method="get" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin:12px 0 18px"><h3 style="margin-top:0">Filtres</h3><div class="form-grid"><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if selected_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach</label><select name="coach_filter"><option value="">Tous</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if selected_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau</label><select name="slot_filter"><option value="">Tous</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if selected_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('index') }}">Réinitialiser</a></form>{% endif %}{% for s in sessions %}<div class="session"><div><div class="muted">{{ s.course_date.strftime('%A %d/%m/%Y') }} · {{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</div><strong>{{ s.course_name }}</strong>{% if s.is_reservable %}<div class="muted">{{ booked_count(s) }} / {{ s.capacity }} inscrits</div>{% else %}<div class="muted">Pas de réservation</div>{% endif %}</div><div>{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif booked_count(s) >= s.capacity %}<span class="badge full">Complet</span>{% else %}<span class="badge">{{ s.capacity - booked_count(s) }} places</span>{% endif %}<br><br>{% if current_user.role == 'adherent' and s.is_reservable %}<a class="btn" href="{{ url_for('book', session_id=s.id) }}">Réserver</a>{% endif %}{% if current_user.role in ['admin','coach'] %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}</div></div>{% endfor %}</section>
-<section class="card"><h2>Mes réservations</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th></th></tr>{% for b in current_user.bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Vous êtes en liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">{{ b.status }}</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}">Annuler</a>{% endif %}</td></tr>{% endfor %}</table></section></div>
+{% if current_user.role == 'admin' %}<section class="card"><h2>Dernières actions adhérents</h2><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Cours</th><th>Statut</th><th>Actions</th></tr>{% for b in latest_bookings %}<tr><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td><td>{{ b.user.display_name() }}<br><small class="muted">{{ b.user.email }}</small></td><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% elif b.status == 'booked' %}<span class="badge">Réservé</span>{% else %}<span class="badge full">{{ b.status }}</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Modifier</a>{% if b.status in ['booked','waiting_list'] %} <a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}" onclick="return confirm('Annuler cette réservation ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune réservation récente.</td></tr>{% endfor %}</table></section>{% else %}<section class="card"><h2>Mes réservations</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th></th></tr>{% for b in current_user.bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Vous êtes en liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">{{ b.status }}</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}">Annuler</a>{% endif %}</td></tr>{% endfor %}</table></section>{% endif %}</div>
 {% endset %}{{ shell(content, 'home')|safe }}
 """
 
@@ -2078,6 +2217,24 @@ TEMPLATE_IMPORT_MEMBERS = """
 TEMPLATE_COACH_PLANNING = """
 {% set content %}<div class="card"><div class="top"><div><h1>Planning coachs</h1><p class="muted">Agenda mensuel par coach. Les cours se modifient dans Paramètres.</p></div><form method="get"><input name="year" type="number" value="{{ year }}" style="width:90px;padding:10px;border-radius:10px;border:1px solid #ddd"> <input name="month" type="number" min="1" max="12" value="{{ month }}" style="width:70px;padding:10px;border-radius:10px;border:1px solid #ddd"> <button class="btn secondary" type="submit">Afficher</button> <a class="btn" href="{{ url_for('export_coach_absences', year=year, month=month) }}">Exporter</a></form></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto"><table class="table"><tr><th style="min-width:120px">Date</th>{% for coach in coach_names %}<th style="min-width:190px">{{ coach }}</th>{% endfor %}</tr>{% for day in month_days %}<tr><td><strong>{{ weekday_labels[day.weekday()] }}</strong><br>{{ day.strftime('%d/%m') }}</td>{% for coach in coach_names %}<td>{% set slots = coach_agenda.get((coach, day), []) %}{% for s in slots %}{% set a = abs_by_key.get((coach, day)) %}<div style="border:1px solid #e5e7eb;border-left:4px solid #34a853;border-radius:10px;padding:8px;margin:6px 0;background:#fff"><strong>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</strong><br>{{ s.course_name }}<br>{% if not s.is_reservable %}<span class="badge wait">Sans résa</span>{% endif %}{% if a %}<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% endif %}</div>{% else %}<span class="muted">-</span>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Déclarer une absence / remplacement</h3><div class="form-grid"><div class="field"><label>Coach</label><select name="coach_name">{% for c in coaches %}<option>{{ c }}</option>{% endfor %}</select></div><div class="field"><label>Date</label><input name="absence_date" type="date" required></div><div class="field"><label>Statut</label><select name="status"><option value="absent">Absent</option><option value="conge">Congé</option><option value="present">Présent</option><option value="replaced">Remplacé</option></select></div><div class="field"><label>Remplaçant</label><select name="replacement_name"><option value="">-</option>{% for c in replacement_coaches %}<option>{{ c }}</option>{% endfor %}</select></div><div class="field" style="grid-column:1/-1"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Enregistrer</button></form><br><h2>Suivi des absences / congés</h2><table class="table"><tr><th>Date</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th></tr>{% for a in absences %}<tr><td>{{ weekday_labels[a.absence_date.weekday()] }} {{ a.absence_date.strftime('%d/%m/%Y') }}</td><td>{{ a.coach_name }}</td><td><span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span></td><td>{{ a.replacement_name or '-' }}</td><td>{{ a.notes or '' }}</td><td><form method="post" action="{{ url_for('update_coach_absence_followup', absence_id=a.id) }}"><input type="hidden" name="year" value="{{ year }}"><input type="hidden" name="month" value="{{ month }}"><div class="field"><select name="followup_status"><option value="a_traiter" {% if a.followup_status == 'a_traiter' %}selected{% endif %}>À traiter</option><option value="en_cours" {% if a.followup_status == 'en_cours' %}selected{% endif %}>En cours</option><option value="remplacement_a_trouver" {% if a.followup_status == 'remplacement_a_trouver' %}selected{% endif %}>Remplacement à trouver</option><option value="remplacement_trouve" {% if a.followup_status == 'remplacement_trouve' %}selected{% endif %}>Remplacement trouvé</option><option value="valide" {% if a.followup_status == 'valide' %}selected{% endif %}>Validé</option><option value="refuse" {% if a.followup_status == 'refuse' %}selected{% endif %}>Refusé</option></select></div><div class="field" style="margin-top:8px"><input name="admin_notes" value="{{ a.admin_notes or '' }}" placeholder="Note admin"></div><button class="btn secondary" type="submit" style="margin-top:8px">Enregistrer suivi</button>{% if a.reviewed_at %}<br><small class="muted">MAJ {{ a.reviewed_at.strftime('%d/%m/%Y %H:%M') }} par {{ a.reviewed_by or '-' }}</small>{% endif %}</form></td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}
 """
+
+TEMPLATE_MEMBER_COACH_PLANNING = """
+{% set content %}<div class="card"><div class="top"><div><h1>Planning coachs</h1><p class="muted">Agenda visuel des cours. Les créneaux réservables peuvent être réservés directement ici.</p></div><form method="get"><input name="year" type="number" value="{{ year }}" style="width:90px;padding:10px;border-radius:10px;border:1px solid #ddd"> <input name="month" type="number" min="1" max="12" value="{{ month }}" style="width:70px;padding:10px;border-radius:10px;border:1px solid #ddd"> <button class="btn secondary" type="submit">Afficher</button></form></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto"><table class="table"><tr><th style="min-width:120px">Date</th>{% for coach in coach_names %}<th style="min-width:210px">{{ coach }}</th>{% endfor %}</tr>{% for day in month_days %}<tr><td><strong>{{ weekday_labels[day.weekday()] }}</strong><br>{{ day.strftime('%d/%m') }}</td>{% for coach in coach_names %}<td>{% set slots = coach_agenda.get((coach, day), []) %}{% for s in slots %}{% set a = abs_by_key.get((coach, day)) %}{% set booking = active_booking_by_session.get(s.id) %}<div style="border:1px solid #e5e7eb;border-left:4px solid #34a853;border-radius:10px;padding:8px;margin:6px 0;background:#fff"><strong>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</strong><br>{{ s.course_name }}<br>{% if a %}<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}<br>{% endif %}{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif a and a.status in ['absent','conge'] %}<span class="badge full">Indisponible</span>{% elif booking %}{% if booking.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(booking) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}<br><br><a class="btn danger" href="{{ url_for('cancel', booking_id=booking.id, next=request.full_path) }}">Annuler</a>{% else %}<span class="badge">{{ s.capacity - booked_count(s) if booked_count(s) < s.capacity else 0 }} places</span><br><br><a class="btn" href="{{ url_for('book', session_id=s.id, next=request.full_path) }}">Réserver</a>{% endif %}</div>{% else %}<span class="muted">-</span>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div></div>{% endset %}{{ shell(content, 'member_coach_planning')|safe }}
+"""
+
+_ABSENCE_BADGE_SNIPPET = """<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>"""
+_ABSENCE_BADGE_RENDER = """<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>"""
+TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace("{% elif a and a.status in ['absent','conge'] %}", "{% elif a and absence_blocks_booking(a) %}")
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<th>Réservation</th></tr>", "<th>Réservation</th><th>Suivi</th></tr>")
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
+    """<td>{% if s.is_reservable %}<span class="badge">Réservable</span>{% else %}<span class="badge wait">Sans résa</span>{% endif %}</td></tr>""",
+    """<td>{% if s.is_reservable %}<span class="badge">Réservable</span>{% else %}<span class="badge wait">Sans résa</span>{% endif %}</td><td>{% set a = abs_by_key.get((s.coach_name, s.course_date)) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td></tr>""",
+)
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace('<tr><td colspan="4" class="muted">Aucun cours rattaché sur ce mois.</td></tr>', '<tr><td colspan="5" class="muted">Aucun cours rattaché sur ce mois.</td></tr>')
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<td>{{ item.absence.followup_status or '-' }}</td>", """<td><span class="badge {{ absence_badge_class(item.absence) }}">{{ absence_display_label(item.absence) }}</span></td>""")
 
 TEMPLATE_SETTINGS = """
 {% set content %}<div class="card"><h1>Paramètres</h1>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><input type="hidden" name="settings_section" value="pricing"><h3>Tarifs des abonnements par statut</h3><p class="muted">Renseigner le montant attendu pour chaque combinaison abonnement / statut. Ces montants alimentent automatiquement l'onglet Budget.</p><div class="field" style="max-width:360px"><label>Cotisation annuelle première inscription (€)</label><input name="annual_membership_fee" value="{{ '%.2f'|format(annual_membership_fee) }}"></div><br><table class="table"><tr><th>Abonnement</th>{% for profile_key, profile_label in member_profile_labels.items() %}<th>{{ profile_label }}</th>{% endfor %}</tr>{% for name in subscription_prices %}<tr><td><strong>{{ name }}</strong></td>{% for profile_key, profile_label in member_profile_labels.items() %}<td><input name="{{ subscription_profile_price_key(name, profile_key) }}" value="{{ '%.2f'|format(subscription_price_matrix[name][profile_key]) }}" style="width:110px;padding:10px;border:1px solid #d1d5db;border-radius:10px"> €</td>{% endfor %}</tr>{% endfor %}</table><br><button class="btn" type="submit">Enregistrer les tarifs</button></form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3><div class="form-grid"><div class="field"><label>Nom du coach</label><input name="coach_name" required></div><div class="field"><label>Intitulé cours</label><input name="course_name" required></div><div class="field"><label>Jour</label><select name="weekday">{% for label in weekday_labels %}<option value="{{ loop.index0 }}">{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Semaine odd/even</label><select name="week_parity"><option value="all">Toutes</option><option value="even">Even / paire</option><option value="odd">Odd / impaire</option></select></div><div class="field"><label>Début</label><input name="start_time" type="time" required></div><div class="field"><label>Fin</label><input name="end_time" type="time" required></div><div class="field"><label>Jauge</label><input name="capacity" type="number" value="35" min="1" required></div><div class="field"><label>Réservation</label><label style="font-weight:600"><input name="is_reservable" type="checkbox" checked style="width:auto"> Créneau à réserver</label></div></div><br><button class="btn" type="submit">Créer le cours</button></form><br><table class="table"><tr><th>Jour</th><th>Semaine</th><th>Cours</th><th>Horaire</th><th>Jauge</th><th>Coach</th><th>Réservation</th><th>Statut</th><th>Actions</th></tr>{% for t in templates %}<tr><form method="post" action="{{ url_for('edit_template', template_id=t.id) }}"><td><select name="weekday">{% for label in weekday_labels %}<option value="{{ loop.index0 }}" {% if t.weekday == loop.index0 %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td><td><select name="week_parity"><option value="all" {% if t.week_parity == 'all' %}selected{% endif %}>Toutes</option><option value="even" {% if t.week_parity == 'even' %}selected{% endif %}>Even</option><option value="odd" {% if t.week_parity == 'odd' %}selected{% endif %}>Odd</option></select></td><td><input name="course_name" value="{{ t.course_name }}" required></td><td><input name="start_time" type="time" value="{{ t.start_time.strftime('%H:%M') }}" required><br><input name="end_time" type="time" value="{{ t.end_time.strftime('%H:%M') }}" required></td><td><input name="capacity" type="number" min="1" value="{{ t.capacity }}" required style="width:80px"></td><td><input name="coach_name" value="{{ t.coach_name or '' }}" required></td><td><label style="font-weight:600"><input name="is_reservable" type="checkbox" {% if t.is_reservable %}checked{% endif %} style="width:auto"> Oui</label></td><td>{% if t.active %}<span class="badge">Actif</span>{% else %}<span class="badge full">Inactif</span>{% endif %}</td><td><button class="btn secondary" type="submit">Modifier</button> <a class="btn secondary" href="{{ url_for('toggle_template', template_id=t.id) }}">Activer / désactiver</a> <a class="btn danger" href="{{ url_for('delete_template', template_id=t.id) }}" onclick="return confirm('Supprimer ce cours ? Les séances futures sans réservation seront supprimées.')">Supprimer</a></td></form></tr>{% else %}<tr><td colspan="9" class="muted">Aucun cours.</td></tr>{% endfor %}</table><br><h3>Profs</h3><table class="table"><tr><th>Prof</th><th>Action</th></tr>{% for coach in coaches %}<tr><td>{{ coach }}</td><td><a class="btn danger" href="{{ url_for('delete_settings_coach', coach_name=coach) }}" onclick="return confirm('Supprimer ce prof des cours paramétrés et des futurs cours sans réservation ?')">Supprimer ce prof des cours</a></td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun prof.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'settings')|safe }}
@@ -2405,7 +2562,8 @@ def admin_coach_planning():
         existing.replacement_name = replacement
         existing.notes = notes
         db.session.commit()
-        flash("Planning coach mis à jour.")
+        member_sent = notify_members_of_coach_absence(coach_name, absence_date, absence_date, status, replacement, notes)
+        flash(f"Planning coach mis à jour. Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else "Planning coach mis à jour.")
         return redirect(url_for("admin_coach_planning", year=absence_date.year, month=absence_date.month))
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])

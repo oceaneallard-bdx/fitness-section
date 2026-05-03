@@ -1929,9 +1929,12 @@ def delete_coach_absence(absence_id):
         flash("Action non autorisée.")
         return redirect(url_for("index"))
     coach_name = absence.coach_name
+    absence_date = absence.absence_date
     db.session.delete(absence)
     db.session.commit()
     flash("Absence supprimée.")
+    if request.args.get("from") == "admin_planning" and is_admin():
+        return redirect(url_for("admin_coach_planning", year=request.args.get("year", absence_date.year), month=request.args.get("month", absence_date.month)))
     return redirect(url_for("coach_profile", coach_name=coach_name))
 
 
@@ -2296,6 +2299,14 @@ _ABSENCE_BADGE_SNIPPET = """<span class="badge {% if a.status in ['absent','cong
 _ABSENCE_BADGE_RENDER = """<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>"""
 TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    "<tr><th>Date</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th></tr>",
+    "<tr><th>Date</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th><th>Action</th></tr>",
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    "</form></td></tr>{% else %}<tr><td colspan=\"6\" class=\"muted\">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}",
+    "</form></td><td><a class=\"btn danger\" href=\"{{ url_for('delete_coach_absence', absence_id=a.id, **{'from':'admin_planning'}, year=year, month=month) }}\" onclick=\"return confirm('Supprimer cette demande d\\'absence/congé ?')\">Supprimer</a></td></tr>{% else %}<tr><td colspan=\"7\" class=\"muted\">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}",
+)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace("{% elif a and a.status in ['absent','conge'] %}", "{% elif a and absence_blocks_booking(a) %}")
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<th>Réservation</th></tr>", "<th>Réservation</th><th>Suivi</th></tr>")

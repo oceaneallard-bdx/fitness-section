@@ -85,6 +85,8 @@ class User(db.Model, UserMixin):
     # Nouveaux champs adhérent
     full_name = db.Column(db.String(150), nullable=True)
     profile_photo = db.Column(db.String(255), nullable=True)
+    profile_photo_data = db.Column(db.Text, nullable=True)
+    profile_photo_mime = db.Column(db.String(80), nullable=True)
     subscription_type = db.Column(db.String(50), nullable=True)
     subscription_year = db.Column(db.Integer, nullable=True)
     member_profile = db.Column(db.String(30), nullable=True)
@@ -668,6 +670,46 @@ def save_profile_photo(file, user_id):
     return f"uploads/{filename}"
 
 
+def persist_profile_photo(user, file):
+    if not file or not file.filename:
+        return None
+    if not allowed_image(file.filename):
+        raise ValueError("Format photo non accepté. Utilisez JPG ou PNG.")
+    ext = secure_filename(file.filename).rsplit(".", 1)[1].lower()
+    content = file.read()
+    filename = f"profile_{user.id}.{ext}"
+    path = UPLOAD_DIR / filename
+    path.write_bytes(content)
+    user.profile_photo = f"uploads/{filename}"
+    user.profile_photo_data = base64.b64encode(content).decode("ascii")
+    user.profile_photo_mime = "image/png" if ext == "png" else "image/jpeg"
+    return user.profile_photo
+
+
+def user_profile_photo_bytes(user):
+    if user.profile_photo_data:
+        try:
+            return base64.b64decode(user.profile_photo_data), user.profile_photo_mime or "image/jpeg"
+        except Exception:
+            pass
+    if user.profile_photo:
+        path = STATIC_DIR / user.profile_photo
+        if path.exists():
+            mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+            return path.read_bytes(), mime
+    return None, None
+
+
+def user_profile_photo_image(user):
+    data, _ = user_profile_photo_bytes(user)
+    if not data:
+        return None
+    try:
+        return Image.open(BytesIO(data)).convert("RGB")
+    except Exception:
+        return None
+
+
 def allowed_document(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in {"pdf", "png", "jpg", "jpeg", "doc", "docx", "xls", "xlsx"}
 
@@ -735,6 +777,22 @@ def draw_text_fit(draw, position, text, font_size, max_width, fill, bold=True, m
     return font
 
 
+def add_left_card_gradient(card):
+    width, height = card.size
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    pixels = overlay.load()
+    for x in range(width):
+        if x < 780:
+            alpha = 255
+        elif x < 1080:
+            alpha = int(255 * (1 - ((x - 780) / 300)))
+        else:
+            alpha = 0
+        for y in range(48, height - 48):
+            pixels[x, y] = (0, 0, 0, max(0, min(255, alpha)))
+    return Image.alpha_composite(card.convert("RGBA"), overlay)
+
+
 def generate_member_card(user):
     width, height = 1536, 960
     green = (88, 126, 55)
@@ -750,24 +808,18 @@ def generate_member_card(user):
         for i in range(-250, width, 28):
             fallback_draw.arc((i, 120, i + 1200, height + 260), 205, 345, fill=(34, 62, 36), width=2)
 
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    overlay_draw.rounded_rectangle((52, 48, width - 52, height - 48), radius=54, fill=(0, 0, 0, 35))
-    overlay_draw.rectangle((52, 48, 780, height - 48), fill=(0, 0, 0, 255))
-    overlay_draw.rectangle((52, 735, 1160, height - 48), fill=(0, 0, 0, 245))
-    card = Image.alpha_composite(card.convert("RGBA"), overlay)
+    card = add_left_card_gradient(card)
     draw = ImageDraw.Draw(card)
 
     photo_x, photo_y, photo_w, photo_h = 116, 124, 300, 410
     draw.rounded_rectangle((photo_x - 5, photo_y - 5, photo_x + photo_w + 5, photo_y + photo_h + 5), radius=34, fill=green)
     draw.rounded_rectangle((photo_x, photo_y, photo_x + photo_w, photo_y + photo_h), radius=30, fill=(232, 232, 232))
-    if user.profile_photo:
-        photo_path = STATIC_DIR / user.profile_photo
-        if photo_path.exists():
-            photo = fit_image_cover(Image.open(photo_path).convert("RGB"), (photo_w, photo_h))
-            mask = Image.new("L", (photo_w, photo_h), 0)
-            ImageDraw.Draw(mask).rounded_rectangle((0, 0, photo_w, photo_h), radius=30, fill=255)
-            card.paste(photo, (photo_x, photo_y), mask)
+    photo = user_profile_photo_image(user)
+    if photo:
+        photo = fit_image_cover(photo, (photo_w, photo_h))
+        mask = Image.new("L", (photo_w, photo_h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, photo_w, photo_h), radius=30, fill=255)
+        card.paste(photo, (photo_x, photo_y), mask)
     else:
         placeholder_font = get_font(28, True)
         draw.text((photo_x + 68, photo_y + 185), "PHOTO", font=placeholder_font, fill=(120, 120, 120))
@@ -778,7 +830,7 @@ def generate_member_card(user):
     draw.line((116, 736, 390, 736), fill=green, width=5)
 
     info_box = (116, 778, 1110, 912)
-    draw.rounded_rectangle(info_box, radius=18, outline=green, width=3, fill=(0, 0, 0, 105))
+    draw.rounded_rectangle(info_box, radius=18, outline=green, width=3, fill=(0, 0, 0, 210))
     small_label = get_font(32, True)
     draw.rounded_rectangle((162, 808, 262, 892), radius=24, fill=green)
     draw.rounded_rectangle((186, 832, 238, 878), radius=3, outline=white, width=5)
@@ -1243,7 +1295,7 @@ def register():
         db.session.commit()
 
         try:
-            user.profile_photo = save_profile_photo(photo, user.id)
+            persist_profile_photo(user, photo)
             db.session.commit()
             card_path = generate_member_card(user)
         except ValueError as exc:
@@ -1284,7 +1336,7 @@ def member_profile():
         photo = request.files.get("profile_photo")
         if photo and photo.filename:
             try:
-                current_user.profile_photo = save_profile_photo(photo, current_user.id)
+                persist_profile_photo(current_user, photo)
             except ValueError as exc:
                 flash(str(exc))
                 return redirect(url_for("member_profile"))
@@ -1558,7 +1610,7 @@ def admin_edit_member(user_id):
         photo = request.files.get("profile_photo")
         try:
             if photo and photo.filename:
-                user.profile_photo = save_profile_photo(photo, user.id)
+                persist_profile_photo(user, photo)
             generate_member_card(user)
         except ValueError as exc:
             flash(str(exc))
@@ -1678,7 +1730,7 @@ def admin_create_member():
 
         try:
             if photo and photo.filename:
-                user.profile_photo = save_profile_photo(photo, user.id)
+                persist_profile_photo(user, photo)
                 db.session.commit()
             card_path = generate_member_card(user)
         except ValueError as exc:
@@ -2006,6 +2058,20 @@ def download_card(user_id):
     return send_file(STATIC_DIR / user.member_card, as_attachment=True, download_name=f"carte_adherent_{user.id}.png")
 
 
+@app.route("/profile-photo/<int:user_id>")
+@login_required
+def profile_photo_file(user_id):
+    user = User.query.get_or_404(user_id)
+    if current_user.id != user.id and not is_admin():
+        flash("Action non autorisée.")
+        return redirect(url_for("index"))
+    data, mime = user_profile_photo_bytes(user)
+    if not data:
+        flash("Aucune photo disponible.")
+        return redirect(url_for("index"))
+    return send_file(BytesIO(data), mimetype=mime)
+
+
 @app.route("/admin/export")
 @login_required
 def export_excel():
@@ -2149,7 +2215,7 @@ TEMPLATE_INDEX = """
 """
 
 TEMPLATE_MEMBER_PROFILE = """
-{% set content %}<div class="card form-wrap"><h1>Mon profil</h1><p class="muted">Modifier votre statut adhérent, vos préférences ou votre photo de profil.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if current_user.profile_photo %}<img class="photo-preview" src="{{ url_for('static', filename=current_user.profile_photo) }}" alt="Photo profil"><br><br>{% endif %}<form method="post" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>Nom complet</label><input value="{{ current_user.display_name() }}" disabled></div><div class="field"><label>Email</label><input value="{{ current_user.email }}" disabled></div><div class="field"><label>Statut prioritaire</label><select name="status"><option value="mensuel" {% if current_user.status == 'mensuel' %}selected{% endif %}>Mensuel</option><option value="cadre" {% if current_user.status == 'cadre' %}selected{% endif %}>Cadre</option><option value="autre" {% if current_user.status == 'autre' %}selected{% endif %}>Autre</option></select></div><div class="field"><label>Profil adhérent</label><select name="member_profile"><option value="ouvrant_droit" {% if current_user.member_profile == 'ouvrant_droit' or not current_user.member_profile %}selected{% endif %}>Ouvrant droit - personnel Thales, alternant, stagiaire, CDD</option><option value="ayant_droit" {% if current_user.member_profile == 'ayant_droit' %}selected{% endif %}>Ayant droit - proche d'un ouvrant droit</option><option value="exterieur" {% if current_user.member_profile == 'exterieur' %}selected{% endif %}>Extérieur - prestataire sur site Thales</option><option value="retraite" {% if current_user.member_profile == 'retraite' %}selected{% endif %}>Retraité</option></select></div><div class="field" style="grid-column:1/-1"><label>Nom et prénom de l'ouvrant droit, si ayant droit</label><input name="rights_holder_name" value="{{ current_user.rights_holder_name or '' }}"></div><div class="field"><label>Cours préféré</label><select name="preferred_course"><option value="">-</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if current_user.preferred_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach préféré</label><select name="preferred_coach"><option value="">-</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if current_user.preferred_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau préféré</label><select name="preferred_slot"><option value="">-</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if current_user.preferred_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field" style="grid-column:1/-1"><label>Nouvelle photo de profil JPG/PNG, facultative</label><input name="profile_photo" type="file" accept="image/png,image/jpeg"></div></div><br><button class="btn" type="submit">Enregistrer</button> <a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Télécharger ma carte</a></form></div>{% endset %}{{ shell(content, 'member_profile')|safe }}
+{% set content %}<div class="card form-wrap"><h1>Mon profil</h1><p class="muted">Modifier votre statut adhérent, vos préférences ou votre photo de profil.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if current_user.profile_photo or current_user.profile_photo_data %}<img class="photo-preview" src="{{ url_for('profile_photo_file', user_id=current_user.id) }}" alt="Photo profil"><br><br>{% endif %}<form method="post" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>Nom complet</label><input value="{{ current_user.display_name() }}" disabled></div><div class="field"><label>Email</label><input value="{{ current_user.email }}" disabled></div><div class="field"><label>Statut prioritaire</label><select name="status"><option value="mensuel" {% if current_user.status == 'mensuel' %}selected{% endif %}>Mensuel</option><option value="cadre" {% if current_user.status == 'cadre' %}selected{% endif %}>Cadre</option><option value="autre" {% if current_user.status == 'autre' %}selected{% endif %}>Autre</option></select></div><div class="field"><label>Profil adhérent</label><select name="member_profile"><option value="ouvrant_droit" {% if current_user.member_profile == 'ouvrant_droit' or not current_user.member_profile %}selected{% endif %}>Ouvrant droit - personnel Thales, alternant, stagiaire, CDD</option><option value="ayant_droit" {% if current_user.member_profile == 'ayant_droit' %}selected{% endif %}>Ayant droit - proche d'un ouvrant droit</option><option value="exterieur" {% if current_user.member_profile == 'exterieur' %}selected{% endif %}>Extérieur - prestataire sur site Thales</option><option value="retraite" {% if current_user.member_profile == 'retraite' %}selected{% endif %}>Retraité</option></select></div><div class="field" style="grid-column:1/-1"><label>Nom et prénom de l'ouvrant droit, si ayant droit</label><input name="rights_holder_name" value="{{ current_user.rights_holder_name or '' }}"></div><div class="field"><label>Cours préféré</label><select name="preferred_course"><option value="">-</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if current_user.preferred_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach préféré</label><select name="preferred_coach"><option value="">-</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if current_user.preferred_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau préféré</label><select name="preferred_slot"><option value="">-</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if current_user.preferred_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field" style="grid-column:1/-1"><label>Nouvelle photo de profil JPG/PNG, facultative</label><input name="profile_photo" type="file" accept="image/png,image/jpeg"></div></div><br><button class="btn" type="submit">Enregistrer</button> <a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Télécharger ma carte</a></form></div>{% endset %}{{ shell(content, 'member_profile')|safe }}
 """
 
 TEMPLATE_REGISTER = """
@@ -2413,7 +2479,7 @@ def activate_account(token):
         photo = request.files.get("profile_photo")
         if photo and photo.filename:
             try:
-                user.profile_photo = save_profile_photo(photo, user.id)
+                persist_profile_photo(user, photo)
             except ValueError as exc:
                 flash(str(exc))
                 return render_template_string(TEMPLATE_ACTIVATE, user=user)
@@ -3094,6 +3160,20 @@ def ensure_useful_documents_schema():
 
 def ensure_schema():
     db.create_all()
+    if db.engine.dialect.name == "postgresql":
+        user_columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'user'
+        """)).fetchall()}
+        postgres_user_additions = {
+            "profile_photo_data": "ALTER TABLE \"user\" ADD COLUMN profile_photo_data TEXT",
+            "profile_photo_mime": "ALTER TABLE \"user\" ADD COLUMN profile_photo_mime VARCHAR(80)",
+        }
+        for col, sql in postgres_user_additions.items():
+            if col not in user_columns:
+                db.session.execute(db.text(sql))
+        db.session.commit()
+        return
     if db.engine.dialect.name != "sqlite":
         db.session.commit()
         return
@@ -3102,6 +3182,8 @@ def ensure_schema():
     additions = {
         "full_name": "ALTER TABLE user ADD COLUMN full_name VARCHAR(150)",
         "profile_photo": "ALTER TABLE user ADD COLUMN profile_photo VARCHAR(255)",
+        "profile_photo_data": "ALTER TABLE user ADD COLUMN profile_photo_data TEXT",
+        "profile_photo_mime": "ALTER TABLE user ADD COLUMN profile_photo_mime VARCHAR(80)",
         "subscription_type": "ALTER TABLE user ADD COLUMN subscription_type VARCHAR(50)",
         "subscription_year": "ALTER TABLE user ADD COLUMN subscription_year INTEGER",
         "member_profile": "ALTER TABLE user ADD COLUMN member_profile VARCHAR(30)",

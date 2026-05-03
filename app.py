@@ -794,69 +794,42 @@ def add_left_card_gradient(card):
 
 
 def generate_member_card(user):
-    width, height = 1536, 960
+    width, height = 1528, 998
     green = (88, 126, 55)
-    bright_green = (112, 157, 71)
     white = (255, 255, 255)
-    dark = (4, 10, 10)
+    panel_dark = (6, 13, 12)
 
     if MEMBER_CARD_TEMPLATE_PATH.exists():
-        card = fit_image_cover(Image.open(MEMBER_CARD_TEMPLATE_PATH).convert("RGB"), (width, height))
+        card = Image.open(MEMBER_CARD_TEMPLATE_PATH).convert("RGBA").resize((width, height))
     else:
-        card = Image.new("RGB", (width, height), (10, 16, 15))
+        card = Image.new("RGBA", (width, height), (10, 16, 15, 255))
         fallback_draw = ImageDraw.Draw(card)
         for i in range(-250, width, 28):
             fallback_draw.arc((i, 120, i + 1200, height + 260), 205, 345, fill=(34, 62, 36), width=2)
 
-    card = add_left_card_gradient(card)
     draw = ImageDraw.Draw(card)
 
-    photo_x, photo_y, photo_w, photo_h = 116, 124, 300, 410
-    draw.rounded_rectangle((photo_x - 5, photo_y - 5, photo_x + photo_w + 5, photo_y + photo_h + 5), radius=34, fill=green)
-    draw.rounded_rectangle((photo_x, photo_y, photo_x + photo_w, photo_y + photo_h), radius=30, fill=(232, 232, 232))
+    photo_x, photo_y, photo_w, photo_h = 83, 93, 310, 435
+    draw.rounded_rectangle((photo_x - 3, photo_y - 3, photo_x + photo_w + 3, photo_y + photo_h + 3), radius=31, fill=green)
+    draw.rounded_rectangle((photo_x, photo_y, photo_x + photo_w, photo_y + photo_h), radius=28, fill=(232, 232, 232))
     photo = user_profile_photo_image(user)
     if photo:
         photo = fit_image_cover(photo, (photo_w, photo_h))
         mask = Image.new("L", (photo_w, photo_h), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, photo_w, photo_h), radius=30, fill=255)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, photo_w, photo_h), radius=28, fill=255)
         card.paste(photo, (photo_x, photo_y), mask)
     else:
         placeholder_font = get_font(28, True)
         draw.text((photo_x + 68, photo_y + 185), "PHOTO", font=placeholder_font, fill=(120, 120, 120))
 
-    label_font = get_font(36, True)
-    draw.text((116, 580), "NOM COMPLET", font=label_font, fill=green)
-    draw_text_fit(draw, (116, 632), user.display_name(), 66, 560, white, bold=True, min_size=34)
-    draw.line((116, 736, 390, 736), fill=green, width=5)
+    draw.rectangle((78, 630, 760, 744), fill=panel_dark)
+    draw_text_fit(draw, (82, 635), user.display_name(), 78, 660, white, bold=True, min_size=38)
 
-    info_box = (116, 778, 1110, 912)
-    draw.rounded_rectangle(info_box, radius=18, outline=green, width=3, fill=(0, 0, 0, 210))
-    small_label = get_font(32, True)
-    draw.rounded_rectangle((162, 808, 262, 892), radius=24, fill=green)
-    draw.rounded_rectangle((186, 832, 238, 878), radius=3, outline=white, width=5)
-    draw.line((186, 846, 238, 846), fill=white, width=5)
-    for cx in [198, 212, 226]:
-        for cy in [858, 870]:
-            draw.rectangle((cx - 3, cy - 3, cx + 3, cy + 3), fill=white)
-    draw.text((300, 810), "ABONNEMENT", font=small_label, fill=green)
-    draw_text_fit(draw, (300, 852), user.subscription_type or "-", 45, 270, white, bold=True, min_size=26)
-    draw.line((590, 802, 590, 894), fill=green, width=3)
-    draw.rounded_rectangle((656, 808, 756, 892), radius=24, fill=green)
-    draw.line((687, 851, 706, 870), fill=white, width=7)
-    draw.line((706, 870, 730, 833), fill=white, width=7)
-    draw.rounded_rectangle((682, 828, 730, 880), radius=12, outline=white, width=4)
-    draw.text((784, 810), "ANNÉE", font=small_label, fill=green)
-    draw_text_fit(draw, (784, 852), str(user.subscription_year or date.today().year), 45, 250, white, bold=True, min_size=30)
+    draw.rectangle((272, 860, 548, 930), fill=panel_dark)
+    draw_text_fit(draw, (276, 868), user.subscription_type or "-", 48, 250, white, bold=True, min_size=26)
 
-    if LOGO_PATH.exists():
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        logo.thumbnail((190, 190))
-        logo_x, logo_y = 1210, 680
-        draw.ellipse((logo_x - 14, logo_y - 14, logo_x + 204, logo_y + 204), fill=(255, 255, 255), outline=(0, 0, 0), width=4)
-        card.paste(logo, (logo_x + (190 - logo.width) // 2, logo_y + (190 - logo.height) // 2), logo)
-    else:
-        draw.ellipse((1210, 680, 1414, 884), fill=(255, 255, 255), outline=dark, width=4)
-        draw.text((1250, 765), "FITNESS", font=get_font(30, True), fill=dark)
+    draw.rectangle((775, 860, 970, 930), fill=panel_dark)
+    draw_text_fit(draw, (778, 868), str(user.subscription_year or date.today().year), 48, 180, white, bold=True, min_size=30)
 
     filename = f"carte_adherent_{user.id}.png"
     path = CARD_DIR / filename

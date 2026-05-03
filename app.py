@@ -555,11 +555,16 @@ def mail_sender_payload():
     return payload
 
 
+def mail_sender_email():
+    return mail_sender_payload()["email"]
+
+
 def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
     attachments = attachments or []
     payload = {
         "sender": mail_sender_payload(),
-        "to": [{"email": to}],
+        "to": [{"email": mail_sender_email(), "name": "Section Fitness"}],
+        "bcc": [{"email": to}],
         "subject": subject,
         "textContent": body,
     }
@@ -615,7 +620,8 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
 
         msg = EmailMessage()
         msg["From"] = MAIL_FROM
-        msg["To"] = to
+        msg["To"] = "Section Fitness <{}>".format(mail_sender_email())
+        msg["Bcc"] = to
         msg["Subject"] = subject
         msg.set_content(body)
         if html_body:

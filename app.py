@@ -33,6 +33,7 @@ STATIC_DIR = BASE_DIR / "static"
 UPLOAD_DIR = STATIC_DIR / "uploads"
 CARD_DIR = STATIC_DIR / "cards"
 LOGO_PATH = STATIC_DIR / "logo.png"
+MEMBER_CARD_TEMPLATE_PATH = STATIC_DIR / "member_card_template.png"
 for folder in [STATIC_DIR, UPLOAD_DIR, CARD_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -712,72 +713,102 @@ def next_member_number(year):
     return f"FS-{year}-{count:04d}"
 
 
+def fit_image_cover(image, size):
+    target_w, target_h = size
+    img_w, img_h = image.size
+    scale = max(target_w / img_w, target_h / img_h)
+    new_size = (int(img_w * scale), int(img_h * scale))
+    image = image.resize(new_size)
+    left = (image.width - target_w) // 2
+    top = (image.height - target_h) // 2
+    return image.crop((left, top, left + target_w, top + target_h))
+
+
+def draw_text_fit(draw, position, text, font_size, max_width, fill, bold=True, min_size=24):
+    text = str(text or "-").upper()
+    size = font_size
+    font = get_font(size, bold)
+    while size > min_size and draw.textbbox((0, 0), text, font=font)[2] > max_width:
+        size -= 2
+        font = get_font(size, bold)
+    draw.text(position, text, font=font, fill=fill)
+    return font
+
+
 def generate_member_card(user):
-    width, height = 1000, 620
-    card = Image.new("RGB", (width, height), (8, 18, 20))
+    width, height = 1536, 960
+    green = (88, 126, 55)
+    bright_green = (112, 157, 71)
+    white = (255, 255, 255)
+    dark = (4, 10, 10)
+
+    if MEMBER_CARD_TEMPLATE_PATH.exists():
+        card = fit_image_cover(Image.open(MEMBER_CARD_TEMPLATE_PATH).convert("RGB"), (width, height))
+    else:
+        card = Image.new("RGB", (width, height), (10, 16, 15))
+        fallback_draw = ImageDraw.Draw(card)
+        for i in range(-250, width, 28):
+            fallback_draw.arc((i, 120, i + 1200, height + 260), 205, 345, fill=(34, 62, 36), width=2)
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rounded_rectangle((52, 48, width - 52, height - 48), radius=54, fill=(0, 0, 0, 35))
+    overlay_draw.rectangle((52, 48, 780, height - 48), fill=(0, 0, 0, 255))
+    overlay_draw.rectangle((52, 735, 1160, height - 48), fill=(0, 0, 0, 245))
+    card = Image.alpha_composite(card.convert("RGBA"), overlay)
     draw = ImageDraw.Draw(card)
 
-    # fond avec lignes vertes
-    for i in range(-200, 900, 18):
-        draw.arc((i, 170, i + 850, 920), 200, 350, fill=(44, 88, 45), width=1)
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=35, outline=(230, 230, 230), width=2)
-    draw.rectangle((0, height - 70, 500, height), fill=(95, 190, 65))
-
-    title_font = get_font(42, True)
-    h2_font = get_font(30, True)
-    label_font = get_font(19, False)
-    text_font = get_font(26, False)
-    small_font = get_font(18, False)
-
-    # logo
-    if LOGO_PATH.exists():
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        logo.thumbnail((150, 150))
-        card.paste(logo, (42, 42), logo)
-    else:
-        draw.ellipse((42, 42, 192, 192), fill=(255, 255, 255))
-        draw.text((75, 95), "FITNESS", font=small_font, fill=(0, 0, 0))
-
-    draw.text((225, 65), "CARTE ADHÉRENT", font=title_font, fill=(143, 221, 82))
-    draw.text((225, 120), "SECTION FITNESS", font=h2_font, fill=(255, 255, 255))
-
-    x, y = 42, 245
-    draw.text((x, y), "Nom", font=label_font, fill=(143, 221, 82))
-    draw.text((x, y + 28), user.display_name(), font=text_font, fill=(255, 255, 255))
-    draw.text((x, y + 88), "Email", font=label_font, fill=(143, 221, 82))
-    draw.text((x, y + 116), user.email, font=text_font, fill=(255, 255, 255))
-    draw.text((x, y + 176), "Abonnement", font=label_font, fill=(143, 221, 82))
-    draw.text((x, y + 204), user.subscription_type or "-", font=text_font, fill=(255, 255, 255))
-    draw.text((x, y + 264), "Année", font=label_font, fill=(143, 221, 82))
-    draw.text((x, y + 292), str(user.subscription_year or date.today().year), font=text_font, fill=(255, 255, 255))
-
-    # photo
-    photo_box = (705, 145, 925, 365)
-    draw.rounded_rectangle(photo_box, radius=26, fill=(235, 235, 235))
+    photo_x, photo_y, photo_w, photo_h = 116, 124, 300, 410
+    draw.rounded_rectangle((photo_x - 5, photo_y - 5, photo_x + photo_w + 5, photo_y + photo_h + 5), radius=34, fill=green)
+    draw.rounded_rectangle((photo_x, photo_y, photo_x + photo_w, photo_y + photo_h), radius=30, fill=(232, 232, 232))
     if user.profile_photo:
         photo_path = STATIC_DIR / user.profile_photo
         if photo_path.exists():
-            photo = Image.open(photo_path).convert("RGB")
-            photo = photo.resize((220, 220))
-            mask = Image.new("L", (220, 220), 0)
-            ImageDraw.Draw(mask).rounded_rectangle((0, 0, 220, 220), radius=26, fill=255)
-            card.paste(photo, (705, 145), mask)
+            photo = fit_image_cover(Image.open(photo_path).convert("RGB"), (photo_w, photo_h))
+            mask = Image.new("L", (photo_w, photo_h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, photo_w, photo_h), radius=30, fill=255)
+            card.paste(photo, (photo_x, photo_y), mask)
+    else:
+        placeholder_font = get_font(28, True)
+        draw.text((photo_x + 68, photo_y + 185), "PHOTO", font=placeholder_font, fill=(120, 120, 120))
 
-    draw.text((715, 395), "ID ADHÉRENT", font=h2_font, fill=(143, 221, 82))
-    draw.text((715, 440), user.member_number or "FS-0000", font=text_font, fill=(255, 255, 255))
+    label_font = get_font(36, True)
+    draw.text((116, 580), "NOM COMPLET", font=label_font, fill=green)
+    draw_text_fit(draw, (116, 632), user.display_name(), 66, 560, white, bold=True, min_size=34)
+    draw.line((116, 736, 390, 736), fill=green, width=5)
 
-    # faux code-barres décoratif
-    bx, by = 650, 505
-    for i in range(70):
-        bar_w = 2 if i % 3 else 5
-        bar_h = 62 if i % 4 else 78
-        draw.rectangle((bx + i * 5, by, bx + i * 5 + bar_w, by + bar_h), fill=(255, 255, 255))
+    info_box = (116, 778, 1110, 912)
+    draw.rounded_rectangle(info_box, radius=18, outline=green, width=3, fill=(0, 0, 0, 105))
+    small_label = get_font(32, True)
+    draw.rounded_rectangle((162, 808, 262, 892), radius=24, fill=green)
+    draw.rounded_rectangle((186, 832, 238, 878), radius=3, outline=white, width=5)
+    draw.line((186, 846, 238, 846), fill=white, width=5)
+    for cx in [198, 212, 226]:
+        for cy in [858, 870]:
+            draw.rectangle((cx - 3, cy - 3, cx + 3, cy + 3), fill=white)
+    draw.text((300, 810), "ABONNEMENT", font=small_label, fill=green)
+    draw_text_fit(draw, (300, 852), user.subscription_type or "-", 45, 270, white, bold=True, min_size=26)
+    draw.line((590, 802, 590, 894), fill=green, width=3)
+    draw.rounded_rectangle((656, 808, 756, 892), radius=24, fill=green)
+    draw.line((687, 851, 706, 870), fill=white, width=7)
+    draw.line((706, 870, 730, 833), fill=white, width=7)
+    draw.rounded_rectangle((682, 828, 730, 880), radius=12, outline=white, width=4)
+    draw.text((784, 810), "ANNÉE", font=small_label, fill=green)
+    draw_text_fit(draw, (784, 852), str(user.subscription_year or date.today().year), 45, 250, white, bold=True, min_size=30)
 
-    draw.text((42, height - 50), "Ensemble, dépassons nos limites !", font=get_font(24, True), fill=(255, 255, 255))
+    if LOGO_PATH.exists():
+        logo = Image.open(LOGO_PATH).convert("RGBA")
+        logo.thumbnail((190, 190))
+        logo_x, logo_y = 1210, 680
+        draw.ellipse((logo_x - 14, logo_y - 14, logo_x + 204, logo_y + 204), fill=(255, 255, 255), outline=(0, 0, 0), width=4)
+        card.paste(logo, (logo_x + (190 - logo.width) // 2, logo_y + (190 - logo.height) // 2), logo)
+    else:
+        draw.ellipse((1210, 680, 1414, 884), fill=(255, 255, 255), outline=dark, width=4)
+        draw.text((1250, 765), "FITNESS", font=get_font(30, True), fill=dark)
 
     filename = f"carte_adherent_{user.id}.png"
     path = CARD_DIR / filename
-    card.save(path)
+    card.convert("RGB").save(path)
     user.member_card = f"cards/{filename}"
     db.session.commit()
     return path

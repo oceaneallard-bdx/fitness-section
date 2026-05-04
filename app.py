@@ -569,7 +569,6 @@ def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
     attachments = attachments or []
     payload = {
         "sender": mail_sender_payload(),
-        "to": [{"email": mail_sender_email(), "name": "Section Fitness"}],
         "bcc": [{"email": to}],
         "subject": subject,
         "textContent": body,
@@ -612,7 +611,7 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
 
         if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
             print("\n--- EMAIL NON ENVOYÉ : SMTP NON CONFIGURÉ ---")
-            print("To:", to)
+            print("Cci:", to)
             print("Subject:", subject)
             print(body)
             if html_body:
@@ -626,7 +625,6 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
 
         msg = EmailMessage()
         msg["From"] = MAIL_FROM
-        msg["To"] = "Section Fitness <{}>".format(mail_sender_email())
         msg["Bcc"] = to
         msg["Subject"] = subject
         msg.set_content(body)
@@ -1807,8 +1805,32 @@ def admin_members():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
-    users = active_adherent_query().order_by(User.full_name, User.email).all()
-    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count)
+    query = active_adherent_query()
+    search = request.args.get("search", "").strip()
+    profile = request.args.get("member_profile", "").strip()
+    subscription = request.args.get("subscription_type", "").strip()
+    year = request.args.get("subscription_year", "").strip()
+    account_status = request.args.get("account_status", "").strip()
+    if search:
+        like = f"%{search.lower()}%"
+        query = query.filter(db.or_(db.func.lower(User.full_name).like(like), db.func.lower(User.email).like(like), db.func.lower(User.member_number).like(like)))
+    if profile:
+        query = query.filter(User.member_profile == profile)
+    if subscription:
+        query = query.filter(User.subscription_type == subscription)
+    if year.isdigit():
+        query = query.filter(User.subscription_year == int(year))
+    if account_status:
+        query = query.filter(User.account_status == account_status)
+    users = query.order_by(User.full_name, User.email).all()
+    filter_values = {
+        "search": search,
+        "member_profile": profile,
+        "subscription_type": subscription,
+        "subscription_year": year,
+        "account_status": account_status,
+    }
+    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys())
 
 
 @app.route("/admin/coaches", methods=["GET", "POST"])
@@ -2280,6 +2302,11 @@ TEMPLATE_SESSION_DETAIL = """
 TEMPLATE_MEMBERS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> <a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a></td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}">""",
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_members') }}" class="card" style="box-shadow:none;background:#f9fafb"><h3>Filtres</h3><div class="form-grid"><div class="field"><label>Recherche</label><input name="search" value="{{ filter_values.search }}" placeholder="Nom, email, ID"></div><div class="field"><label>Profil</label><select name="member_profile"><option value="">Tous</option>{% for key, label in member_profile_labels.items() %}<option value="{{ key }}" {% if filter_values.member_profile == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Abonnement</label><select name="subscription_type"><option value="">Tous</option>{% for opt in subscription_options %}<option value="{{ opt }}" {% if filter_values.subscription_type == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" value="{{ filter_values.subscription_year }}" placeholder="2026"></div><div class="field"><label>Compte</label><select name="account_status"><option value="">Tous</option><option value="active" {% if filter_values.account_status == 'active' %}selected{% endif %}>Actif</option><option value="pending" {% if filter_values.account_status == 'pending' %}selected{% endif %}>Activation à faire</option></select></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a></form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    1,
+)
 
 
 

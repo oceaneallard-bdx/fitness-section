@@ -922,6 +922,12 @@ def absence_session_label(absence):
     return "Toute la journée"
 
 
+def absence_session_options(absence):
+    if not absence:
+        return []
+    return absence_target_sessions(absence.coach_name, absence.absence_date)
+
+
 def absence_target_sessions(coach_name, day):
     return CourseSession.query.filter_by(
         coach_name=coach_name,
@@ -959,6 +965,7 @@ def template_helpers():
         "absence_display_label": absence_display_label,
         "absence_for_session": absence_for_session,
         "absence_session_label": absence_session_label,
+        "absence_session_options": absence_session_options,
     }
 
 
@@ -1911,10 +1918,12 @@ def coach_profile():
                     upsert_coach_absence(coach_name, current_day, status, replacement, notes, session=session, reset_followup=current_user.role == "coach")
                     saved += 1
             else:
-                upsert_coach_absence(coach_name, current_day, status, replacement, notes, reset_followup=current_user.role == "coach")
-                saved += 1
+                pass
             current_day += timedelta(days=1)
         db.session.commit()
+        if saved == 0:
+            flash("Aucune absence créée : aucun cours n'existe pour cette coach sur la période sélectionnée.")
+            return redirect(url_for("coach_profile", coach_name=coach_name))
         if current_user.role == "coach":
             sent = notify_admins_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
             member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
@@ -2400,6 +2409,11 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """<div class="field" style="margin-top:8px"><label>Remplaçant</label><select name="replacement_name"><option value="">-</option>{% for c in replacement_coaches %}<option value="{{ c }}" {% if a.replacement_name == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></div><div class="field" style="margin-top:8px"><input name="admin_notes" value="{{ a.admin_notes or '' }}" placeholder="Note admin"></div><button class="btn secondary" type="submit" style="margin-top:8px">Enregistrer suivi</button>""",
     1,
 )
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """<input type="hidden" name="year" value="{{ year }}"><input type="hidden" name="month" value="{{ month }}"><div class="field"><select name="followup_status">""",
+    """<input type="hidden" name="year" value="{{ year }}"><input type="hidden" name="month" value="{{ month }}"><div class="field"><label>Créneau</label><select name="session_id"><option value="">Toute la journée</option>{% for s in absence_session_options(a) %}<option value="{{ s.id }}" {% if a.session_id == s.id %}selected{% endif %}>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }} · {{ s.course_name }}</option>{% endfor %}</select></div><div class="field" style="margin-top:8px"><label>Suivi</label><select name="followup_status">""",
+    1,
+)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(
     "{% set a = abs_by_key.get((coach, day)) %}",
@@ -2745,10 +2759,12 @@ def admin_coach_planning():
                     upsert_coach_absence(coach_name, current_day, status, replacement, notes, session=session)
                     saved += 1
             else:
-                upsert_coach_absence(coach_name, current_day, status, replacement, notes)
-                saved += 1
+                pass
             current_day += timedelta(days=1)
         db.session.commit()
+        if saved == 0:
+            flash("Aucune absence créée : aucun cours n'existe pour cette coach sur la période sélectionnée.")
+            return redirect(url_for("admin_coach_planning", year=start_date.year, month=start_date.month))
         member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
         flash(f"Planning coach mis à jour sur {saved} jour(s). Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else f"Planning coach mis à jour sur {saved} jour(s).")
         return redirect(url_for("admin_coach_planning", year=start_date.year, month=start_date.month))
@@ -2778,6 +2794,30 @@ def update_coach_absence_followup(absence_id):
     allowed = {"a_traiter", "en_cours", "remplacement_a_trouver", "remplacement_trouve", "valide", "refuse"}
     status = request.form.get("followup_status", "a_traiter")
     absence.followup_status = status if status in allowed else "a_traiter"
+    if "session_id" in request.form:
+        raw_session_id = request.form.get("session_id", "").strip()
+        if raw_session_id:
+            session = CourseSession.query.get(int(raw_session_id))
+            if session and session.coach_name == absence.coach_name and session.course_date == absence.absence_date:
+                duplicate = CoachAbsence.query.filter_by(
+                    coach_name=absence.coach_name,
+                    absence_date=absence.absence_date,
+                    session_id=session.id,
+                ).filter(CoachAbsence.id != absence.id).first()
+                if duplicate:
+                    duplicate.status = absence.status
+                    duplicate.replacement_name = absence.replacement_name
+                    duplicate.notes = absence.notes
+                    duplicate.followup_status = absence.followup_status
+                    duplicate.admin_notes = absence.admin_notes
+                    duplicate.reviewed_at = absence.reviewed_at
+                    duplicate.reviewed_by = absence.reviewed_by
+                    db.session.delete(absence)
+                    absence = duplicate
+                else:
+                    absence.session_id = session.id
+        else:
+            absence.session_id = None
     replacement_name = request.form.get("replacement_name")
     if replacement_name is not None:
         absence.replacement_name = replacement_name.strip()

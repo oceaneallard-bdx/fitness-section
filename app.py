@@ -166,6 +166,7 @@ class CoachAbsence(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     coach_name = db.Column(db.String(150), nullable=False)
     absence_date = db.Column(db.Date, nullable=False)
+    session_id = db.Column(db.Integer, db.ForeignKey("course_session.id"), nullable=True)
     status = db.Column(db.String(30), nullable=False, default="absent")
     replacement_name = db.Column(db.String(150), nullable=True)
     notes = db.Column(db.String(500), nullable=True)
@@ -174,6 +175,7 @@ class CoachAbsence(db.Model):
     reviewed_at = db.Column(db.DateTime, nullable=True)
     reviewed_by = db.Column(db.String(150), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    session = db.relationship("CourseSession")
 
 
 class BudgetEntry(db.Model):
@@ -363,6 +365,10 @@ def get_replacement_coaches():
     setting_names = {name.strip() for name in raw.split("\n") if name.strip()}
     user_names = {u.display_name() for u in User.query.filter_by(role="coach", coach_type="remplacant").order_by(User.full_name, User.email).all()}
     return sorted(default_names | setting_names | user_names)
+
+
+def coach_replacement_options():
+    return sorted(set(configured_coach_names()) | set(coach_display_names()) | set(get_replacement_coaches()))
 
 
 def save_replacement_coaches(names):
@@ -903,12 +909,56 @@ def absence_blocks_booking(absence):
     return absence.status in ["absent", "conge"]
 
 
+def absence_for_session(abs_by_key, session):
+    if not session:
+        return None
+    return abs_by_key.get((session.coach_name, session.course_date, session.id)) or abs_by_key.get((session.coach_name, session.course_date, None))
+
+
+def absence_session_label(absence):
+    if absence and absence.session:
+        session = absence.session
+        return f"{session.start_time.strftime('%H:%M')} - {session.end_time.strftime('%H:%M')} · {session.course_name}"
+    return "Toute la journée"
+
+
+def absence_target_sessions(coach_name, day):
+    return CourseSession.query.filter_by(
+        coach_name=coach_name,
+        course_date=day,
+    ).order_by(CourseSession.start_time).all()
+
+
+def upsert_coach_absence(coach_name, day, status, replacement, notes, session=None, reset_followup=False):
+    existing = CoachAbsence.query.filter_by(
+        coach_name=coach_name,
+        absence_date=day,
+        session_id=session.id if session else None,
+    ).first()
+    if not existing:
+        existing = CoachAbsence(coach_name=coach_name, absence_date=day, session_id=session.id if session else None)
+        db.session.add(existing)
+    existing.status = status
+    existing.replacement_name = replacement
+    existing.notes = notes
+    if reset_followup:
+        existing.followup_status = "a_traiter"
+        existing.admin_notes = None
+        existing.reviewed_at = None
+        existing.reviewed_by = None
+    if replacement and existing.followup_status in ["a_traiter", "remplacement_a_trouver"]:
+        existing.followup_status = "remplacement_trouve"
+    return existing
+
+
 @app.context_processor
 def template_helpers():
     return {
         "absence_badge_class": absence_badge_class,
         "absence_blocks_booking": absence_blocks_booking,
         "absence_display_label": absence_display_label,
+        "absence_for_session": absence_for_session,
+        "absence_session_label": absence_session_label,
     }
 
 
@@ -1348,7 +1398,7 @@ def member_coach_planning():
         CoachAbsence.absence_date >= start,
         CoachAbsence.absence_date <= end,
     ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
-    abs_by_key = {(a.coach_name, a.absence_date): a for a in absences}
+    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
     coach_names = sorted({s.coach_name for s in sessions if s.coach_name and coach_type_for_name(s.coach_name) == "titulaire"} | set(titular_coach_names()))
     planning_weekdays = set(get_coach_planning_weekdays())
     month_days = [start + timedelta(days=i) for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() in planning_weekdays]
@@ -1855,19 +1905,14 @@ def coach_profile():
         current_day = start_date
         saved = 0
         while current_day <= end_date:
-            existing = CoachAbsence.query.filter_by(coach_name=coach_name, absence_date=current_day).first()
-            if not existing:
-                existing = CoachAbsence(coach_name=coach_name, absence_date=current_day)
-                db.session.add(existing)
-            existing.status = status
-            existing.replacement_name = replacement
-            existing.notes = notes
-            if current_user.role == "coach":
-                existing.followup_status = "a_traiter"
-                existing.admin_notes = None
-                existing.reviewed_at = None
-                existing.reviewed_by = None
-            saved += 1
+            target_sessions = absence_target_sessions(coach_name, current_day)
+            if target_sessions:
+                for session in target_sessions:
+                    upsert_coach_absence(coach_name, current_day, status, replacement, notes, session=session, reset_followup=current_user.role == "coach")
+                    saved += 1
+            else:
+                upsert_coach_absence(coach_name, current_day, status, replacement, notes, reset_followup=current_user.role == "coach")
+                saved += 1
             current_day += timedelta(days=1)
         db.session.commit()
         if current_user.role == "coach":
@@ -1883,7 +1928,7 @@ def coach_profile():
         CoachAbsence.coach_name == coach_name,
         CoachAbsence.absence_date >= today - timedelta(days=30)
     ).order_by(CoachAbsence.absence_date.desc()).all()
-    return render_template_string(TEMPLATE_COACH_PROFILE, coach_name=coach_name, coaches=coaches, replacement_coaches=get_replacement_coaches(), absences=absences, today=today)
+    return render_template_string(TEMPLATE_COACH_PROFILE, coach_name=coach_name, coaches=coaches, replacement_coaches=coach_replacement_options(), absences=absences, today=today)
 
 
 @app.route("/coach/schedule")
@@ -1919,18 +1964,18 @@ def coach_schedule():
         CoachAbsence.absence_date <= end,
         CoachAbsence.coach_name.in_(identities),
     ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
-    abs_by_key = {(a.coach_name, a.absence_date): a for a in own_absences}
+    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in own_absences}
     replacements = []
     for absence in absences:
-        replacement_sessions = CourseSession.query.filter_by(
-            coach_name=absence.coach_name,
-            course_date=absence.absence_date,
-        ).order_by(CourseSession.start_time).all()
-        if replacement_sessions:
-            for session in replacement_sessions:
-                replacements.append({"absence": absence, "session": session})
+        if absence.session_id:
+            replacements.append({"absence": absence, "session": absence.session})
         else:
-            replacements.append({"absence": absence, "session": None})
+            replacement_sessions = absence_target_sessions(absence.coach_name, absence.absence_date)
+            if replacement_sessions:
+                for session in replacement_sessions:
+                    replacements.append({"absence": absence, "session": session})
+            else:
+                replacements.append({"absence": absence, "session": None})
     return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
@@ -2311,15 +2356,40 @@ TEMPLATE_MEMBER_COACH_PLANNING = """
 _ABSENCE_BADGE_SNIPPET = """<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>"""
 _ABSENCE_BADGE_RENDER = """<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>"""
 TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
+TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(
+    "<tr><th>Date</th><th>Type</th><th>Remplaçant</th><th>Notes</th><th>Action</th></tr>",
+    "<tr><th>Date</th><th>Créneau</th><th>Type</th><th>Remplaçant</th><th>Notes</th><th>Action</th></tr>",
+)
+TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(
+    "<tr><td>{{ a.absence_date.strftime('%d/%m/%Y') }}</td><td>",
+    "<tr><td>{{ a.absence_date.strftime('%d/%m/%Y') }}</td><td>{{ absence_session_label(a) }}</td><td>",
+)
+TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(
+    "<tr><td colspan=\"5\" class=\"muted\">Aucune absence enregistrée.</td></tr>",
+    "<tr><td colspan=\"6\" class=\"muted\">Aucune absence enregistrée.</td></tr>",
+)
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    "{% set a = abs_by_key.get((coach, day)) %}",
+    "{% set a = absence_for_session(abs_by_key, s) %}",
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     "<tr><th>Date</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th></tr>",
-    "<tr><th>Date</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th><th>Action</th></tr>",
+    "<tr><th>Date</th><th>Créneau</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th></tr>",
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    "<tr><td>{{ weekday_labels[a.absence_date.weekday()] }} {{ a.absence_date.strftime('%d/%m/%Y') }}</td><td>{{ a.coach_name }}</td>",
+    "<tr><td>{{ weekday_labels[a.absence_date.weekday()] }} {{ a.absence_date.strftime('%d/%m/%Y') }}</td><td>{{ absence_session_label(a) }}</td><td>{{ a.coach_name }}</td>",
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    "<tr><th>Date</th><th>Créneau</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th></tr>",
+    "<tr><th>Date</th><th>Créneau</th><th>Coach</th><th>Type</th><th>Remplaçant</th><th>Notes coach</th><th>Suivi admin</th><th>Action</th></tr>",
 )
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     "</form></td></tr>{% else %}<tr><td colspan=\"6\" class=\"muted\">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}",
     "</form></td><td><a class=\"btn danger\" href=\"{{ url_for('delete_coach_absence', absence_id=a.id, source='admin_planning', year=year, month=month) }}\" onclick=\"return confirm('Supprimer cette demande d\\'absence/congé ?')\">Supprimer</a></td></tr>{% else %}<tr><td colspan=\"7\" class=\"muted\">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}",
 )
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace("colspan=\"7\" class=\"muted\">Aucune absence déclarée ce mois.", "colspan=\"8\" class=\"muted\">Aucune absence déclarée ce mois.")
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """<div class="field"><label>Date</label><input name="absence_date" type="date" required></div>""",
     """<div class="field"><label>Début</label><input name="start_date" type="date" required></div><div class="field"><label>Fin</label><input name="end_date" type="date" required></div>""",
@@ -2331,11 +2401,15 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     1,
 )
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(
+    "{% set a = abs_by_key.get((coach, day)) %}",
+    "{% set a = absence_for_session(abs_by_key, s) %}",
+)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace("{% elif a and a.status in ['absent','conge'] %}", "{% elif a and absence_blocks_booking(a) %}")
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<th>Réservation</th></tr>", "<th>Réservation</th><th>Suivi</th></tr>")
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
     """<td>{% if s.is_reservable %}<span class="badge">Réservable</span>{% else %}<span class="badge wait">Sans résa</span>{% endif %}</td></tr>""",
-    """<td>{% if s.is_reservable %}<span class="badge">Réservable</span>{% else %}<span class="badge wait">Sans résa</span>{% endif %}</td><td>{% set a = abs_by_key.get((s.coach_name, s.course_date)) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td></tr>""",
+    """<td>{% if s.is_reservable %}<span class="badge">Réservable</span>{% else %}<span class="badge wait">Sans résa</span>{% endif %}</td><td>{% set a = absence_for_session(abs_by_key, s) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td></tr>""",
 )
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace('<tr><td colspan="4" class="muted">Aucun cours rattaché sur ce mois.</td></tr>', '<tr><td colspan="5" class="muted">Aucun cours rattaché sur ce mois.</td></tr>')
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<td>{{ item.absence.followup_status or '-' }}</td>", """<td><span class="badge {{ absence_badge_class(item.absence) }}">{{ absence_display_label(item.absence) }}</span></td>""")
@@ -2665,16 +2739,14 @@ def admin_coach_planning():
         current_day = start_date
         saved = 0
         while current_day <= end_date:
-            existing = CoachAbsence.query.filter_by(coach_name=coach_name, absence_date=current_day).first()
-            if not existing:
-                existing = CoachAbsence(coach_name=coach_name, absence_date=current_day)
-                db.session.add(existing)
-            existing.status = status
-            existing.replacement_name = replacement
-            existing.notes = notes
-            if replacement and existing.followup_status in ["a_traiter", "remplacement_a_trouver"]:
-                existing.followup_status = "remplacement_trouve"
-            saved += 1
+            target_sessions = absence_target_sessions(coach_name, current_day)
+            if target_sessions:
+                for session in target_sessions:
+                    upsert_coach_absence(coach_name, current_day, status, replacement, notes, session=session)
+                    saved += 1
+            else:
+                upsert_coach_absence(coach_name, current_day, status, replacement, notes)
+                saved += 1
             current_day += timedelta(days=1)
         db.session.commit()
         member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
@@ -2683,8 +2755,8 @@ def admin_coach_planning():
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     sessions = CourseSession.query.filter(CourseSession.course_date >= start, CourseSession.course_date <= end).order_by(CourseSession.course_date, CourseSession.start_time).all()
-    absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
-    abs_by_key = {(a.coach_name, a.absence_date): a for a in absences}
+    absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name, CoachAbsence.session_id).all()
+    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
     coaches = titular_coach_names()
     coach_names = sorted({s.coach_name for s in sessions if s.coach_name and coach_type_for_name(s.coach_name) == "titulaire"} | set(coaches))
     planning_weekdays = set(get_coach_planning_weekdays())
@@ -2692,7 +2764,7 @@ def admin_coach_planning():
     coach_agenda = {}
     for session in sessions:
         coach_agenda.setdefault((session.coach_name or "-", session.course_date), []).append(session)
-    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=get_replacement_coaches(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
+    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/admin/coach-absence/<int:absence_id>/followup", methods=["POST"])
@@ -2731,14 +2803,15 @@ def export_coach_absences():
     month = int(request.args.get("month", today.month))
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
-    absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
+    absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name, CoachAbsence.session_id).all()
     wb = Workbook()
     ws = wb.active
     ws.title = "Absences coachs"
-    ws.append(["Date", "Coach", "Type", "Remplaçant", "Notes coach", "Suivi admin", "Notes admin", "Mis à jour le", "Mis à jour par", "Créé le"])
+    ws.append(["Date", "Créneau", "Coach", "Type", "Remplaçant", "Notes coach", "Suivi admin", "Notes admin", "Mis à jour le", "Mis à jour par", "Créé le"])
     for a in absences:
         ws.append([
             a.absence_date.strftime("%d/%m/%Y"),
+            absence_session_label(a),
             a.coach_name,
             a.status,
             a.replacement_name or "",
@@ -3147,10 +3220,28 @@ def ensure_inventory_schema():
 
 def ensure_coach_absence_schema():
     db.create_all()
+    if db.engine.dialect.name == "postgresql":
+        absence_columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'coach_absence'
+        """)).fetchall()}
+        absence_additions = {
+            "session_id": "ALTER TABLE coach_absence ADD COLUMN session_id INTEGER",
+            "followup_status": "ALTER TABLE coach_absence ADD COLUMN followup_status VARCHAR(30) DEFAULT 'a_traiter' NOT NULL",
+            "admin_notes": "ALTER TABLE coach_absence ADD COLUMN admin_notes VARCHAR(500)",
+            "reviewed_at": "ALTER TABLE coach_absence ADD COLUMN reviewed_at TIMESTAMP",
+            "reviewed_by": "ALTER TABLE coach_absence ADD COLUMN reviewed_by VARCHAR(150)",
+        }
+        for col, sql in absence_additions.items():
+            if col not in absence_columns:
+                db.session.execute(db.text(sql))
+        db.session.commit()
+        return
     if db.engine.dialect.name != "sqlite":
         return
     absence_columns = {row[1] for row in db.session.execute(db.text("PRAGMA table_info(coach_absence)")).fetchall()}
     absence_additions = {
+        "session_id": "ALTER TABLE coach_absence ADD COLUMN session_id INTEGER",
         "followup_status": "ALTER TABLE coach_absence ADD COLUMN followup_status VARCHAR(30) DEFAULT 'a_traiter' NOT NULL",
         "admin_notes": "ALTER TABLE coach_absence ADD COLUMN admin_notes VARCHAR(500)",
         "reviewed_at": "ALTER TABLE coach_absence ADD COLUMN reviewed_at DATETIME",

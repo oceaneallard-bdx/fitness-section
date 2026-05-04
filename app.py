@@ -858,6 +858,10 @@ def monday_midday_priority_applies(session):
     )
 
 
+def priority_until_label(session):
+    return session.priority_until.strftime("%d/%m/%Y") if session and session.priority_until else ""
+
+
 def booked_count(session):
     return Booking.query.filter_by(session_id=session.id, status="booked").count()
 
@@ -1526,7 +1530,7 @@ def book(session_id):
         flash(f"Vous êtes bloqué jusqu'au {current_user.blocked_until}.")
         return redirect(redirect_target)
     if monday_midday_priority_applies(session) and current_user.status != "mensuel":
-        flash("Priorité réservée aux adhérents mensuels pendant les 7 premiers jours.")
+        flash(f"Priorité réservée aux adhérents mensuels jusqu'au {priority_until_label(session)} inclus.")
         return redirect(redirect_target)
 
     booking, result = create_booking_for_user(current_user, session)

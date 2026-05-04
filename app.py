@@ -1922,8 +1922,15 @@ def coach_schedule():
     abs_by_key = {(a.coach_name, a.absence_date): a for a in own_absences}
     replacements = []
     for absence in absences:
-        session = CourseSession.query.filter_by(coach_name=absence.coach_name, course_date=absence.absence_date).order_by(CourseSession.start_time).first()
-        replacements.append({"absence": absence, "session": session})
+        replacement_sessions = CourseSession.query.filter_by(
+            coach_name=absence.coach_name,
+            course_date=absence.absence_date,
+        ).order_by(CourseSession.start_time).all()
+        if replacement_sessions:
+            for session in replacement_sessions:
+                replacements.append({"absence": absence, "session": session})
+        else:
+            replacements.append({"absence": absence, "session": None})
     return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
@@ -2313,6 +2320,16 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     "</form></td></tr>{% else %}<tr><td colspan=\"6\" class=\"muted\">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}",
     "</form></td><td><a class=\"btn danger\" href=\"{{ url_for('delete_coach_absence', absence_id=a.id, source='admin_planning', year=year, month=month) }}\" onclick=\"return confirm('Supprimer cette demande d\\'absence/congé ?')\">Supprimer</a></td></tr>{% else %}<tr><td colspan=\"7\" class=\"muted\">Aucune absence déclarée ce mois.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'coach_planning')|safe }}",
 )
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """<div class="field"><label>Date</label><input name="absence_date" type="date" required></div>""",
+    """<div class="field"><label>Début</label><input name="start_date" type="date" required></div><div class="field"><label>Fin</label><input name="end_date" type="date" required></div>""",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """<div class="field" style="margin-top:8px"><input name="admin_notes" value="{{ a.admin_notes or '' }}" placeholder="Note admin"></div><button class="btn secondary" type="submit" style="margin-top:8px">Enregistrer suivi</button>""",
+    """<div class="field" style="margin-top:8px"><label>Remplaçant</label><select name="replacement_name"><option value="">-</option>{% for c in replacement_coaches %}<option value="{{ c }}" {% if a.replacement_name == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></div><div class="field" style="margin-top:8px"><input name="admin_notes" value="{{ a.admin_notes or '' }}" placeholder="Note admin"></div><button class="btn secondary" type="submit" style="margin-top:8px">Enregistrer suivi</button>""",
+    1,
+)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace("{% elif a and a.status in ['absent','conge'] %}", "{% elif a and absence_blocks_booking(a) %}")
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<th>Réservation</th></tr>", "<th>Réservation</th><th>Suivi</th></tr>")
@@ -2637,21 +2654,32 @@ def admin_coach_planning():
     month = int(request.values.get("month", today.month))
     if request.method == "POST":
         coach_name = request.form["coach_name"]
-        absence_date = datetime.strptime(request.form["absence_date"], "%Y-%m-%d").date()
+        start_date = datetime.strptime(request.form.get("start_date") or request.form["absence_date"], "%Y-%m-%d").date()
+        end_date = datetime.strptime(request.form.get("end_date") or request.form.get("start_date") or request.form["absence_date"], "%Y-%m-%d").date()
+        if end_date < start_date:
+            flash("La date de fin doit être postérieure ou égale à la date de début.")
+            return redirect(url_for("admin_coach_planning", year=year, month=month))
         status = request.form.get("status", "absent")
         replacement = request.form.get("replacement_name", "").strip()
         notes = request.form.get("notes", "").strip()
-        existing = CoachAbsence.query.filter_by(coach_name=coach_name, absence_date=absence_date).first()
-        if not existing:
-            existing = CoachAbsence(coach_name=coach_name, absence_date=absence_date)
-            db.session.add(existing)
-        existing.status = status
-        existing.replacement_name = replacement
-        existing.notes = notes
+        current_day = start_date
+        saved = 0
+        while current_day <= end_date:
+            existing = CoachAbsence.query.filter_by(coach_name=coach_name, absence_date=current_day).first()
+            if not existing:
+                existing = CoachAbsence(coach_name=coach_name, absence_date=current_day)
+                db.session.add(existing)
+            existing.status = status
+            existing.replacement_name = replacement
+            existing.notes = notes
+            if replacement and existing.followup_status in ["a_traiter", "remplacement_a_trouver"]:
+                existing.followup_status = "remplacement_trouve"
+            saved += 1
+            current_day += timedelta(days=1)
         db.session.commit()
-        member_sent = notify_members_of_coach_absence(coach_name, absence_date, absence_date, status, replacement, notes)
-        flash(f"Planning coach mis à jour. Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else "Planning coach mis à jour.")
-        return redirect(url_for("admin_coach_planning", year=absence_date.year, month=absence_date.month))
+        member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
+        flash(f"Planning coach mis à jour sur {saved} jour(s). Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else f"Planning coach mis à jour sur {saved} jour(s).")
+        return redirect(url_for("admin_coach_planning", year=start_date.year, month=start_date.month))
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     sessions = CourseSession.query.filter(CourseSession.course_date >= start, CourseSession.course_date <= end).order_by(CourseSession.course_date, CourseSession.start_time).all()
@@ -2678,6 +2706,11 @@ def update_coach_absence_followup(absence_id):
     allowed = {"a_traiter", "en_cours", "remplacement_a_trouver", "remplacement_trouve", "valide", "refuse"}
     status = request.form.get("followup_status", "a_traiter")
     absence.followup_status = status if status in allowed else "a_traiter"
+    replacement_name = request.form.get("replacement_name")
+    if replacement_name is not None:
+        absence.replacement_name = replacement_name.strip()
+        if absence.replacement_name and absence.followup_status in ["a_traiter", "remplacement_a_trouver"]:
+            absence.followup_status = "remplacement_trouve"
     absence.admin_notes = request.form.get("admin_notes", "").strip()
     absence.reviewed_at = datetime.utcnow()
     absence.reviewed_by = current_user.display_name()

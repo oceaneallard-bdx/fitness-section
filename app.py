@@ -3,6 +3,7 @@ from calendar import monthrange
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from threading import Thread
 import base64
 import json
 import os
@@ -470,6 +471,13 @@ def archive_expired_memberships():
     today = date.today()
     users = User.query.filter(User.role == "adherent", User.account_status != "archived", User.subscription_end_date.isnot(None), User.subscription_end_date < today).all()
     for user in users:
+        has_future_booking = Booking.query.join(CourseSession).filter(
+            Booking.user_id == user.id,
+            Booking.status.in_(["booked", "waiting_list"]),
+            CourseSession.course_date >= today,
+        ).first()
+        if has_future_booking:
+            continue
         user.account_status = "archived"
         user.archived_at = today
         user.archived_reason = f"Abonnement expiré le {user.subscription_end_date.strftime('%d/%m/%Y')}"
@@ -480,6 +488,22 @@ def archive_expired_memberships():
 
 def active_adherent_query():
     return User.query.filter(User.role == "adherent", User.account_status != "archived")
+
+
+def send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images):
+    def worker():
+        with app.app_context():
+            sent_count = 0
+            failed_count = 0
+            users = User.query.filter(User.id.in_(user_ids), User.role == "adherent", User.account_status != "archived").order_by(User.full_name, User.email).all()
+            for user in users:
+                if send_email(user.email, subject, signed_body, html_body=signed_html, inline_images=inline_images):
+                    sent_count += 1
+                else:
+                    failed_count += 1
+            print(f"\n--- CAMPAGNE EMAIL TERMINÉE ---\nEnvoyés: {sent_count}\nÉchecs: {failed_count}\n-------------------------------\n")
+
+    Thread(target=worker, daemon=True).start()
 
 
 def notify_admins_of_coach_absence(coach_name, start_date, end_date, status, replacement_name="", notes=""):
@@ -2080,11 +2104,9 @@ def admin_email_members():
         signed_body = admin_email_signature_body(body)
         signed_html = admin_email_signature_html(body)
         inline_images = {"fitness_logo": LOGO_PATH} if LOGO_PATH.exists() else {}
-        sent_count = 0
-        for u in users:
-            if send_email(u.email, subject, signed_body, html_body=signed_html, inline_images=inline_images):
-                sent_count += 1
-        flash(f"Email envoyé à {sent_count} adhérent(s)." if sent_count else "SMTP non configuré : les emails apparaissent dans la console, mais ne sont pas réellement envoyés.")
+        user_ids = [u.id for u in users]
+        send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images)
+        flash(f"Campagne email lancée pour {len(user_ids)} adhérent(s). L'envoi continue en arrière-plan pour éviter une erreur serveur.")
         return redirect(url_for("admin_members"))
     return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users)
 
@@ -2612,6 +2634,9 @@ def activate_account(token):
                 return render_template_string(TEMPLATE_ACTIVATE, user=user)
             user.member_profile = member_profile
             user.rights_holder_name = rights_holder_name if member_profile == "ayant_droit" else None
+            if not user.subscription_end_date or user.subscription_end_date < date.today():
+                user.subscription_year = date.today().year
+                user.subscription_end_date = subscription_end(user.subscription_type or "Annuel", user.subscription_year)
         user.set_password(password)
         user.account_status = "active"
         user.activation_token = None

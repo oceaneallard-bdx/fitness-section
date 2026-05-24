@@ -1340,6 +1340,14 @@ def apply_absence_sanction(user):
         )
 
 
+def refresh_absence_block_status(user):
+    absences = absence_count(user)
+    if absences < 2 and user.blocked_reason and user.blocked_reason.startswith("Blocage automatique"):
+        user.blocked_until = None
+        user.blocked_at = None
+        user.blocked_reason = None
+
+
 def planned_sessions_for_day(day):
     """Retourne les cours théoriques à créer pour une date donnée, à partir des paramètres admin."""
     iso_week = day.isocalendar().week
@@ -2456,7 +2464,11 @@ def blocked_members():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
     users = User.query.filter(User.blocked_until >= date.today()).order_by(User.blocked_until.desc()).all()
-    return render_template_string(TEMPLATE_BLOCKED, users=users, absence_count=absence_count)
+    recent_absences = Booking.query.join(CourseSession).join(Booking.user).filter(
+        Booking.status == "absent_unexcused",
+        CourseSession.course_date >= date.today() - timedelta(days=90),
+    ).order_by(CourseSession.course_date.desc(), CourseSession.start_time.desc()).all()
+    return render_template_string(TEMPLATE_BLOCKED, users=users, absence_count=absence_count, recent_absences=recent_absences)
 
 
 @app.route("/admin/unblock/<int:user_id>")
@@ -2472,6 +2484,25 @@ def unblock_member(user_id):
     db.session.commit()
     send_email(user.email, "Déblocage de votre compte Fitness", f"Bonjour {user.display_name()},\n\nVotre compte Fitness a été débloqué. Vous pouvez à nouveau réserver des cours.\n\nSection Fitness")
     flash("Adhérent débloqué.")
+    return redirect(url_for("blocked_members"))
+
+
+@app.route("/admin/absence/remove/<int:booking_id>")
+@login_required
+def remove_unexcused_absence(booking_id):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    booking = Booking.query.get_or_404(booking_id)
+    if booking.status != "absent_unexcused":
+        flash("Cette réservation n'est pas marquée absente.")
+        return redirect(url_for("blocked_members"))
+    user = booking.user
+    booking.status = "booked"
+    booking.attendance_status = None
+    refresh_absence_block_status(user)
+    db.session.commit()
+    flash(f"Marquage absent retiré pour {user.display_name()}.")
     return redirect(url_for("blocked_members"))
 
 
@@ -2800,6 +2831,9 @@ TEMPLATE_EMAIL_MEMBERS = """
 
 TEMPLATE_BLOCKED = """
 {% set content %}<div class="card"><h1>Adhérents bloqués</h1><p class="muted">Liste des adhérents actuellement bloqués automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<table class="table"><tr><th>Nom</th><th>Email</th><th>Jusqu'au</th><th>Motif</th><th>Absences 90j</th><th>Action</th></tr>{% for u in users %}<tr><td>{{ u.display_name() }}</td><td>{{ u.email }}</td><td>{{ u.blocked_until }}</td><td>{{ u.blocked_reason or '-' }}</td><td>{{ absence_count(u) }}</td><td><a class="btn" href="{{ url_for('unblock_member', user_id=u.id) }}">Débloquer</a></td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun adhérent bloqué.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'blocked')|safe }}
+"""
+TEMPLATE_BLOCKED = """
+{% set content %}<div class="card"><h1>Adhérents bloqués</h1><p class="muted">Suivi des blocages automatiques et des absences non excusées à corriger si besoin.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<h2>Comptes bloqués</h2><table class="table"><tr><th>Nom</th><th>Email</th><th>Jusqu'au</th><th>Motif</th><th>Absences 90j</th><th>Action</th></tr>{% for u in users %}<tr><td>{{ u.display_name() }}</td><td>{{ u.email }}</td><td>{{ u.blocked_until }}</td><td>{{ u.blocked_reason or '-' }}</td><td>{{ absence_count(u) }}</td><td><a class="btn" href="{{ url_for('unblock_member', user_id=u.id) }}">Débloquer</a></td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun adhérent bloqué.</td></tr>{% endfor %}</table><br><h2>Absences à vérifier</h2><p class="muted">Cette liste inclut les absences non excusées des 90 derniers jours, même si l'adhérent n'est pas encore bloqué.</p><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Adhérent</th><th>Email</th><th>Absences 90j</th><th>Action</th></tr>{% for b in recent_absences %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</td><td>{{ b.session.course_name }}</td><td>{{ b.user.display_name() }}</td><td>{{ b.user.email }}</td><td>{{ absence_count(b.user) }}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Voir cours</a> <a class="btn danger" href="{{ url_for('remove_unexcused_absence', booking_id=b.id) }}" onclick="return confirm('Retirer ce marquage absent ?')">Retirer absence</a></td></tr>{% else %}<tr><td colspan="7" class="muted">Aucune absence non excusée récente.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'blocked')|safe }}
 """
 
 TEMPLATE_USEFUL_INFO = """

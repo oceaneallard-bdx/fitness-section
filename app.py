@@ -146,6 +146,7 @@ class Booking(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     session_id = db.Column(db.Integer, db.ForeignKey("course_session.id"), nullable=False)
     status = db.Column(db.String(30), nullable=False, default="booked")
+    attendance_status = db.Column(db.String(30), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     archived = db.Column(db.Boolean, nullable=False, default=False)
     user = db.relationship("User", backref="bookings")
@@ -1030,6 +1031,30 @@ def waitlist_capacity(session):
     return session.waitlist_capacity if session.waitlist_capacity is not None else 5
 
 
+def attendance_label(booking):
+    if booking.attendance_status == "present":
+        return "Présent"
+    if booking.attendance_status == "skipped":
+        return "À revoir"
+    if booking.attendance_status == "absent" or booking.status == "absent_unexcused":
+        return "Absent"
+    if booking.status == "waiting_list":
+        return "Liste d'attente"
+    return "Non pointé"
+
+
+def attendance_badge_class(booking):
+    if booking.attendance_status == "present":
+        return ""
+    if booking.attendance_status == "skipped":
+        return "wait"
+    if booking.attendance_status == "absent" or booking.status == "absent_unexcused":
+        return "full"
+    if booking.status == "waiting_list":
+        return "wait"
+    return "wait"
+
+
 def absence_display_label(absence):
     if not absence:
         return ""
@@ -1114,6 +1139,8 @@ def template_helpers():
         "absence_for_session": absence_for_session,
         "absence_session_label": absence_session_label,
         "absence_session_options": absence_session_options,
+        "attendance_badge_class": attendance_badge_class,
+        "attendance_label": attendance_label,
         "user_can_book_session": user_can_book_session,
         "split_name": split_name,
     }
@@ -1785,7 +1812,45 @@ def session_detail(session_id):
         Booking.session_id == session.id,
         Booking.status.in_(["booked", "waiting_list", "absent_unexcused"]),
     ).order_by(Booking.status, Booking.created_at).all()
+    bookings = sorted(bookings, key=lambda b: (
+        2 if b.status == "waiting_list" else 1 if b.attendance_status == "skipped" else 3 if b.status == "absent_unexcused" else 0,
+        b.created_at or datetime.utcnow(),
+        b.id,
+    ))
     return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings)
+
+
+@app.route("/presence/present/<int:booking_id>")
+@login_required
+def mark_present(booking_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé à la coach ou à l’admin.")
+        return redirect(url_for("index"))
+    booking = Booking.query.get_or_404(booking_id)
+    if booking.status not in ["booked", "absent_unexcused"]:
+        flash("Seules les réservations confirmées peuvent être pointées présentes.")
+        return redirect(url_for("session_detail", session_id=booking.session_id))
+    booking.status = "booked"
+    booking.attendance_status = "present"
+    db.session.commit()
+    flash(f"{booking.user.display_name()} marqué présent.")
+    return redirect(url_for("session_detail", session_id=booking.session_id))
+
+
+@app.route("/presence/skip/<int:booking_id>")
+@login_required
+def mark_skipped(booking_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé à la coach ou à l’admin.")
+        return redirect(url_for("index"))
+    booking = Booking.query.get_or_404(booking_id)
+    if booking.status != "booked":
+        flash("Seules les réservations confirmées peuvent être mises de côté.")
+        return redirect(url_for("session_detail", session_id=booking.session_id))
+    booking.attendance_status = "skipped"
+    db.session.commit()
+    flash(f"{booking.user.display_name()} mis de côté pour revenir dessus après.")
+    return redirect(url_for("session_detail", session_id=booking.session_id))
 
 
 @app.route("/presence/absent/<int:booking_id>")
@@ -1799,6 +1864,7 @@ def mark_absent(booking_id):
         flash("Seules les réservations confirmées peuvent être marquées absentes.")
         return redirect(url_for("session_detail", session_id=booking.session_id))
     booking.status = "absent_unexcused"
+    booking.attendance_status = "absent"
     db.session.commit()
     apply_absence_sanction(booking.user)
     send_email(
@@ -2589,6 +2655,9 @@ TEMPLATE_GENERATE = """
 
 TEMPLATE_SESSION_DETAIL = """
 {% set content %}<div class="card"><h1>{{ session.course_name }} - {{ session.course_date.strftime('%d/%m/%Y') }}</h1><p class="muted">{{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">La coach peut contrôler la présence des inscrits et marquer les absences non excusées directement depuis cette page.</p><table class="table"><tr><th>Photo</th><th>Nom</th><th>Email</th><th>Abonnement</th><th>Statut réservation</th>{% if current_user.role in ['admin','coach'] %}<th>Présence</th>{% endif %}</tr>{% for b in bookings %}<tr><td>{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ b.user.display_name() }}</td><td>{{ b.user.email }}</td><td>{{ b.user.subscription_type }} {{ b.user.subscription_year }}</td><td><span class="badge {% if b.status == 'absent_unexcused' %}full{% elif b.status == 'waiting_list' %}wait{% endif %}">{{ b.status }}</span></td>{% if current_user.role in ['admin','coach'] %}<td>{% if b.status == 'booked' %}<a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}">Marquer absent</a>{% elif b.status == 'absent_unexcused' %}<span class="muted">Absence enregistrée</span>{% else %}<span class="muted">-</span>{% endif %}</td>{% endif %}</tr>{% else %}<tr><td colspan="6" class="muted">Aucune réservation.</td></tr>{% endfor %}</table><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
+"""
+TEMPLATE_SESSION_DETAIL = """
+{% set content %}<style>.attendance-list{display:grid;gap:14px}.attendance-card{display:grid;grid-template-columns:76px 1fr;gap:14px;align-items:center;border:1px solid #e5e7eb;border-radius:16px;padding:14px;background:#fff}.attendance-photo{width:76px;height:76px;border-radius:16px;object-fit:cover;background:#e5e7eb;border:1px solid #e5e7eb}.attendance-name{font-size:20px;font-weight:800;margin-bottom:4px}.attendance-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.attendance-actions .btn{text-align:center;padding:13px 8px}.btn.warn{background:#f59e0b}@media(max-width:700px){.main{padding:14px}.card{padding:16px;border-radius:14px}.attendance-card{grid-template-columns:68px 1fr;padding:12px}.attendance-photo{width:68px;height:68px}.attendance-name{font-size:18px}.attendance-actions{grid-template-columns:1fr;gap:8px}.attendance-actions .btn{width:100%;font-size:16px}}</style><div class="card"><h1>{{ session.course_name }}</h1><p class="muted">{{ session.course_date.strftime('%d/%m/%Y') }} · {{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">Appel mobile : traiter chaque adhérent, ou utiliser “Passer” pour revenir dessus après.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">{% for b in bookings %}<div class="attendance-card">{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="attendance-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<div class="attendance-photo"></div>{% endif %}<div><div class="attendance-name">{{ b.user.display_name() }}</div><div class="muted">{{ b.user.email }}</div><div style="margin-top:8px"><span class="badge {{ attendance_badge_class(b) }}">{{ attendance_label(b) }}</span>{% if b.status == 'waiting_list' %} <span class="badge wait">rang {{ waitlist_rank(b) }}</span>{% endif %}</div></div><div class="attendance-actions">{% if b.status in ['booked','absent_unexcused'] %}<a class="btn" href="{{ url_for('mark_present', booking_id=b.id) }}">Présent</a>{% if b.status == 'booked' %}<a class="btn warn" href="{{ url_for('mark_skipped', booking_id=b.id) }}">Passer</a><a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="return confirm('Marquer cet adhérent absent ?')">Absent</a>{% else %}<span class="btn secondary">Passer</span><span class="btn danger">Absent</span>{% endif %}{% else %}<span class="muted">Liste d'attente, pas d'appel.</span>{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
 """
 
 TEMPLATE_MEMBERS = """
@@ -3696,6 +3765,12 @@ def ensure_coach_absence_schema():
         for col, sql in absence_additions.items():
             if col not in absence_columns:
                 db.session.execute(db.text(sql))
+        booking_columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'booking'
+        """)).fetchall()}
+        if "attendance_status" not in booking_columns:
+            db.session.execute(db.text("ALTER TABLE booking ADD COLUMN attendance_status VARCHAR(30)"))
         db.session.commit()
         return
     if db.engine.dialect.name != "sqlite":
@@ -3826,6 +3901,8 @@ def ensure_schema():
     booking_columns = {row[1] for row in db.session.execute(db.text("PRAGMA table_info(booking)")).fetchall()}
     if "archived" not in booking_columns:
         db.session.execute(db.text("ALTER TABLE booking ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0"))
+    if "attendance_status" not in booking_columns:
+        db.session.execute(db.text("ALTER TABLE booking ADD COLUMN attendance_status VARCHAR(30)"))
 
     ensure_coach_absence_schema()
     ensure_inventory_schema()

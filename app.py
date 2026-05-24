@@ -1188,7 +1188,9 @@ def template_helpers():
         "absence_session_options": absence_session_options,
         "attendance_badge_class": attendance_badge_class,
         "attendance_label": attendance_label,
+        "booked_count": booked_count,
         "user_can_book_session": user_can_book_session,
+        "waitlist_rank": waitlist_rank,
         "split_name": split_name,
     }
 
@@ -1862,6 +1864,7 @@ def session_detail(session_id):
     if not is_coach_or_admin():
         flash("Accès réservé au coach ou à l’admin.")
         return redirect(url_for("index"))
+    ensure_coach_absence_schema()
     session = CourseSession.query.get_or_404(session_id)
     bookings = Booking.query.filter(
         Booking.session_id == session.id,
@@ -1872,7 +1875,7 @@ def session_detail(session_id):
         b.created_at or datetime.utcnow(),
         b.id,
     ))
-    return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings)
+    return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings, waitlist_rank=waitlist_rank)
 
 
 @app.route("/presence/present/<int:booking_id>")
@@ -2731,9 +2734,6 @@ TEMPLATE_GENERATE = """
 {% set content %}<div class="card form-wrap"><h1>Générer les créneaux</h1>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post"><div class="form-grid"><div class="field"><label>Année</label><input name="year" type="number" value="{{ current_year }}" required></div><div class="field"><label>Mois</label><input name="month" type="number" min="1" max="12" value="{{ current_month }}" required></div></div><br><button class="btn" type="submit">Générer manuellement ce mois</button> <a class="btn secondary" href="{{ url_for('index') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'generate')|safe }}
 """
 
-TEMPLATE_SESSION_DETAIL = """
-{% set content %}<div class="card"><h1>{{ session.course_name }} - {{ session.course_date.strftime('%d/%m/%Y') }}</h1><p class="muted">{{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">La coach peut contrôler la présence des inscrits et marquer les absences non excusées directement depuis cette page.</p><table class="table"><tr><th>Photo</th><th>Nom</th><th>Email</th><th>Abonnement</th><th>Statut réservation</th>{% if current_user.role in ['admin','coach'] %}<th>Présence</th>{% endif %}</tr>{% for b in bookings %}<tr><td>{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ b.user.display_name() }}</td><td>{{ b.user.email }}</td><td>{{ b.user.subscription_type }} {{ b.user.subscription_year }}</td><td><span class="badge {% if b.status == 'absent_unexcused' %}full{% elif b.status == 'waiting_list' %}wait{% endif %}">{{ b.status }}</span></td>{% if current_user.role in ['admin','coach'] %}<td>{% if b.status == 'booked' %}<a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}">Marquer absent</a>{% elif b.status == 'absent_unexcused' %}<span class="muted">Absence enregistrée</span>{% else %}<span class="muted">-</span>{% endif %}</td>{% endif %}</tr>{% else %}<tr><td colspan="6" class="muted">Aucune réservation.</td></tr>{% endfor %}</table><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
-"""
 TEMPLATE_SESSION_DETAIL = """
 {% set content %}<style>.attendance-list{display:grid;gap:14px}.attendance-card{display:grid;grid-template-columns:76px 1fr;gap:14px;align-items:center;border:1px solid #e5e7eb;border-radius:16px;padding:14px;background:#fff}.attendance-photo{width:76px;height:76px;border-radius:16px;object-fit:cover;background:#e5e7eb;border:1px solid #e5e7eb}.attendance-name{font-size:20px;font-weight:800;margin-bottom:4px}.attendance-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.attendance-actions .btn{text-align:center;padding:13px 8px}.btn.warn{background:#f59e0b}@media(max-width:700px){.main{padding:14px}.card{padding:16px;border-radius:14px}.attendance-card{grid-template-columns:68px 1fr;padding:12px}.attendance-photo{width:68px;height:68px}.attendance-name{font-size:18px}.attendance-actions{grid-template-columns:1fr;gap:8px}.attendance-actions .btn{width:100%;font-size:16px}}</style><div class="card"><h1>{{ session.course_name }}</h1><p class="muted">{{ session.course_date.strftime('%d/%m/%Y') }} · {{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">Appel mobile : traiter chaque adhérent, ou utiliser “Passer” pour revenir dessus après.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">{% for b in bookings %}<div class="attendance-card">{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="attendance-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<div class="attendance-photo"></div>{% endif %}<div><div class="attendance-name">{{ b.user.display_name() }}</div><div class="muted">{{ b.user.email }}</div><div style="margin-top:8px"><span class="badge {{ attendance_badge_class(b) }}">{{ attendance_label(b) }}</span>{% if b.status == 'waiting_list' %} <span class="badge wait">rang {{ waitlist_rank(b) }}</span>{% endif %}</div></div><div class="attendance-actions">{% if b.status in ['booked','absent_unexcused'] %}<a class="btn" href="{{ url_for('mark_present', booking_id=b.id) }}">Présent</a>{% if b.status == 'booked' %}<a class="btn warn" href="{{ url_for('mark_skipped', booking_id=b.id) }}">Passer</a><a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="return confirm('Marquer cet adhérent absent ?')">Absent</a>{% else %}<span class="btn secondary">Passer</span><span class="btn danger">Absent</span>{% endif %}{% else %}<span class="muted">Liste d'attente, pas d'appel.</span>{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
 """

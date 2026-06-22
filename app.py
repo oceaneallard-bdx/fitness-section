@@ -328,6 +328,8 @@ SUBSCRIPTION_ALIASES = {
 }
 TEMPORARY_BOOKING_GRACE_START = date(2026, 7, 1)
 TEMPORARY_BOOKING_GRACE_END = date(2026, 7, 15)
+DEMO_ADHERENT_EMAIL = "adherent@fitness.local"
+DEMO_COACH_EMAIL = "coach@fitness.local"
 DEFAULT_ANNUAL_MEMBERSHIP_FEE = 10.0
 MEMBER_PROFILE_LABELS = {
     "ouvrant_droit": "Ouvrant droit",
@@ -718,7 +720,7 @@ def archive_expired_memberships():
     today = date.today()
     if today <= TEMPORARY_BOOKING_GRACE_END:
         return 0
-    users = User.query.filter(User.role == "adherent", User.account_status != "archived", User.subscription_end_date.isnot(None), User.subscription_end_date < today).all()
+    users = User.query.filter(User.role == "adherent", User.email != DEMO_ADHERENT_EMAIL, User.account_status != "archived", User.subscription_end_date.isnot(None), User.subscription_end_date < today).all()
     for user in users:
         has_future_booking = Booking.query.join(CourseSession).filter(
             Booking.user_id == user.id,
@@ -736,12 +738,13 @@ def archive_expired_memberships():
 
 
 def active_adherent_query():
-    return User.query.filter(User.role == "adherent", User.account_status != "archived")
+    return User.query.filter(User.role == "adherent", User.email != DEMO_ADHERENT_EMAIL, User.account_status != "archived")
 
 
 def active_member_query():
     return User.query.filter(
         User.account_status != "archived",
+        User.email != DEMO_ADHERENT_EMAIL,
         db.or_(
             User.role == "adherent",
             db.and_(User.role == "admin", User.subscription_type.isnot(None), User.subscription_year.isnot(None)),
@@ -2877,6 +2880,11 @@ TEMPLATE_INDEX = """
 {% if current_user.role == 'admin' %}<section class="card"><h2>Dernières actions adhérents</h2><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Cours</th><th>Statut</th><th>Actions</th></tr>{% for b in latest_bookings %}<tr><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td><td>{{ b.user.display_name() }}<br><small class="muted">{{ b.user.email }}</small></td><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% elif b.status == 'booked' %}<span class="badge">Réservé</span>{% else %}<span class="badge full">{{ b.status }}</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Modifier</a>{% if b.status in ['booked','waiting_list'] %} <a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}" onclick="return confirm('Annuler cette réservation ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune réservation récente.</td></tr>{% endfor %}</table></section>{% else %}<section class="card"><h2>Mes réservations à venir</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th></th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div></section>{% endif %}</div>
 {% endset %}{{ shell(content, 'home')|safe }}
 """
+TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
+    """<section class="card"><h2>Dernières actions adhérents</h2><table class="table">""",
+    """<section class="card"><h2>Dernières actions adhérents</h2><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue adhérent démo</h2><p class="muted">Pour voir l'affichage exact d'un profil adhérent, déconnectez-vous puis connectez-vous avec <code>adherent@fitness.local</code> et le mot de passe <code>adherent123</code>.</p></div><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue coach démo</h2><p class="muted">Pour voir l'affichage exact d'un profil coach, déconnectez-vous puis connectez-vous avec <code>coach@fitness.local</code> et le mot de passe <code>coach123</code>.</p></div><table class="table">""",
+    1,
+)
 
 TEMPLATE_MEMBER_PROFILE = """
 {% set content %}<div class="card form-wrap"><h1>Mon profil</h1><p class="muted">Modifier votre statut adhérent, vos préférences ou votre photo de profil.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if current_user.profile_photo or current_user.profile_photo_data %}<img class="photo-preview" src="{{ url_for('profile_photo_file', user_id=current_user.id) }}" alt="Photo profil"><br><br>{% endif %}<form method="post" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>Nom complet</label><input value="{{ current_user.display_name() }}" disabled></div><div class="field"><label>Email</label><input value="{{ current_user.email }}" disabled></div><div class="field"><label>Statut prioritaire</label><select name="status"><option value="mensuel" {% if current_user.status == 'mensuel' %}selected{% endif %}>Mensuel</option><option value="cadre" {% if current_user.status == 'cadre' %}selected{% endif %}>Cadre</option><option value="autre" {% if current_user.status == 'autre' %}selected{% endif %}>Autre</option></select></div><div class="field"><label>Profil adhérent</label><select name="member_profile"><option value="ouvrant_droit" {% if current_user.member_profile == 'ouvrant_droit' or not current_user.member_profile %}selected{% endif %}>Ouvrant droit - personnel Thales, alternant, stagiaire, CDD</option><option value="ayant_droit" {% if current_user.member_profile == 'ayant_droit' %}selected{% endif %}>Ayant droit - proche d'un ouvrant droit</option><option value="exterieur" {% if current_user.member_profile == 'exterieur' %}selected{% endif %}>Extérieur - prestataire sur site Thales</option><option value="retraite" {% if current_user.member_profile == 'retraite' %}selected{% endif %}>Retraité</option></select></div><div class="field" style="grid-column:1/-1"><label>Nom et prénom de l'ouvrant droit, si ayant droit</label><input name="rights_holder_name" value="{{ current_user.rights_holder_name or '' }}"></div><div class="field"><label>Cours préféré</label><select name="preferred_course"><option value="">-</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if current_user.preferred_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach préféré</label><select name="preferred_coach"><option value="">-</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if current_user.preferred_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau préféré</label><select name="preferred_slot"><option value="">-</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if current_user.preferred_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field" style="grid-column:1/-1"><label>Nouvelle photo de profil JPG/PNG, facultative</label><input name="profile_photo" type="file" accept="image/png,image/jpeg"></div></div><br><button class="btn" type="submit">Enregistrer</button> <a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Télécharger ma carte</a></form></div>{% endset %}{{ shell(content, 'member_profile')|safe }}
@@ -4323,13 +4331,54 @@ def create_default_admin():
         admin.admin_role = "presidente"
         db.session.commit()
 
-    coach = User.query.filter_by(email="coach@fitness.local").first()
+    coach = User.query.filter_by(email=DEMO_COACH_EMAIL).first()
     if not coach:
-        coach = User(email="coach@fitness.local", role="coach", status="autre", full_name="Coach Fitness")
-        coach.set_password("coach123")
+        coach = User(email=DEMO_COACH_EMAIL, role="coach", status="autre", full_name="Coach Fitness", account_status="active")
         db.session.add(coach)
-        db.session.commit()
-        print("Coach créé : coach@fitness.local / coach123")
+    else:
+        coach.role = "coach"
+        coach.status = coach.status or "autre"
+        coach.full_name = coach.full_name or "Coach Fitness"
+        coach.account_status = "active"
+    coach.set_password("coach123")
+    db.session.commit()
+    print("Coach démo disponible : coach@fitness.local / coach123")
+
+    demo = User.query.filter_by(email=DEMO_ADHERENT_EMAIL).first()
+    if not demo:
+        demo = User(
+            email=DEMO_ADHERENT_EMAIL,
+            role="adherent",
+            status="mensuel",
+            full_name="Adhérent Démo",
+            first_name="Adhérent",
+            last_name="Démo",
+            member_profile="ouvrant_droit",
+            subscription_type="Annuel",
+            subscription_year=2026,
+            subscription_end_date=date(2026, 12, 31),
+            account_status="active",
+            member_number="DEMO-2026",
+            preferred_course="Pilates",
+            preferred_coach="Hayate",
+            preferred_slot="Lundi midi",
+        )
+        db.session.add(demo)
+    else:
+        demo.role = "adherent"
+        demo.status = "mensuel"
+        demo.full_name = demo.full_name or "Adhérent Démo"
+        demo.first_name = demo.first_name or "Adhérent"
+        demo.last_name = demo.last_name or "Démo"
+        demo.member_profile = demo.member_profile or "ouvrant_droit"
+        demo.subscription_type = demo.subscription_type or "Annuel"
+        demo.subscription_year = demo.subscription_year or 2026
+        demo.subscription_end_date = demo.subscription_end_date or date(2026, 12, 31)
+        demo.account_status = "active"
+        demo.member_number = demo.member_number or "DEMO-2026"
+    demo.set_password("adherent123")
+    db.session.commit()
+    print("Adhérent démo disponible : adherent@fitness.local / adherent123")
 
 
 def start_scheduler():

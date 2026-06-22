@@ -757,7 +757,7 @@ def send_member_campaign_async(user_ids, subject, signed_body, signed_html, inli
         with app.app_context():
             sent_count = 0
             failed_count = 0
-            users = User.query.filter(User.id.in_(user_ids), User.role == "adherent", User.account_status != "archived").order_by(User.full_name, User.email).all()
+            users = User.query.filter(User.id.in_(user_ids), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
             for user in users:
                 if send_email(user.email, subject, signed_body, html_body=signed_html, inline_images=inline_images):
                     sent_count += 1
@@ -2617,24 +2617,35 @@ def admin_email_members():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
     selected_ids = request.values.getlist("user_ids")
+    target_roles = request.values.getlist("target_roles") or ["adherent"]
+    valid_roles = {"adherent", "admin", "coach"}
+    target_roles = [role for role in target_roles if role in valid_roles] or ["adherent"]
     if selected_ids:
-        users = User.query.filter(User.id.in_([int(i) for i in selected_ids]), User.role == "adherent").order_by(User.full_name, User.email).all()
+        selected_member_ids = [int(i) for i in selected_ids if str(i).isdigit()]
+        user_filters = []
+        if "adherent" in target_roles and selected_member_ids:
+            user_filters.append(db.and_(User.role == "adherent", User.id.in_(selected_member_ids)))
+        if "admin" in target_roles:
+            user_filters.append(User.role == "admin")
+        if "coach" in target_roles:
+            user_filters.append(User.role == "coach")
+        users = User.query.filter(User.account_status != "archived", db.or_(*user_filters)).order_by(User.role, User.full_name, User.email).all() if user_filters else []
     else:
-        users = User.query.filter_by(role="adherent").order_by(User.full_name, User.email).all()
+        users = User.query.filter(User.role.in_(target_roles), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
     if request.method == "POST":
         subject = request.form["subject"].strip()
         body = request.form["body"].strip()
         if not subject or not body:
             flash("Merci de renseigner un objet et un message.")
-            return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users)
+            return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles)
         signed_body = admin_email_signature_body(body)
         signed_html = admin_email_signature_html(body)
         inline_images = {"fitness_logo": LOGO_PATH} if LOGO_PATH.exists() else {}
         user_ids = [u.id for u in users]
         send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images)
-        flash(f"Campagne email lancée pour {len(user_ids)} adhérent(s). L'envoi continue en arrière-plan pour éviter une erreur serveur.")
+        flash(f"Campagne email lancée pour {len(user_ids)} destinataire(s). L'envoi continue en arrière-plan pour éviter une erreur serveur.")
         return redirect(url_for("admin_members"))
-    return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users)
+    return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles)
 
 
 @app.route("/admin/blocked")
@@ -2815,7 +2826,7 @@ def shell(content, active=""):
             f'<a class="{"active" if active=="settings" else ""}" href="{url_for("admin_settings")}">Paramètres</a>'
             f'<a class="{"active" if active=="useful_info" else ""}" href="{url_for("useful_info")}">Infos utiles</a>'
             f'<a class="{"active" if active=="blocked" else ""}" href="{url_for("blocked_members")}">Adhérents bloqués</a>'
-            f'<a class="{"active" if active=="archives" else ""}" href="{url_for("admin_archives")}">Archives</a>'
+            f'<a class="{"active" if active=="archives" else ""}" href="{url_for("archived_members")}">Archives</a>'
             f'<a href="{url_for("export_excel")}">Export des données</a>'
             f'<a class="{"active" if active=="member_profile" else ""}" href="{url_for("member_profile")}">Mon profil adhérent</a>'
             f'<a class="{"active" if active=="member_coach_planning" else ""}" href="{url_for("member_coach_planning")}">Réserver mes cours</a>'
@@ -2883,6 +2894,11 @@ TEMPLATE_INDEX = """
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
     """<section class="card"><h2>Dernières actions adhérents</h2><table class="table">""",
     """<section class="card"><h2>Dernières actions adhérents</h2><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue adhérent démo</h2><p class="muted">Pour voir l'affichage exact d'un profil adhérent, déconnectez-vous puis connectez-vous avec <code>adherent@fitness.local</code> et le mot de passe <code>adherent123</code>.</p></div><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue coach démo</h2><p class="muted">Pour voir l'affichage exact d'un profil coach, déconnectez-vous puis connectez-vous avec <code>coach@fitness.local</code> et le mot de passe <code>coach123</code>.</p></div><table class="table">""",
+    1,
+)
+TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
+    """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
+    """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Les cours sont créés automatiquement 28 jours avant leur date.</p><p>Pour les créneaux réservables, les adhérents mensuels disposent d'une priorité de réservation pendant les 7 premiers jours.</p><p>Après ces 7 jours, les places restantes sont ouvertes à tous les statuts : cadres et autres peuvent alors réserver jusqu'à 21 jours avant la date du cours, selon les places disponibles.</p><p>Chaque adhérent est autonome pour réserver et annuler ses créneaux depuis son profil. Les membres du Bureau Fitness n'ont pas la main pour annuler une réservation à la place d'un adhérent.</p><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
     1,
 )
 
@@ -3028,7 +3044,7 @@ TEMPLATE_ARCHIVES = """
 """
 
 TEMPLATE_EMAIL_MEMBERS = """
-{% set content %}<div class="card form-wrap"><h1>Email adhérents</h1><p class="muted">Destinataires : {{ users|length }} adhérent(s). La signature du Bureau Fitness et le logo sont ajoutés automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Destinataires</strong><p class="muted">{% for u in users %}{{ u.display_name() }} &lt;{{ u.email }}&gt;{% if not loop.last %}, {% endif %}{% endfor %}</p></div><form method="post">{% for u in users %}<input type="hidden" name="user_ids" value="{{ u.id }}">{% endfor %}<div class="field"><label>Objet</label><input name="subject" required placeholder="Ex. Informations Section Fitness"></div><br><div class="field"><label>Message</label><textarea name="body" required rows="10" style="width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px"></textarea></div><br><button class="btn" type="submit">Envoyer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'members')|safe }}
+{% set content %}<div class="card form-wrap"><h1>Campagne email</h1><p class="muted">Choisissez les groupes destinataires. La signature du Bureau Fitness et le logo sont ajoutés automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post">{% for u in users if u.role == 'adherent' %}<input type="hidden" name="user_ids" value="{{ u.id }}">{% endfor %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Destinataires</strong><div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px"><label><input type="checkbox" name="target_roles" value="adherent" {% if 'adherent' in target_roles %}checked{% endif %}> Adhérents</label><label><input type="checkbox" name="target_roles" value="admin" {% if 'admin' in target_roles %}checked{% endif %}> Admins</label><label><input type="checkbox" name="target_roles" value="coach" {% if 'coach' in target_roles %}checked{% endif %}> Coachs</label></div><p class="muted">{{ users|length }} destinataire(s) actuellement listé(s). Si des adhérents ont été sélectionnés depuis l'onglet Adhérents, seuls ces adhérents sont repris.</p><p class="muted">{% for u in users %}{{ u.display_name() }} &lt;{{ u.email }}&gt;{% if not loop.last %}, {% endif %}{% else %}Aucun destinataire pour cette sélection.{% endfor %}</p></div><br><div class="field"><label>Objet</label><input name="subject" required placeholder="Ex. Informations Section Fitness"></div><br><div class="field"><label>Message</label><textarea name="body" required rows="10" style="width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px"></textarea></div><br><button class="btn" type="submit">Envoyer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 
 TEMPLATE_BLOCKED = """
@@ -4195,10 +4211,18 @@ def ensure_membership_period_schema():
             WHERE table_name = 'membership_period'
         """)).fetchall()}
         additions = {
+            "subscription_type": "ALTER TABLE membership_period ADD COLUMN subscription_type VARCHAR(50) DEFAULT 'Annuel' NOT NULL",
+            "subscription_year": "ALTER TABLE membership_period ADD COLUMN subscription_year INTEGER DEFAULT 2026 NOT NULL",
+            "start_date": "ALTER TABLE membership_period ADD COLUMN start_date DATE DEFAULT CURRENT_DATE NOT NULL",
+            "end_date": "ALTER TABLE membership_period ADD COLUMN end_date DATE DEFAULT CURRENT_DATE NOT NULL",
+            "annual_fee_applies": "ALTER TABLE membership_period ADD COLUMN annual_fee_applies BOOLEAN DEFAULT FALSE NOT NULL",
             "subscription_price_snapshot": "ALTER TABLE membership_period ADD COLUMN subscription_price_snapshot DOUBLE PRECISION",
             "annual_fee_snapshot": "ALTER TABLE membership_period ADD COLUMN annual_fee_snapshot DOUBLE PRECISION",
             "total_snapshot": "ALTER TABLE membership_period ADD COLUMN total_snapshot DOUBLE PRECISION",
             "tariff_snapshot_at": "ALTER TABLE membership_period ADD COLUMN tariff_snapshot_at TIMESTAMP",
+            "created_at": "ALTER TABLE membership_period ADD COLUMN created_at TIMESTAMP",
+            "created_by": "ALTER TABLE membership_period ADD COLUMN created_by VARCHAR(150)",
+            "notes": "ALTER TABLE membership_period ADD COLUMN notes VARCHAR(500)",
         }
         for col, sql in additions.items():
             if col not in columns:
@@ -4230,13 +4254,69 @@ def ensure_schema():
             WHERE table_name = 'user'
         """)).fetchall()}
         postgres_user_additions = {
+            "full_name": "ALTER TABLE \"user\" ADD COLUMN full_name VARCHAR(150)",
             "first_name": "ALTER TABLE \"user\" ADD COLUMN first_name VARCHAR(80)",
             "last_name": "ALTER TABLE \"user\" ADD COLUMN last_name VARCHAR(80)",
+            "profile_photo": "ALTER TABLE \"user\" ADD COLUMN profile_photo VARCHAR(255)",
             "profile_photo_data": "ALTER TABLE \"user\" ADD COLUMN profile_photo_data TEXT",
             "profile_photo_mime": "ALTER TABLE \"user\" ADD COLUMN profile_photo_mime VARCHAR(80)",
+            "subscription_type": "ALTER TABLE \"user\" ADD COLUMN subscription_type VARCHAR(50)",
+            "subscription_year": "ALTER TABLE \"user\" ADD COLUMN subscription_year INTEGER",
+            "member_profile": "ALTER TABLE \"user\" ADD COLUMN member_profile VARCHAR(30)",
+            "rights_holder_name": "ALTER TABLE \"user\" ADD COLUMN rights_holder_name VARCHAR(150)",
+            "member_number": "ALTER TABLE \"user\" ADD COLUMN member_number VARCHAR(30)",
+            "member_card": "ALTER TABLE \"user\" ADD COLUMN member_card VARCHAR(255)",
+            "blocked_at": "ALTER TABLE \"user\" ADD COLUMN blocked_at DATE",
+            "blocked_reason": "ALTER TABLE \"user\" ADD COLUMN blocked_reason VARCHAR(255)",
+            "preferred_course": "ALTER TABLE \"user\" ADD COLUMN preferred_course VARCHAR(100)",
+            "preferred_coach": "ALTER TABLE \"user\" ADD COLUMN preferred_coach VARCHAR(150)",
+            "preferred_slot": "ALTER TABLE \"user\" ADD COLUMN preferred_slot VARCHAR(80)",
+            "admin_role": "ALTER TABLE \"user\" ADD COLUMN admin_role VARCHAR(50)",
+            "account_status": "ALTER TABLE \"user\" ADD COLUMN account_status VARCHAR(30) DEFAULT 'active' NOT NULL",
+            "activation_token": "ALTER TABLE \"user\" ADD COLUMN activation_token VARCHAR(255)",
+            "activation_expires_at": "ALTER TABLE \"user\" ADD COLUMN activation_expires_at TIMESTAMP",
+            "subscription_end_date": "ALTER TABLE \"user\" ADD COLUMN subscription_end_date DATE",
+            "archived_at": "ALTER TABLE \"user\" ADD COLUMN archived_at DATE",
+            "archived_reason": "ALTER TABLE \"user\" ADD COLUMN archived_reason VARCHAR(255)",
+            "created_at": "ALTER TABLE \"user\" ADD COLUMN created_at TIMESTAMP",
+            "coach_type": "ALTER TABLE \"user\" ADD COLUMN coach_type VARCHAR(30) DEFAULT 'titulaire' NOT NULL",
         }
         for col, sql in postgres_user_additions.items():
             if col not in user_columns:
+                db.session.execute(db.text(sql))
+        course_columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'course_session'
+        """)).fetchall()}
+        course_additions = {
+            "coach_name": "ALTER TABLE course_session ADD COLUMN coach_name VARCHAR(150)",
+            "is_reservable": "ALTER TABLE course_session ADD COLUMN is_reservable BOOLEAN DEFAULT TRUE NOT NULL",
+            "waitlist_capacity": "ALTER TABLE course_session ADD COLUMN waitlist_capacity INTEGER DEFAULT 5 NOT NULL",
+        }
+        for col, sql in course_additions.items():
+            if col not in course_columns:
+                db.session.execute(db.text(sql))
+        template_columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'course_template'
+        """)).fetchall()}
+        template_additions = {
+            "is_reservable": "ALTER TABLE course_template ADD COLUMN is_reservable BOOLEAN DEFAULT TRUE NOT NULL",
+            "waitlist_capacity": "ALTER TABLE course_template ADD COLUMN waitlist_capacity INTEGER DEFAULT 5 NOT NULL",
+        }
+        for col, sql in template_additions.items():
+            if col not in template_columns:
+                db.session.execute(db.text(sql))
+        booking_columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'booking'
+        """)).fetchall()}
+        booking_additions = {
+            "archived": "ALTER TABLE booking ADD COLUMN archived BOOLEAN DEFAULT FALSE NOT NULL",
+            "attendance_status": "ALTER TABLE booking ADD COLUMN attendance_status VARCHAR(30)",
+        }
+        for col, sql in booking_additions.items():
+            if col not in booking_columns:
                 db.session.execute(db.text(sql))
         db.session.commit()
         seed_default_2026_tariffs_once()

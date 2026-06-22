@@ -161,6 +161,10 @@ class MembershipPeriod(db.Model):
     start_date = db.Column(db.Date, nullable=False)
     end_date = db.Column(db.Date, nullable=False)
     annual_fee_applies = db.Column(db.Boolean, nullable=False, default=False)
+    subscription_price_snapshot = db.Column(db.Float, nullable=True)
+    annual_fee_snapshot = db.Column(db.Float, nullable=True)
+    total_snapshot = db.Column(db.Float, nullable=True)
+    tariff_snapshot_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     created_by = db.Column(db.String(150), nullable=True)
     notes = db.Column(db.String(500), nullable=True)
@@ -308,12 +312,23 @@ SUBSCRIPTION_PRICES = {
     "Annuel": 140.0, "Semestre 1": 60.0, "Semestre 2": 60.0,
     "Trimestre 1": 35.0, "T2": 35.0, "T3": 35.0, "T4": 35.0,
 }
+DEFAULT_2026_PROFILE_PRICES = {
+    "Annuel": {"ouvrant_droit": 140.0, "ayant_droit": 140.0, "exterieur": 280.0, "retraite": 280.0},
+    "Semestre 1": {"ouvrant_droit": 60.0, "ayant_droit": 60.0, "exterieur": 120.0, "retraite": 120.0},
+    "Semestre 2": {"ouvrant_droit": 45.0, "ayant_droit": 45.0, "exterieur": 90.0, "retraite": 90.0},
+    "Trimestre 1": {"ouvrant_droit": 35.0, "ayant_droit": 35.0, "exterieur": 70.0, "retraite": 70.0},
+    "T2": {"ouvrant_droit": 35.0, "ayant_droit": 35.0, "exterieur": 70.0, "retraite": 70.0},
+    "T3": {"ouvrant_droit": 25.0, "ayant_droit": 25.0, "exterieur": 50.0, "retraite": 50.0},
+    "T4": {"ouvrant_droit": 30.0, "ayant_droit": 30.0, "exterieur": 60.0, "retraite": 60.0},
+}
 SUBSCRIPTION_ALIASES = {
     "Trimestre 2": "T2",
     "Trimestre 3": "T3",
     "Trimestre 4": "T4",
 }
-DEFAULT_ANNUAL_MEMBERSHIP_FEE = 0.0
+TEMPORARY_BOOKING_GRACE_START = date(2026, 7, 1)
+TEMPORARY_BOOKING_GRACE_END = date(2026, 7, 15)
+DEFAULT_ANNUAL_MEMBERSHIP_FEE = 10.0
 MEMBER_PROFILE_LABELS = {
     "ouvrant_droit": "Ouvrant droit",
     "ayant_droit": "Ayant droit",
@@ -415,7 +430,7 @@ def get_subscription_price_matrix():
         matrix[subscription_type] = {}
         base_price = base_prices.get(subscription_type, SUBSCRIPTION_PRICES[subscription_type])
         for member_profile in MEMBER_PROFILE_LABELS:
-            default_price = base_price * member_profile_rate(member_profile)
+            default_price = DEFAULT_2026_PROFILE_PRICES.get(subscription_type, {}).get(member_profile, base_price * member_profile_rate(member_profile))
             key = subscription_profile_price_key(subscription_type, member_profile)
             matrix[subscription_type][member_profile] = parse_amount(setting_value(key, default_price), default_price)
     return matrix
@@ -423,6 +438,26 @@ def get_subscription_price_matrix():
 
 def get_annual_membership_fee():
     return parse_amount(setting_value("annual_membership_fee", DEFAULT_ANNUAL_MEMBERSHIP_FEE), DEFAULT_ANNUAL_MEMBERSHIP_FEE)
+
+
+def seed_default_2026_tariffs_once():
+    if setting_value("default_2026_tariffs_seeded", "") == "yes":
+        return
+    set_setting_value("annual_membership_fee", DEFAULT_ANNUAL_MEMBERSHIP_FEE)
+    for subscription_type, profile_prices in DEFAULT_2026_PROFILE_PRICES.items():
+        for member_profile, amount in profile_prices.items():
+            set_setting_value(subscription_profile_price_key(subscription_type, member_profile), amount)
+    set_setting_value("default_2026_tariffs_seeded", "yes")
+    db.session.commit()
+
+
+def membership_tariff_snapshot(user, subscription_type, annual_fee_applies=False):
+    subscription_type = normalize_subscription_type(subscription_type)
+    member_profile = user.member_profile or "ouvrant_droit"
+    price_matrix = get_subscription_price_matrix()
+    subscription_price = price_matrix.get(subscription_type, {}).get(member_profile, 0.0)
+    annual_fee = get_annual_membership_fee() if annual_fee_applies else 0.0
+    return subscription_price, annual_fee, subscription_price + annual_fee
 
 
 def get_replacement_coaches():
@@ -496,9 +531,6 @@ def first_registration_fee_applies(user, year):
 
 def expected_dues_rows(year=None):
     year = int(year or date.today().year)
-    prices = get_subscription_prices()
-    price_matrix = get_subscription_price_matrix()
-    annual_fee = get_annual_membership_fee()
     rows = []
     periods = MembershipPeriod.query.join(User).filter(
         User.role.in_(["adherent", "admin"]),
@@ -510,29 +542,30 @@ def expected_dues_rows(year=None):
         user = period.user
         member_profile = user.member_profile or "ouvrant_droit"
         subscription_type = normalize_subscription_type(period.subscription_type)
-        base_subscription_price = prices.get(subscription_type or "", 0.0)
-        subscription_price = price_matrix.get(subscription_type or "", {}).get(member_profile, base_subscription_price * member_profile_rate(member_profile))
-        profile_rate = subscription_price / base_subscription_price if base_subscription_price else 0
-        first_fee = annual_fee if period.annual_fee_applies else 0.0
+        subscription_price = period.subscription_price_snapshot
+        first_fee = period.annual_fee_snapshot if period.annual_fee_applies else 0.0
+        if subscription_price is None:
+            subscription_price, fallback_fee, _ = membership_tariff_snapshot(user, subscription_type, period.annual_fee_applies)
+            first_fee = fallback_fee if period.annual_fee_applies else 0.0
+        total = period.total_snapshot if period.total_snapshot is not None else subscription_price + first_fee
         rows.append({
             "user": user,
             "subscription_type": subscription_type,
             "subscription_year": period.subscription_year,
             "member_profile_label": member_profile_label(member_profile),
-            "profile_rate": profile_rate,
-            "base_subscription_price": base_subscription_price,
+            "profile_rate": 0,
+            "base_subscription_price": subscription_price,
             "subscription_price": subscription_price,
             "annual_fee": first_fee,
-            "total": subscription_price + first_fee,
+            "total": total,
         })
     users = active_member_query().filter(User.subscription_year == year, ~User.id.in_(period_user_ids or {0})).order_by(User.full_name, User.email).all()
     for user in users:
         member_profile = user.member_profile or "ouvrant_droit"
         subscription_type = normalize_subscription_type(user.subscription_type)
-        base_subscription_price = prices.get(subscription_type or "", 0.0)
-        subscription_price = price_matrix.get(subscription_type or "", {}).get(member_profile, base_subscription_price * member_profile_rate(member_profile))
-        first_fee = annual_fee if first_registration_fee_applies(user, year) else 0.0
-        rows.append({"user": user, "subscription_type": subscription_type, "subscription_year": user.subscription_year, "member_profile_label": member_profile_label(member_profile), "profile_rate": subscription_price / base_subscription_price if base_subscription_price else 0, "base_subscription_price": base_subscription_price, "subscription_price": subscription_price, "annual_fee": first_fee, "total": subscription_price + first_fee})
+        first_fee_applies = first_registration_fee_applies(user, year)
+        subscription_price, first_fee, total = membership_tariff_snapshot(user, subscription_type, first_fee_applies)
+        rows.append({"user": user, "subscription_type": subscription_type, "subscription_year": user.subscription_year, "member_profile_label": member_profile_label(member_profile), "profile_rate": 0, "base_subscription_price": subscription_price, "subscription_price": subscription_price, "annual_fee": first_fee, "total": total})
     return rows
 
 
@@ -563,6 +596,8 @@ def subscription_range(subscription_type, year):
 def user_can_book_session(user, session):
     if user.role not in ["adherent", "admin"]:
         return False, "Seuls les adhérents peuvent réserver."
+    if TEMPORARY_BOOKING_GRACE_START <= session.course_date <= TEMPORARY_BOOKING_GRACE_END:
+        return True, ""
     if not user.subscription_type or not user.subscription_year:
         return False, "Votre abonnement n'est pas renseigné. Contactez la Section Fitness."
     start, end = subscription_range(user.subscription_type, user.subscription_year)
@@ -582,10 +617,18 @@ def create_membership_period(user, subscription_type, subscription_year, annual_
         end_date=end,
     ).first()
     if existing:
+        old_annual_fee_applies = existing.annual_fee_applies
         existing.annual_fee_applies = existing.annual_fee_applies or annual_fee_applies
         existing.created_by = existing.created_by or created_by
         existing.notes = existing.notes or notes
+        if existing.subscription_price_snapshot is None or existing.annual_fee_snapshot is None or existing.total_snapshot is None or (not old_annual_fee_applies and existing.annual_fee_applies):
+            subscription_price, annual_fee, total = membership_tariff_snapshot(user, subscription_type, existing.annual_fee_applies)
+            existing.subscription_price_snapshot = subscription_price
+            existing.annual_fee_snapshot = annual_fee
+            existing.total_snapshot = total
+            existing.tariff_snapshot_at = existing.tariff_snapshot_at or datetime.utcnow()
         return existing
+    subscription_price, annual_fee, total = membership_tariff_snapshot(user, subscription_type, annual_fee_applies)
     period = MembershipPeriod(
         user_id=user.id,
         subscription_type=subscription_type,
@@ -593,11 +636,21 @@ def create_membership_period(user, subscription_type, subscription_year, annual_
         start_date=start,
         end_date=end,
         annual_fee_applies=annual_fee_applies,
+        subscription_price_snapshot=subscription_price,
+        annual_fee_snapshot=annual_fee,
+        total_snapshot=total,
+        tariff_snapshot_at=datetime.utcnow(),
         created_by=created_by,
         notes=notes,
     )
     db.session.add(period)
     return period
+
+
+def recent_membership_actions(limit=40):
+    return MembershipPeriod.query.join(User).filter(
+        User.role.in_(["adherent", "admin"])
+    ).order_by(MembershipPeriod.created_at.desc(), MembershipPeriod.id.desc()).limit(limit).all()
 
 
 def make_activation_token(user):
@@ -629,6 +682,8 @@ def send_password_reset_email(user):
 
 def archive_expired_memberships():
     today = date.today()
+    if today <= TEMPORARY_BOOKING_GRACE_END:
+        return 0
     users = User.query.filter(User.role == "adherent", User.account_status != "archived", User.subscription_end_date.isnot(None), User.subscription_end_date < today).all()
     for user in users:
         has_future_booking = Booking.query.join(CourseSession).filter(
@@ -1081,6 +1136,8 @@ def waitlist_capacity(session):
 def attendance_label(booking):
     if booking.attendance_status == "present":
         return "Présent"
+    if booking.attendance_status == "late":
+        return "Retard"
     if booking.attendance_status == "skipped":
         return "À revoir"
     if booking.attendance_status == "absent" or booking.status == "absent_unexcused":
@@ -1093,6 +1150,8 @@ def attendance_label(booking):
 def attendance_badge_class(booking):
     if booking.attendance_status == "present":
         return ""
+    if booking.attendance_status == "late":
+        return "wait"
     if booking.attendance_status == "skipped":
         return "wait"
     if booking.attendance_status == "absent" or booking.status == "absent_unexcused":
@@ -1515,12 +1574,14 @@ def index():
     ).all()
     abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
     current_bookings = []
+    active_booking_by_session = {}
     if current_user.role in ["adherent", "admin"]:
         current_bookings = Booking.query.join(CourseSession).filter(
             Booking.user_id == current_user.id,
             Booking.status.in_(["booked", "waiting_list"]),
             CourseSession.course_date >= today,
         ).order_by(CourseSession.course_date, CourseSession.start_time, Booking.created_at).all()
+        active_booking_by_session = {booking.session_id: booking for booking in current_bookings}
     stats = {
         "today_sessions": CourseSession.query.filter_by(course_date=today).count(),
         "bookings": Booking.query.filter_by(status="booked", archived=False).count(),
@@ -1530,7 +1591,7 @@ def index():
     latest_bookings = Booking.query.join(CourseSession).join(Booking.user).filter(
         User.role.in_(["adherent", "admin"])
     ).order_by(Booking.created_at.desc(), Booking.id.desc()).limit(12).all() if is_admin() else []
-    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings)
+    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, temporary_booking_grace_start=TEMPORARY_BOOKING_GRACE_START, temporary_booking_grace_end=TEMPORARY_BOOKING_GRACE_END)
 
 
 @app.route("/admin/statistics")
@@ -1550,6 +1611,8 @@ def admin_statistics():
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    flash("La création de compte est réservée à l'administration. Utilisez le lien d'activation reçu par email.")
+    return redirect(url_for("login"))
     if request.method == "POST":
         email = request.form["email"].strip().lower()
         password = request.form["password"]
@@ -1716,6 +1779,17 @@ def login():
             if user.account_status == "pending":
                 flash("Compte non activé : utilisez le lien reçu par email pour créer votre mot de passe.")
                 return redirect(url_for("login"))
+            if (
+                user.role == "adherent"
+                and user.account_status == "archived"
+                and date.today() <= TEMPORARY_BOOKING_GRACE_END
+                and user.subscription_type
+                and user.subscription_year
+            ):
+                user.account_status = "active"
+                user.archived_at = None
+                user.archived_reason = None
+                db.session.commit()
             if user.role == "adherent" and user.account_status == "archived":
                 flash("Votre compte est archivé car votre abonnement est expiré. Contactez la Section Fitness pour renouveler votre abonnement.")
                 return redirect(url_for("login"))
@@ -1727,6 +1801,8 @@ def login():
 
 @app.route("/coach", methods=["GET", "POST"])
 def coach_login():
+    flash("Les coachs se connectent maintenant depuis la page de connexion principale.")
+    return redirect(url_for("login"))
     """Connexion réservée aux coachs préalablement créés par l'admin."""
     if request.method == "POST":
         email = request.form["email"].strip().lower()
@@ -1773,7 +1849,7 @@ def reset_password(token):
             user.account_status = "active"
         db.session.commit()
         flash("Mot de passe réinitialisé. Vous pouvez vous connecter.")
-        return redirect(url_for("coach_login" if user.role == "coach" else "login"))
+        return redirect(url_for("login"))
     return render_template_string(TEMPLATE_RESET_PASSWORD, user=user)
 
 
@@ -1871,7 +1947,7 @@ def session_detail(session_id):
         Booking.status.in_(["booked", "waiting_list", "absent_unexcused"]),
     ).order_by(Booking.status, Booking.created_at).all()
     bookings = sorted(bookings, key=lambda b: (
-        2 if b.status == "waiting_list" else 1 if b.attendance_status == "skipped" else 3 if b.status == "absent_unexcused" else 0,
+        -1 if b.status == "absent_unexcused" or b.attendance_status == "absent" else 2 if b.status == "waiting_list" else 0,
         b.created_at or datetime.utcnow(),
         b.id,
     ))
@@ -1931,6 +2007,24 @@ def mark_absent(booking_id):
         f"Bonjour {booking.user.display_name()},\n\nVotre absence au cours {booking.session.course_name} du {booking.session.course_date.strftime('%d/%m/%Y')} a été enregistrée comme non excusée, car la réservation n'avait pas été annulée dans les délais.\n\nSection Fitness"
     )
     flash("Absence non excusée enregistrée.")
+    return redirect(url_for("session_detail", session_id=booking.session_id))
+
+
+@app.route("/presence/late/<int:booking_id>")
+@login_required
+def mark_late(booking_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé à la coach ou à l’admin.")
+        return redirect(url_for("index"))
+    booking = Booking.query.get_or_404(booking_id)
+    if booking.status != "absent_unexcused":
+        flash("Seule une absence peut être transformée en retard.")
+        return redirect(url_for("session_detail", session_id=booking.session_id))
+    booking.status = "booked"
+    booking.attendance_status = "late"
+    refresh_absence_block_status(booking.user)
+    db.session.commit()
+    flash(f"{booking.user.display_name()} marqué en retard : aucune pénalité d'absence.")
     return redirect(url_for("session_detail", session_id=booking.session_id))
 
 
@@ -2206,7 +2300,40 @@ def admin_members():
         "subscription_year": year,
         "account_status": account_status,
     }
-    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys())
+    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys(), membership_actions=recent_membership_actions())
+
+
+@app.route("/admin/members/membership-followup/export")
+@login_required
+def export_membership_followup():
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    periods = MembershipPeriod.query.join(User).filter(
+        User.role.in_(["adherent", "admin"])
+    ).order_by(MembershipPeriod.created_at.desc(), MembershipPeriod.id.desc()).all()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Suivi inscriptions"
+    ws.append(["Date action", "Adhérent", "Email", "Abonnement", "Année", "Période", "Tarif abonnement figé", "Cotisation annuelle figée", "Total figé", "Créé par", "Note"])
+    for period in periods:
+        ws.append([
+            period.created_at.strftime("%d/%m/%Y %H:%M") if period.created_at else "",
+            period.user.display_name(),
+            period.user.email,
+            period.subscription_type,
+            period.subscription_year,
+            f"{period.start_date.strftime('%d/%m/%Y')} - {period.end_date.strftime('%d/%m/%Y')}",
+            period.subscription_price_snapshot or 0,
+            period.annual_fee_snapshot or 0,
+            period.total_snapshot or 0,
+            period.created_by or "",
+            period.notes or "",
+        ])
+    file = BytesIO()
+    wb.save(file)
+    file.seek(0)
+    return send_file(file, as_attachment=True, download_name="suivi_inscriptions_renouvellements.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/admin/coaches", methods=["GET", "POST"])
@@ -2693,6 +2820,17 @@ TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
     1,
 )
 
+TEMPLATE_INDEX = """
+{% set content %}
+<div class="top"><div><h1>Bienvenue, {{ current_user.display_name() }} 👋</h1><p class="muted">Voici le planning de la Section Fitness.</p></div>{% if current_user.role == 'adherent' %}<a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Ma carte adhérent</a>{% endif %}</div>
+{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
+{% if current_user.is_blocked() %}<div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Votre compte est bloqué jusqu'au {{ current_user.blocked_until }}.</div>{% endif %}
+{% if current_user.role == 'adherent' %}<div class="flash">Période de reprise : les réservations du {{ temporary_booking_grace_start.strftime('%d/%m/%Y') }} au {{ temporary_booking_grace_end.strftime('%d/%m/%Y') }} restent ouvertes pendant la mise à jour des adhésions.</div>{% endif %}
+<div class="content-grid"><section class="card"><h2>Prochaines séances</h2>{% if current_user.role not in ['admin','coach'] %}<form method="get" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin:12px 0 18px"><h3 style="margin-top:0">Filtres</h3><div class="form-grid"><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if selected_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach</label><select name="coach_filter"><option value="">Tous</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if selected_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau</label><select name="slot_filter"><option value="">Tous</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if selected_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('index') }}">Réinitialiser</a></form>{% endif %}{% for s in sessions %}{% set a = absence_for_session(abs_by_key, s) %}{% set booking = active_booking_by_session.get(s.id) %}<div class="session"><div><div class="muted">{{ s.course_date.strftime('%A %d/%m/%Y') }} · {{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</div><strong>{{ s.course_name }}</strong>{% if a %}<br><span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% endif %}{% if s.is_reservable %}<div class="muted">{{ booked_count(s) }} / {{ s.capacity }} inscrits</div>{% else %}<div class="muted">Pas de réservation</div>{% endif %}</div><div>{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif booking %}{% if booking.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(booking) }}</span>{% else %}<span class="badge">Déjà réservé</span>{% endif %}{% elif booked_count(s) >= s.capacity %}<span class="badge full">Complet</span>{% else %}<span class="badge">{{ s.capacity - booked_count(s) }} places</span>{% endif %}<br><br>{% if current_user.role == 'adherent' and s.is_reservable %}{% set can_book, reason = user_can_book_session(current_user, s) %}{% if booking %}<a class="btn danger" href="{{ url_for('cancel', booking_id=booking.id, next=request.full_path) }}">Annuler</a>{% elif a and absence_blocks_booking(a) %}<span class="badge full">Indisponible</span>{% elif not can_book %}<span class="badge wait">{{ reason }}</span>{% else %}<a class="btn" href="{{ url_for('book', session_id=s.id, next=request.full_path) }}">Réserver</a>{% endif %}{% endif %}{% if current_user.role in ['admin','coach'] %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}</div></div>{% else %}<p class="muted">Aucune séance à venir.</p>{% endfor %}</section>
+{% if current_user.role == 'admin' %}<section class="card"><h2>Dernières actions adhérents</h2><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Cours</th><th>Statut</th><th>Actions</th></tr>{% for b in latest_bookings %}<tr><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td><td>{{ b.user.display_name() }}<br><small class="muted">{{ b.user.email }}</small></td><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% elif b.status == 'booked' %}<span class="badge">Réservé</span>{% else %}<span class="badge full">{{ b.status }}</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Modifier</a>{% if b.status in ['booked','waiting_list'] %} <a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}" onclick="return confirm('Annuler cette réservation ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune réservation récente.</td></tr>{% endfor %}</table></section>{% else %}<section class="card"><h2>Mes réservations à venir</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th></th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div></section>{% endif %}</div>
+{% endset %}{{ shell(content, 'home')|safe }}
+"""
+
 TEMPLATE_MEMBER_PROFILE = """
 {% set content %}<div class="card form-wrap"><h1>Mon profil</h1><p class="muted">Modifier votre statut adhérent, vos préférences ou votre photo de profil.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if current_user.profile_photo or current_user.profile_photo_data %}<img class="photo-preview" src="{{ url_for('profile_photo_file', user_id=current_user.id) }}" alt="Photo profil"><br><br>{% endif %}<form method="post" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>Nom complet</label><input value="{{ current_user.display_name() }}" disabled></div><div class="field"><label>Email</label><input value="{{ current_user.email }}" disabled></div><div class="field"><label>Statut prioritaire</label><select name="status"><option value="mensuel" {% if current_user.status == 'mensuel' %}selected{% endif %}>Mensuel</option><option value="cadre" {% if current_user.status == 'cadre' %}selected{% endif %}>Cadre</option><option value="autre" {% if current_user.status == 'autre' %}selected{% endif %}>Autre</option></select></div><div class="field"><label>Profil adhérent</label><select name="member_profile"><option value="ouvrant_droit" {% if current_user.member_profile == 'ouvrant_droit' or not current_user.member_profile %}selected{% endif %}>Ouvrant droit - personnel Thales, alternant, stagiaire, CDD</option><option value="ayant_droit" {% if current_user.member_profile == 'ayant_droit' %}selected{% endif %}>Ayant droit - proche d'un ouvrant droit</option><option value="exterieur" {% if current_user.member_profile == 'exterieur' %}selected{% endif %}>Extérieur - prestataire sur site Thales</option><option value="retraite" {% if current_user.member_profile == 'retraite' %}selected{% endif %}>Retraité</option></select></div><div class="field" style="grid-column:1/-1"><label>Nom et prénom de l'ouvrant droit, si ayant droit</label><input name="rights_holder_name" value="{{ current_user.rights_holder_name or '' }}"></div><div class="field"><label>Cours préféré</label><select name="preferred_course"><option value="">-</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if current_user.preferred_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach préféré</label><select name="preferred_coach"><option value="">-</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if current_user.preferred_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau préféré</label><select name="preferred_slot"><option value="">-</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if current_user.preferred_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field" style="grid-column:1/-1"><label>Nouvelle photo de profil JPG/PNG, facultative</label><input name="profile_photo" type="file" accept="image/png,image/jpeg"></div></div><br><button class="btn" type="submit">Enregistrer</button> <a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Télécharger ma carte</a></form></div>{% endset %}{{ shell(content, 'member_profile')|safe }}
 """
@@ -2727,7 +2865,7 @@ TEMPLATE_REGISTER = TEMPLATE_REGISTER.replace(
 )
 
 TEMPLATE_LOGIN = """
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">__STYLE__<title>Connexion</title></head><body><div class="login"><div class="card login-box"><h1>Connexion</h1>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post"><div class="field"><label>Email</label><input name="email" type="email" required></div><br><div class="field"><label>Mot de passe</label><input name="password" type="password" required></div><br><button class="btn" type="submit">Connexion</button> <a class="btn secondary" href="{{ url_for('register') }}">Créer un compte</a> <a class="btn secondary" href="{{ url_for('coach_login') }}">Coach</a></form><p><a href="{{ url_for('forgot_password') }}">Mot de passe oublié ?</a></p></div></div></body></html>
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">__STYLE__<title>Connexion</title></head><body><div class="login"><div class="card login-box"><h1>Connexion</h1>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post"><div class="field"><label>Email</label><input name="email" type="email" required></div><br><div class="field"><label>Mot de passe</label><input name="password" type="password" required></div><br><button class="btn" type="submit">Connexion</button></form><p><a href="{{ url_for('forgot_password') }}">Mot de passe oublié ?</a></p></div></div></body></html>
 """.replace("__STYLE__", BASE_TEMPLATE_STYLE)
 
 TEMPLATE_GENERATE = """
@@ -2738,12 +2876,21 @@ TEMPLATE_SESSION_DETAIL = """
 {% set content %}<style>.attendance-list{display:grid;gap:14px}.attendance-card{display:grid;grid-template-columns:76px 1fr;gap:14px;align-items:center;border:1px solid #e5e7eb;border-radius:16px;padding:14px;background:#fff}.attendance-photo{width:76px;height:76px;border-radius:16px;object-fit:cover;background:#e5e7eb;border:1px solid #e5e7eb}.attendance-name{font-size:20px;font-weight:800;margin-bottom:4px}.attendance-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}.attendance-actions .btn{text-align:center;padding:13px 8px}.btn.warn{background:#f59e0b}@media(max-width:700px){.main{padding:14px}.card{padding:16px;border-radius:14px}.attendance-card{grid-template-columns:68px 1fr;padding:12px}.attendance-photo{width:68px;height:68px}.attendance-name{font-size:18px}.attendance-actions{grid-template-columns:1fr;gap:8px}.attendance-actions .btn{width:100%;font-size:16px}}</style><div class="card"><h1>{{ session.course_name }}</h1><p class="muted">{{ session.course_date.strftime('%d/%m/%Y') }} · {{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">Appel mobile : traiter chaque adhérent, ou utiliser “Passer” pour revenir dessus après.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">{% for b in bookings %}<div class="attendance-card">{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="attendance-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<div class="attendance-photo"></div>{% endif %}<div><div class="attendance-name">{{ b.user.display_name() }}</div><div class="muted">{{ b.user.email }}</div><div style="margin-top:8px"><span class="badge {{ attendance_badge_class(b) }}">{{ attendance_label(b) }}</span>{% if b.status == 'waiting_list' %} <span class="badge wait">rang {{ waitlist_rank(b) }}</span>{% endif %}</div></div><div class="attendance-actions">{% if b.status in ['booked','absent_unexcused'] %}<a class="btn" href="{{ url_for('mark_present', booking_id=b.id) }}">Présent</a>{% if b.status == 'booked' %}<a class="btn warn" href="{{ url_for('mark_skipped', booking_id=b.id) }}">Passer</a><a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="return confirm('Marquer cet adhérent absent ?')">Absent</a>{% else %}<span class="btn secondary">Passer</span><span class="btn danger">Absent</span>{% endif %}{% else %}<span class="muted">Liste d'attente, pas d'appel.</span>{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
 """
 
+TEMPLATE_SESSION_DETAIL = """
+{% set content %}<style>.attendance-list{display:grid;gap:14px}.attendance-card{display:grid;grid-template-columns:76px 1fr;gap:14px;align-items:center;border:1px solid #e5e7eb;border-radius:16px;padding:14px;background:#fff}.attendance-card.absent{border-left:6px solid var(--danger);background:#fff7f7}.attendance-photo{width:76px;height:76px;border-radius:16px;object-fit:cover;background:#e5e7eb;border:1px solid #e5e7eb}.attendance-name{font-size:20px;font-weight:800;margin-bottom:4px}.attendance-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr;gap:10px}.attendance-actions .btn{text-align:center;padding:14px 8px}.btn.warn{background:#f59e0b}@media(max-width:700px){.main{padding:14px}.card{padding:16px;border-radius:14px}.attendance-card{grid-template-columns:68px 1fr;padding:12px}.attendance-photo{width:68px;height:68px}.attendance-name{font-size:18px}.attendance-actions .btn{width:100%;font-size:16px}}</style><div class="card"><h1>{{ session.course_name }}</h1><p class="muted">{{ session.course_date.strftime('%d/%m/%Y') }} · {{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">Appel mobile : marquez uniquement les absents. Si une personne arrive après l'appel, utilisez “Retard” pour retirer la pénalité.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">{% for b in bookings %}<div class="attendance-card {% if b.status == 'absent_unexcused' or b.attendance_status == 'absent' %}absent{% endif %}">{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="attendance-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<div class="attendance-photo"></div>{% endif %}<div><div class="attendance-name">{{ b.user.display_name() }}</div><div class="muted">{{ b.user.email }}</div><div style="margin-top:8px"><span class="badge {{ attendance_badge_class(b) }}">{{ attendance_label(b) }}</span>{% if b.status == 'waiting_list' %} <span class="badge wait">rang {{ waitlist_rank(b) }}</span>{% endif %}</div></div><div class="attendance-actions">{% if b.status == 'booked' %}<a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="return confirm('Marquer cet adhérent absent ?')">Absent</a>{% elif b.status == 'absent_unexcused' %}<a class="btn warn" href="{{ url_for('mark_late', booking_id=b.id) }}">Retard</a>{% else %}<span class="muted">Liste d'attente, pas d'appel.</span>{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
+"""
+
 TEMPLATE_MEMBERS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> <a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a></td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}">""",
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_members') }}" class="card" style="box-shadow:none;background:#f9fafb"><h3>Filtres</h3><div class="form-grid"><div class="field"><label>Recherche</label><input name="search" value="{{ filter_values.search }}" placeholder="Nom, email, ID"></div><div class="field"><label>Profil</label><select name="member_profile"><option value="">Tous</option>{% for key, label in member_profile_labels.items() %}<option value="{{ key }}" {% if filter_values.member_profile == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Abonnement</label><select name="subscription_type"><option value="">Tous</option>{% for opt in subscription_options %}<option value="{{ opt }}" {% if filter_values.subscription_type == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" value="{{ filter_values.subscription_year }}" placeholder="2026"></div><div class="field"><label>Compte</label><select name="account_status"><option value="">Tous</option><option value="active" {% if filter_values.account_status == 'active' %}selected{% endif %}>Actif</option><option value="pending" {% if filter_values.account_status == 'pending' %}selected{% endif %}>Activation à faire</option></select></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a></form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    1,
+)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
+    """</form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    """</form><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Suivi inscriptions / renouvellements</h2><p class="muted">Les dernières adhésions traitées, dans l'ordre chronologique inverse. Les montants affichés sont ceux figés à la date d'inscription.</p></div><a class="btn secondary" href="{{ url_for('export_membership_followup') }}">Exporter ce suivi</a></div><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_actions %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y %H:%M') if p.created_at else '-' }}</td><td>{{ p.user.display_name() }}<br><small class="muted">{{ p.user.email }}</small></td><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(p.subscription_price_snapshot or 0) }} €</td><td>{% if p.annual_fee_applies %}{{ '%.2f'|format(p.annual_fee_snapshot or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(p.total_snapshot or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="9" class="muted">Aucune action d'adhésion enregistrée.</td></tr>{% endfor %}</table></div><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
     1,
 )
 
@@ -2793,7 +2940,7 @@ TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
 )
 TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
     """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}""",
-    """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Renouveler l'adhésion</h2><p class="muted">Ajoute une nouvelle période d'adhésion dans l'historique. La cotisation annuelle n'est comptée qu'une fois par année civile.</p><form method="post" action="{{ url_for('admin_renew_member', user_id=user.id) }}"><div class="form-grid"><div class="field"><label>Nouvel abonnement</label><select name="subscription_type" required>{% for opt in subscription_options %}<option>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" min="2024" max="2100" value="{{ current_year }}" required></div></div><br><button class="btn" type="submit">Renouveler</button></form><br><h3>Historique adhésions</h3><table class="table"><tr><th>Abonnement</th><th>Période</th><th>Cotisation annuelle</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_periods %}<tr><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{% if p.annual_fee_applies %}<span class="badge">Oui</span>{% else %}<span class="muted">Non</span>{% endif %}</td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucun historique d'adhésion.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
+    """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Renouveler l'adhésion</h2><p class="muted">Ajoute une nouvelle période d'adhésion dans l'historique. Les tarifs sont figés à la date du renouvellement.</p><form method="post" action="{{ url_for('admin_renew_member', user_id=user.id) }}"><div class="form-grid"><div class="field"><label>Nouvel abonnement</label><select name="subscription_type" required>{% for opt in subscription_options %}<option>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" min="2024" max="2100" value="{{ current_year }}" required></div></div><br><button class="btn" type="submit">Renouveler</button></form><br><h3>Historique adhésions</h3><table class="table"><tr><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_periods %}<tr><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(p.subscription_price_snapshot or 0) }} €</td><td>{% if p.annual_fee_applies %}{{ '%.2f'|format(p.annual_fee_snapshot or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(p.total_snapshot or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun historique d'adhésion.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
     1,
 )
 
@@ -2983,6 +3130,11 @@ TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
     """<div class="field"><label>Jauge</label><input name="capacity" type="number" value="35" min="1" required></div><div class="field"><label>Réservation</label>""",
     """<div class="field"><label>Jauge</label><input name="capacity" type="number" value="35" min="1" required></div><div class="field"><label>Liste d'attente</label><input name="waitlist_capacity" type="number" value="5" min="0" required></div><div class="field"><label>Réservation</label>""",
+    1,
+)
+TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
+    """<div class="field"><label>Semaine odd/even</label><select name="week_parity"><option value="all">Toutes</option><option value="even">Even / paire</option><option value="odd">Odd / impaire</option></select></div><div class="field"><label>Début</label>""",
+    """<div class="field"><label>Récurrence</label><select name="week_parity"><option value="all">Toutes les semaines</option><option value="even">Even / paire</option><option value="odd">Odd / impaire</option><option value="single">Ponctuel - une seule date</option></select></div><div class="field"><label>Date si ponctuel</label><input name="session_date" type="date"></div><div class="field"><label>Début</label>""",
     1,
 )
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
@@ -3469,8 +3621,27 @@ def admin_settings():
             db.session.commit()
             flash("Tarifs des abonnements mis à jour.")
             return redirect(url_for("admin_settings"))
-        weekday = int(request.form["weekday"])
         parity = request.form.get("week_parity", "all")
+        if parity == "single":
+            if not request.form.get("session_date"):
+                flash("Merci d'indiquer une date pour une session ponctuelle.")
+                return redirect(url_for("admin_settings"))
+            single_date = datetime.strptime(request.form["session_date"], "%Y-%m-%d").date()
+            course_name = request.form["course_name"].strip()
+            start = datetime.strptime(request.form["start_time"], "%H:%M").time()
+            end = datetime.strptime(request.form["end_time"], "%H:%M").time()
+            if end <= start:
+                flash("L'heure de fin doit être après l'heure de début.")
+                return redirect(url_for("admin_settings"))
+            capacity = int(request.form.get("capacity", 35))
+            waitlist_capacity_value = int(request.form.get("waitlist_capacity", 5))
+            coach_name = request.form.get("coach_name", "").strip()
+            is_reservable = request.form.get("is_reservable") == "on"
+            created = create_session_if_missing(single_date, course_name, start, end, capacity, date.today(), coach_name, is_reservable, waitlist_capacity_value)
+            db.session.commit()
+            flash("Session ponctuelle créée." if created else "Cette session ponctuelle existe déjà.")
+            return redirect(url_for("admin_settings"))
+        weekday = int(request.form["weekday"])
         course_name = request.form["course_name"].strip()
         start = datetime.strptime(request.form["start_time"], "%H:%M").time()
         end = datetime.strptime(request.form["end_time"], "%H:%M").time()
@@ -3923,6 +4094,65 @@ def ensure_useful_documents_schema():
     db.session.commit()
 
 
+def backfill_membership_tariff_snapshots():
+    periods = MembershipPeriod.query.join(User).filter(
+        db.or_(
+            MembershipPeriod.subscription_price_snapshot.is_(None),
+            MembershipPeriod.annual_fee_snapshot.is_(None),
+            MembershipPeriod.total_snapshot.is_(None),
+        )
+    ).all()
+    changed = False
+    for period in periods:
+        subscription_price, annual_fee, total = membership_tariff_snapshot(period.user, period.subscription_type, period.annual_fee_applies)
+        if period.subscription_price_snapshot is None:
+            period.subscription_price_snapshot = subscription_price
+        if period.annual_fee_snapshot is None:
+            period.annual_fee_snapshot = annual_fee
+        if period.total_snapshot is None:
+            period.total_snapshot = (period.subscription_price_snapshot or 0.0) + (period.annual_fee_snapshot or 0.0)
+        if period.tariff_snapshot_at is None:
+            period.tariff_snapshot_at = period.created_at or datetime.utcnow()
+        changed = True
+    if changed:
+        db.session.commit()
+
+
+def ensure_membership_period_schema():
+    db.create_all()
+    if db.engine.dialect.name == "postgresql":
+        columns = {row[0] for row in db.session.execute(db.text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'membership_period'
+        """)).fetchall()}
+        additions = {
+            "subscription_price_snapshot": "ALTER TABLE membership_period ADD COLUMN subscription_price_snapshot DOUBLE PRECISION",
+            "annual_fee_snapshot": "ALTER TABLE membership_period ADD COLUMN annual_fee_snapshot DOUBLE PRECISION",
+            "total_snapshot": "ALTER TABLE membership_period ADD COLUMN total_snapshot DOUBLE PRECISION",
+            "tariff_snapshot_at": "ALTER TABLE membership_period ADD COLUMN tariff_snapshot_at TIMESTAMP",
+        }
+        for col, sql in additions.items():
+            if col not in columns:
+                db.session.execute(db.text(sql))
+        db.session.commit()
+        backfill_membership_tariff_snapshots()
+        return
+    if db.engine.dialect.name != "sqlite":
+        return
+    columns = {row[1] for row in db.session.execute(db.text("PRAGMA table_info(membership_period)")).fetchall()}
+    additions = {
+        "subscription_price_snapshot": "ALTER TABLE membership_period ADD COLUMN subscription_price_snapshot FLOAT",
+        "annual_fee_snapshot": "ALTER TABLE membership_period ADD COLUMN annual_fee_snapshot FLOAT",
+        "total_snapshot": "ALTER TABLE membership_period ADD COLUMN total_snapshot FLOAT",
+        "tariff_snapshot_at": "ALTER TABLE membership_period ADD COLUMN tariff_snapshot_at DATETIME",
+    }
+    for col, sql in additions.items():
+        if col not in columns:
+            db.session.execute(db.text(sql))
+    db.session.commit()
+    backfill_membership_tariff_snapshots()
+
+
 def ensure_schema():
     db.create_all()
     if db.engine.dialect.name == "postgresql":
@@ -3940,6 +4170,8 @@ def ensure_schema():
             if col not in user_columns:
                 db.session.execute(db.text(sql))
         db.session.commit()
+        seed_default_2026_tariffs_once()
+        ensure_membership_period_schema()
         ensure_coach_absence_schema()
         ensure_inventory_schema()
         ensure_useful_documents_schema()
@@ -4004,6 +4236,8 @@ def ensure_schema():
     ensure_coach_absence_schema()
     ensure_inventory_schema()
     ensure_useful_documents_schema()
+    seed_default_2026_tariffs_once()
+    ensure_membership_period_schema()
     db.session.commit()
 
     # Renseigner les fins d'abonnement manquantes dans les anciennes bases.

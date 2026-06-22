@@ -648,9 +648,43 @@ def create_membership_period(user, subscription_type, subscription_year, annual_
 
 
 def recent_membership_actions(limit=40):
-    return MembershipPeriod.query.join(User).filter(
+    return membership_actions_query().limit(limit).all()
+
+
+def membership_actions_query(start_date=None, end_date=None, year=None):
+    query = MembershipPeriod.query.join(User).filter(
         User.role.in_(["adherent", "admin"])
-    ).order_by(MembershipPeriod.created_at.desc(), MembershipPeriod.id.desc()).limit(limit).all()
+    )
+    if year:
+        query = query.filter(MembershipPeriod.subscription_year == int(year))
+    if start_date:
+        query = query.filter(MembershipPeriod.created_at >= datetime.combine(start_date, time.min))
+    if end_date:
+        query = query.filter(MembershipPeriod.created_at <= datetime.combine(end_date, time.max))
+    return query.order_by(MembershipPeriod.created_at.desc(), MembershipPeriod.id.desc())
+
+
+def delete_static_file(relative_path):
+    if not relative_path:
+        return
+    try:
+        path = (STATIC_DIR / relative_path).resolve()
+        if STATIC_DIR.resolve() in path.parents and path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def delete_member_completely(user):
+    """Supprime un adhérent et toutes les données directement rattachées."""
+    profile_photo = user.profile_photo
+    member_card = user.member_card
+    Booking.query.filter_by(user_id=user.id).delete(synchronize_session=False)
+    MembershipPeriod.query.filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.session.delete(user)
+    db.session.commit()
+    delete_static_file(profile_photo)
+    delete_static_file(member_card)
 
 
 def make_activation_token(user):
@@ -2262,10 +2296,9 @@ def admin_delete_member(user_id):
     if user.role != "adherent":
         flash("Seuls les comptes adhérents peuvent être supprimés depuis cet écran.")
         return redirect(url_for("admin_members"))
-    Booking.query.filter_by(user_id=user.id).delete()
-    db.session.delete(user)
-    db.session.commit()
-    flash("Adhérent supprimé.")
+    deleted_email = user.email
+    delete_member_completely(user)
+    flash(f"Adhérent {deleted_email} supprimé avec ses réservations, adhésions, photo et carte.")
     return redirect(url_for("admin_members"))
 
 
@@ -2281,6 +2314,9 @@ def admin_members():
     subscription = request.args.get("subscription_type", "").strip()
     year = request.args.get("subscription_year", "").strip()
     account_status = request.args.get("account_status", "").strip()
+    followup_year = request.args.get("followup_year", "").strip()
+    followup_start = request.args.get("followup_start", "").strip()
+    followup_end = request.args.get("followup_end", "").strip()
     if search:
         like = f"%{search.lower()}%"
         query = query.filter(db.or_(db.func.lower(User.full_name).like(like), db.func.lower(User.first_name).like(like), db.func.lower(User.last_name).like(like), db.func.lower(User.email).like(like), db.func.lower(User.member_number).like(like)))
@@ -2299,8 +2335,15 @@ def admin_members():
         "subscription_type": subscription,
         "subscription_year": year,
         "account_status": account_status,
+        "followup_year": followup_year,
+        "followup_start": followup_start,
+        "followup_end": followup_end,
     }
-    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys(), membership_actions=recent_membership_actions())
+    start_date = parse_iso_date(followup_start, None) if followup_start else None
+    end_date = parse_iso_date(followup_end, None) if followup_end else None
+    followup_year_value = int(followup_year) if followup_year.isdigit() else None
+    membership_actions = membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).limit(25).all()
+    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys(), membership_actions=membership_actions)
 
 
 @app.route("/admin/members/membership-followup/export")
@@ -2309,9 +2352,13 @@ def export_membership_followup():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
-    periods = MembershipPeriod.query.join(User).filter(
-        User.role.in_(["adherent", "admin"])
-    ).order_by(MembershipPeriod.created_at.desc(), MembershipPeriod.id.desc()).all()
+    followup_year = request.args.get("followup_year", "").strip()
+    followup_start = request.args.get("followup_start", "").strip()
+    followup_end = request.args.get("followup_end", "").strip()
+    start_date = parse_iso_date(followup_start, None) if followup_start else None
+    end_date = parse_iso_date(followup_end, None) if followup_end else None
+    followup_year_value = int(followup_year) if followup_year.isdigit() else None
+    periods = membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).all()
     wb = Workbook()
     ws = wb.active
     ws.title = "Suivi inscriptions"
@@ -2890,7 +2937,7 @@ TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
 )
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """</form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
-    """</form><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Suivi inscriptions / renouvellements</h2><p class="muted">Les dernières adhésions traitées, dans l'ordre chronologique inverse. Les montants affichés sont ceux figés à la date d'inscription.</p></div><a class="btn secondary" href="{{ url_for('export_membership_followup') }}">Exporter ce suivi</a></div><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_actions %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y %H:%M') if p.created_at else '-' }}</td><td>{{ p.user.display_name() }}<br><small class="muted">{{ p.user.email }}</small></td><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(p.subscription_price_snapshot or 0) }} €</td><td>{% if p.annual_fee_applies %}{{ '%.2f'|format(p.annual_fee_snapshot or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(p.total_snapshot or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="9" class="muted">Aucune action d'adhésion enregistrée.</td></tr>{% endfor %}</table></div><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    """</form><br><details class="card" style="box-shadow:none;background:#f9fafb" {% if filter_values.followup_year or filter_values.followup_start or filter_values.followup_end %}open{% endif %}><summary style="cursor:pointer;font-weight:800;font-size:18px">Suivi inscriptions / renouvellements</summary><p class="muted">Affichage limité aux 25 dernières lignes de la période choisie. Les montants sont figés à la date d'inscription.</p><form method="get" action="{{ url_for('admin_members') }}"><div class="form-grid"><div class="field"><label>Année d'adhésion</label><input name="followup_year" type="number" value="{{ filter_values.followup_year }}" placeholder="2026"></div><div class="field"><label>Date action début</label><input name="followup_start" type="date" value="{{ filter_values.followup_start }}"></div><div class="field"><label>Date action fin</label><input name="followup_end" type="date" value="{{ filter_values.followup_end }}"></div></div><br><button class="btn secondary" type="submit">Afficher le suivi</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a> <a class="btn" href="{{ url_for('export_membership_followup', followup_year=filter_values.followup_year, followup_start=filter_values.followup_start, followup_end=filter_values.followup_end) }}">Exporter ce suivi</a></form><br><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_actions %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y %H:%M') if p.created_at else '-' }}</td><td>{{ p.user.display_name() }}<br><small class="muted">{{ p.user.email }}</small></td><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(p.subscription_price_snapshot or 0) }} €</td><td>{% if p.annual_fee_applies %}{{ '%.2f'|format(p.annual_fee_snapshot or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(p.total_snapshot or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="9" class="muted">Aucune action d'adhésion sur cette période.</td></tr>{% endfor %}</table></details><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
     1,
 )
 
@@ -3176,7 +3223,7 @@ TEMPLATE_INVENTORY = """
 """
 
 TEMPLATE_ARCHIVED_MEMBERS = """
-{% set content %}<div class="card"><h1>Archives adhérents</h1><p class="muted">Adhérents dont l'abonnement est expiré et qui ne sont plus actifs.</p><table class="table"><tr><th>Nom</th><th>Email</th><th>Abonnement</th><th>Fin abonnement</th><th>Archivé le</th><th>Motif</th></tr>{% for u in users %}<tr><td>{{ u.display_name() }}</td><td>{{ u.email }}</td><td>{{ u.subscription_type }} {{ u.subscription_year }}</td><td>{{ u.subscription_end_date or '-' }}</td><td>{{ u.archived_at or '-' }}</td><td>{{ u.archived_reason or '-' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun ancien adhérent archivé.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'archives')|safe }}
+{% set content %}<div class="card"><h1>Archives adhérents</h1><p class="muted">Dossiers adhérents archivés par année civile. Si une personne revient plus tard, ouvrez sa fiche puis renouvelez son adhésion.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" class="card" style="box-shadow:none;background:#f9fafb"><h3>Rechercher dans les archives</h3><div class="form-grid"><div class="field"><label>Recherche</label><input name="search" value="{{ filter_values.search }}" placeholder="Nom, email, ID"></div><div class="field"><label>Année d'archivage</label><input name="archived_year" type="number" value="{{ filter_values.archived_year }}" placeholder="2026"></div><div class="field"><label>Année d'abonnement</label><input name="subscription_year" type="number" value="{{ filter_values.subscription_year }}" placeholder="2026"></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('archived_members') }}">Réinitialiser</a></form><br><table class="table"><tr><th>Nom</th><th>Email</th><th>Abonnement</th><th>Fin abonnement</th><th>Archivé le</th><th>Motif</th><th>Action</th></tr>{% for u in users %}<tr><td>{{ u.display_name() }}</td><td>{{ u.email }}</td><td>{{ u.subscription_type }} {{ u.subscription_year }}</td><td>{{ u.subscription_end_date or '-' }}</td><td>{{ u.archived_at or '-' }}</td><td>{{ u.archived_reason or '-' }}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Ouvrir / renouveler</a></td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun ancien adhérent archivé.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'archives')|safe }}
 """
 # -------------------- Gestion avancée admin : bureau, import, budget, inventaire, coachs --------------------
 
@@ -3981,8 +4028,22 @@ def archived_members():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
-    users = User.query.filter(User.role == "adherent", User.account_status == "archived").order_by(User.archived_at.desc(), User.full_name).all()
-    return render_template_string(TEMPLATE_ARCHIVED_MEMBERS, users=users)
+    query = User.query.filter(User.role == "adherent", User.account_status == "archived")
+    search = request.args.get("search", "").strip()
+    archived_year = request.args.get("archived_year", "").strip()
+    subscription_year = request.args.get("subscription_year", "").strip()
+    if search:
+        like = f"%{search.lower()}%"
+        query = query.filter(db.or_(db.func.lower(User.full_name).like(like), db.func.lower(User.first_name).like(like), db.func.lower(User.last_name).like(like), db.func.lower(User.email).like(like), db.func.lower(User.member_number).like(like)))
+    if archived_year.isdigit():
+        archive_start = date(int(archived_year), 1, 1)
+        archive_end = date(int(archived_year), 12, 31)
+        query = query.filter(User.archived_at >= archive_start, User.archived_at <= archive_end)
+    if subscription_year.isdigit():
+        query = query.filter(User.subscription_year == int(subscription_year))
+    users = query.order_by(User.archived_at.desc(), User.full_name).all()
+    filter_values = {"search": search, "archived_year": archived_year, "subscription_year": subscription_year}
+    return render_template_string(TEMPLATE_ARCHIVED_MEMBERS, users=users, filter_values=filter_values)
 
 
 def ensure_inventory_schema():

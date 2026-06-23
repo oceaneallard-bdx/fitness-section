@@ -4277,7 +4277,10 @@ def admin_budget():
             db.session.commit()
             flash("Ligne budget ajoutée.")
             return redirect(url_for("admin_budget"))
-        dues_year = int(request.args.get("dues_year", date.today().year))
+        try:
+            dues_year = int(request.args.get("dues_year") or date.today().year)
+        except (TypeError, ValueError):
+            dues_year = date.today().year
         entries = BudgetEntry.query.order_by(BudgetEntry.entry_date.desc(), BudgetEntry.id.desc()).all()
     except Exception as exc:
         db.session.rollback()
@@ -4285,7 +4288,10 @@ def admin_budget():
         traceback.print_exc()
         print("------------------------------------\n")
         entries = []
-        dues_year = int(request.args.get("dues_year", date.today().year))
+        try:
+            dues_year = int(request.args.get("dues_year") or date.today().year)
+        except (TypeError, ValueError):
+            dues_year = date.today().year
         flash("Impossible de lire les lignes budget existantes. La page reste accessible en mode sécurisé.")
     try:
         dues_rows = expected_dues_rows(dues_year)
@@ -4308,7 +4314,14 @@ def admin_budget():
         print("\n--- ERREUR AFFICHAGE BUDGET ---")
         traceback.print_exc()
         print("-------------------------------\n")
-        return render_template_string(TEMPLATE_BUDGET_SAFE, entries=entries, income=total_income, expenses=expenses, balance=total_income-expenses, expected_dues=expected_dues, dues_year=dues_year, today=date.today())
+        try:
+            return render_template_string(TEMPLATE_BUDGET_SAFE, entries=entries, income=total_income, expenses=expenses, balance=total_income-expenses, expected_dues=expected_dues, dues_year=dues_year, today=date.today())
+        except Exception:
+            db.session.rollback()
+            print("\n--- ERREUR AFFICHAGE BUDGET SAFE ---")
+            traceback.print_exc()
+            print("------------------------------------\n")
+            return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Budget</title><style>body{{font-family:Arial,sans-serif;background:#f6f8fb;color:#111827;padding:32px}}.card{{background:white;border:1px solid #e5e7eb;border-radius:14px;padding:24px;max-width:900px;margin:auto}}.flash{{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;padding:12px;border-radius:10px}}</style></head><body><div class="card"><h1>Budget</h1><div class="flash">Mode urgence : le budget complet ne peut pas s'afficher. Les détails techniques sont dans les logs Render.</div><p>Recettes : {income:.2f} €</p><p>Dépenses : {expenses:.2f} €</p><p>Solde : {(total_income-expenses):.2f} €</p><p><a href="/">Retour au tableau de bord</a></p></div></body></html>"""
 
 
 @app.route("/admin/budget/dues/export")

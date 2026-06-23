@@ -403,15 +403,24 @@ def parse_iso_date(value, default):
 
 def coach_planning_period(args):
     today = date.today()
-    view_mode = args.get("view_mode", "").strip()
-    explicit_start = args.get("start_date", "").strip()
-    explicit_end = args.get("end_date", "").strip()
-    if explicit_start or explicit_end:
-        view_mode = "range"
-    elif not view_mode:
-        view_mode = "month" if args.get("year") or args.get("month") else "rolling"
-    year = int(args.get("year", today.year) or today.year)
-    month = int(args.get("month", today.month) or today.month)
+    view_mode = (args.get("view_mode") or "").strip()
+    explicit_start = (args.get("start_date") or "").strip()
+    explicit_end = (args.get("end_date") or "").strip()
+    if not view_mode:
+        if explicit_start or explicit_end:
+            view_mode = "range"
+        elif args.get("year") or args.get("month"):
+            view_mode = "month"
+        else:
+            view_mode = "rolling"
+    try:
+        year = int(args.get("year", today.year) or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    try:
+        month = int(args.get("month", today.month) or today.month)
+    except (TypeError, ValueError):
+        month = today.month
     if month < 1 or month > 12:
         month = today.month
     if view_mode == "month":

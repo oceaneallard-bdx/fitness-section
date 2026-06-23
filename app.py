@@ -552,18 +552,24 @@ def expected_dues_rows(year=None):
         User.role.in_(["adherent", "admin"]),
         User.account_status != "archived",
         MembershipPeriod.subscription_year == year,
-    ).order_by(User.full_name, User.email, MembershipPeriod.start_date).all()
+    ).order_by(User.full_name, User.email, MembershipPeriod.start_date, MembershipPeriod.id).all()
     period_user_ids = {p.user_id for p in periods}
+    first_period_seen = set()
     for period in periods:
         user = period.user
         member_profile = user.member_profile or "ouvrant_droit"
         subscription_type = normalize_subscription_type(period.subscription_type)
         subscription_price = period.subscription_price_snapshot
-        first_fee = period.annual_fee_snapshot if period.annual_fee_applies else 0.0
+        user_year_key = (period.user_id, period.subscription_year)
+        is_first_period_for_year = user_year_key not in first_period_seen
+        first_period_seen.add(user_year_key)
+        is_renewal = "renouvellement" in (period.notes or "").lower()
+        annual_fee_should_apply = period.annual_fee_applies and is_first_period_for_year and not is_renewal
+        first_fee = period.annual_fee_snapshot if annual_fee_should_apply else 0.0
         if subscription_price is None:
-            subscription_price, fallback_fee, _ = membership_tariff_snapshot(user, subscription_type, period.annual_fee_applies)
-            first_fee = fallback_fee if period.annual_fee_applies else 0.0
-        total = period.total_snapshot if period.total_snapshot is not None else subscription_price + first_fee
+            subscription_price, fallback_fee, _ = membership_tariff_snapshot(user, subscription_type, annual_fee_should_apply)
+            first_fee = fallback_fee if annual_fee_should_apply else 0.0
+        total = (subscription_price or 0.0) + (first_fee or 0.0)
         rows.append({
             "user": user,
             "subscription_type": subscription_type,
@@ -3498,7 +3504,7 @@ TEMPLATE_BUDGET_SAFE = """
 """
 
 TEMPLATE_BUDGET_SIMPLE = """
-{% set content %}<div class="card"><h1>Budget</h1><p class="muted">Version simplifiée stable : recettes, dépenses et lignes manuelles.</p><div class="grid"><div class="card"><span class="muted">Recettes</span><div class="stat">{{ '%.2f'|format(income) }} €</div></div><div class="card"><span class="muted">Dépenses</span><div class="stat">{{ '%.2f'|format(expenses) }} €</div></div><div class="card"><span class="muted">Solde</span><div class="stat">{{ '%.2f'|format(balance) }} €</div></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter une ligne</h3><div class="form-grid"><div class="field"><label>Date</label><input name="entry_date" type="date" value="{{ today.isoformat() }}" required></div><div class="field"><label>Type</label><select name="entry_type"><option value="income">Recette</option><option value="expense">Dépense</option></select></div><div class="field"><label>Catégorie</label><select name="category"><option>Abonnement</option><option>Cotisation adhérent</option><option>Facture coach</option><option>Achat matériel</option><option>Autre</option></select></div><div class="field"><label>Libellé</label><input name="label" required></div><div class="field"><label>Montant (€)</label><input name="amount" required></div><div class="field"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Ajouter</button></form><br><table class="table"><tr><th>Date</th><th>Type</th><th>Catégorie</th><th>Libellé</th><th>Montant</th><th>Notes</th></tr>{% for e in entries %}<tr><td>{{ e.entry_date.strftime('%d/%m/%Y') }}</td><td>{% if e.entry_type == 'income' %}Recette{% else %}Dépense{% endif %}</td><td>{{ e.category }}</td><td>{{ e.label }}</td><td><strong>{{ '%.2f'|format(e.amount) }} €</strong></td><td>{{ e.notes or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune ligne budget.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'budget')|safe }}
+{% set content %}<div class="card"><h1>Budget</h1><p class="muted">Recettes attendues d'après les adhésions enregistrées, plus les lignes manuelles. La cotisation annuelle est comptée une seule fois par adhérent et par année.</p><div class="grid"><div class="card"><span class="muted">Recettes</span><div class="stat">{{ '%.2f'|format(income) }} €</div><small class="muted">{{ '%.2f'|format(expected_dues) }} € cotisations / abonnements + {{ '%.2f'|format(manual_income) }} € lignes manuelles</small></div><div class="card"><span class="muted">Dépenses</span><div class="stat">{{ '%.2f'|format(expenses) }} €</div></div><div class="card"><span class="muted">Solde</span><div class="stat">{{ '%.2f'|format(balance) }} €</div></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter une ligne</h3><div class="form-grid"><div class="field"><label>Date</label><input name="entry_date" type="date" value="{{ today.isoformat() }}" required></div><div class="field"><label>Type</label><select name="entry_type"><option value="income">Recette</option><option value="expense">Dépense</option></select></div><div class="field"><label>Catégorie</label><select name="category"><option>Abonnement</option><option>Cotisation adhérent</option><option>Facture coach</option><option>Achat matériel</option><option>Autre</option></select></div><div class="field"><label>Libellé</label><input name="label" required></div><div class="field"><label>Montant (€)</label><input name="amount" required></div><div class="field"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Ajouter</button></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Cotisations et abonnements attendus</h2><p class="muted">Basé sur l'historique des inscriptions / renouvellements. Les renouvellements de la même année affichent l'abonnement, sans nouvelle cotisation annuelle.</p></div><form method="get"><input name="dues_year" type="number" value="{{ dues_year }}" style="width:100px;padding:10px;border-radius:10px;border:1px solid #ddd"> <button class="btn secondary" type="submit">Afficher</button> <a class="btn" href="{{ url_for('export_budget_dues', dues_year=dues_year) }}">Exporter</a></form></div><table class="table"><tr><th>Adhérent</th><th>Profil</th><th>Abonnement</th><th>Tarif abonnement</th><th>Cotisation annuelle</th><th>Total</th><th>Note</th></tr>{% for row in dues_rows %}<tr><td>{{ row.user.display_name() }}<br><small class="muted">{{ row.user.email }}</small></td><td>{{ row.member_profile_label }}</td><td>{{ row.subscription_type or '-' }} {{ row.subscription_year or '' }}</td><td>{{ '%.2f'|format(row.subscription_price or 0) }} €</td><td>{% if row.annual_fee %}{{ '%.2f'|format(row.annual_fee) }} €{% else %}<span class="muted">Déjà comptée / renouvellement</span>{% endif %}</td><td><strong>{{ '%.2f'|format(row.total or 0) }} €</strong></td><td>{% if row.annual_fee %}Première inscription annuelle{% else %}Pas de nouvelle cotisation{% endif %}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucune cotisation / abonnement attendu pour cette année.</td></tr>{% endfor %}</table></div><br><table class="table"><tr><th>Date</th><th>Type</th><th>Catégorie</th><th>Libellé</th><th>Montant</th><th>Notes</th></tr>{% for e in entries %}<tr><td>{{ e.entry_date.strftime('%d/%m/%Y') }}</td><td>{% if e.entry_type == 'income' %}Recette{% else %}Dépense{% endif %}</td><td>{{ e.category }}</td><td>{{ e.label }}</td><td><strong>{{ '%.2f'|format(e.amount) }} €</strong></td><td>{{ e.notes or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune ligne manuelle.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'budget')|safe }}
 """
 
 TEMPLATE_INVENTORY = """
@@ -4265,6 +4271,7 @@ def admin_budget():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
+    dues_year = int(request.args.get("dues_year", date.today().year))
     try:
         db.create_all()
         if request.method == "POST":
@@ -4290,10 +4297,21 @@ def admin_budget():
         print("----------------------------\n")
         entries = []
         flash("Budget ouvert en mode simplifié : anciennes données temporairement ignorées.")
-    income = sum((e.amount or 0) for e in entries if e.entry_type == "income")
+    try:
+        dues_rows = expected_dues_rows(dues_year)
+    except Exception:
+        db.session.rollback()
+        print("\n--- ERREUR COTISATIONS BUDGET ---")
+        traceback.print_exc()
+        print("---------------------------------\n")
+        dues_rows = []
+        flash("Les lignes cotisations / abonnements n'ont pas pu être calculées. Les lignes manuelles restent disponibles.")
+    expected_dues = sum((row.get("total") or 0) for row in dues_rows)
+    manual_income = sum((e.amount or 0) for e in entries if e.entry_type == "income")
+    income = manual_income + expected_dues
     expenses = sum((e.amount or 0) for e in entries if e.entry_type == "expense")
     balance = income - expenses
-    return render_template_string(TEMPLATE_BUDGET_SIMPLE, entries=entries, income=income, expenses=expenses, balance=balance, today=date.today())
+    return render_template_string(TEMPLATE_BUDGET_SIMPLE, entries=entries, dues_rows=dues_rows, dues_year=dues_year, expected_dues=expected_dues, manual_income=manual_income, income=income, expenses=expenses, balance=balance, today=date.today())
 
 
 @app.route("/admin/budget/dues/export")

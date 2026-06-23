@@ -3497,6 +3497,10 @@ TEMPLATE_BUDGET_SAFE = """
 {% set content %}<div class="card"><h1>Budget</h1><div class="flash">Mode sécurisé : une ancienne donnée ou une colonne manquante empêche l'affichage complet. Les détails techniques sont affichés dans les logs Render.</div><div class="grid"><div class="card"><span class="muted">Recettes</span><div class="stat">{{ '%.2f'|format(income) }} €</div><small class="muted">Cotisations attendues calculées : {{ '%.2f'|format(expected_dues) }} €</small></div><div class="card"><span class="muted">Dépenses</span><div class="stat">{{ '%.2f'|format(expenses) }} €</div></div><div class="card"><span class="muted">Solde</span><div class="stat">{{ '%.2f'|format(balance) }} €</div></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter une ligne</h3><div class="form-grid"><div class="field"><label>Date</label><input name="entry_date" type="date" value="{{ today.isoformat() }}" required></div><div class="field"><label>Type</label><select name="entry_type"><option value="income">Recette</option><option value="expense">Dépense</option></select></div><div class="field"><label>Catégorie</label><select name="category"><option>Abonnement</option><option>Cotisation adhérent</option><option>Facture coach</option><option>Achat matériel</option><option>Autre</option></select></div><div class="field"><label>Libellé</label><input name="label" required></div><div class="field"><label>Montant (€)</label><input name="amount" required></div><div class="field"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Ajouter</button></form><br><table class="table"><tr><th>Date</th><th>Type</th><th>Catégorie</th><th>Libellé</th><th>Montant</th><th>Notes</th></tr>{% for e in entries %}<tr><td>{{ e.entry_date.strftime('%d/%m/%Y') }}</td><td>{{ e.entry_type }}</td><td>{{ e.category }}</td><td>{{ e.label }}</td><td>{{ '%.2f'|format(e.amount) }} €</td><td>{{ e.notes or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune ligne budget lisible pour le moment.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'budget')|safe }}
 """
 
+TEMPLATE_BUDGET_SIMPLE = """
+{% set content %}<div class="card"><h1>Budget</h1><p class="muted">Version simplifiée stable : recettes, dépenses et lignes manuelles.</p><div class="grid"><div class="card"><span class="muted">Recettes</span><div class="stat">{{ '%.2f'|format(income) }} €</div></div><div class="card"><span class="muted">Dépenses</span><div class="stat">{{ '%.2f'|format(expenses) }} €</div></div><div class="card"><span class="muted">Solde</span><div class="stat">{{ '%.2f'|format(balance) }} €</div></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter une ligne</h3><div class="form-grid"><div class="field"><label>Date</label><input name="entry_date" type="date" value="{{ today.isoformat() }}" required></div><div class="field"><label>Type</label><select name="entry_type"><option value="income">Recette</option><option value="expense">Dépense</option></select></div><div class="field"><label>Catégorie</label><select name="category"><option>Abonnement</option><option>Cotisation adhérent</option><option>Facture coach</option><option>Achat matériel</option><option>Autre</option></select></div><div class="field"><label>Libellé</label><input name="label" required></div><div class="field"><label>Montant (€)</label><input name="amount" required></div><div class="field"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Ajouter</button></form><br><table class="table"><tr><th>Date</th><th>Type</th><th>Catégorie</th><th>Libellé</th><th>Montant</th><th>Notes</th></tr>{% for e in entries %}<tr><td>{{ e.entry_date.strftime('%d/%m/%Y') }}</td><td>{% if e.entry_type == 'income' %}Recette{% else %}Dépense{% endif %}</td><td>{{ e.category }}</td><td>{{ e.label }}</td><td><strong>{{ '%.2f'|format(e.amount) }} €</strong></td><td>{{ e.notes or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune ligne budget.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'budget')|safe }}
+"""
+
 TEMPLATE_INVENTORY = """
 {% set content %}<div class="card"><h1>Inventaire</h1><p class="muted">Valeur estimée : <strong>{{ '%.2f'|format(inventory_value) }} €</strong></p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" enctype="multipart/form-data" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter un article</h3><div class="form-grid"><div class="field"><label>Nom</label><input name="name" required></div><div class="field"><label>Catégorie</label><input name="category"></div><div class="field"><label>Quantité</label><input name="quantity" type="number" value="1" required></div><div class="field"><label>Seuil d'alerte</label><input name="alert_threshold" type="number" value="1" required></div><div class="field"><label>Coût unitaire</label><input name="unit_cost"></div><div class="field"><label>Année d'acquisition</label><input name="acquisition_year" type="number" min="1900" max="2100" value="{{ current_year }}"></div><div class="field"><label>Facture</label><input name="invoice_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx"></div><div class="field"><label>Demande achat CSE</label><input name="purchase_request_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx"></div><div class="field" style="grid-column:1/-1"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Ajouter</button></form><br><table class="table"><tr><th>Article</th><th>Catégorie</th><th>Quantité</th><th>Seuil</th><th>Année</th><th>Valeur</th><th>Documents</th><th>Notes</th></tr>{% for i in items %}<tr><td>{{ i.name }}</td><td>{{ i.category or '-' }}</td><td>{% if i.quantity <= i.alert_threshold %}<span class="badge full">{{ i.quantity }}</span>{% else %}<span class="badge">{{ i.quantity }}</span>{% endif %}</td><td>{{ i.alert_threshold }}</td><td>{{ i.acquisition_year or '-' }}</td><td>{{ '%.2f'|format((i.quantity or 0) * (i.unit_cost or 0)) }} €</td><td>{% if i.invoice_file %}<a class="btn secondary" href="{{ url_for('static', filename=i.invoice_file) }}" target="_blank">Facture</a>{% endif %} {% if i.purchase_request_file %}<a class="btn secondary" href="{{ url_for('static', filename=i.purchase_request_file) }}" target="_blank">Demande CSE</a>{% endif %}{% if not i.invoice_file and not i.purchase_request_file %}<span class="muted">-</span>{% endif %}</td><td>{{ i.notes or '' }}</td></tr>{% else %}<tr><td colspan="8" class="muted">Aucun article.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'inventory')|safe }}
 """
@@ -4262,66 +4266,34 @@ def admin_budget():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
     try:
-        try:
-            ensure_schema()
-        except Exception as exc:
-            db.session.rollback()
-            print("\n--- ERREUR MIGRATION BUDGET ---")
-            traceback.print_exc()
-            print("-------------------------------\n")
-            flash("La mise à jour automatique de la base a rencontré un souci. Le budget reste ouvert en mode sécurisé.")
+        db.create_all()
         if request.method == "POST":
             entry_date = datetime.strptime(request.form["entry_date"], "%Y-%m-%d").date()
-            entry = BudgetEntry(entry_date=entry_date, entry_type=request.form["entry_type"], category=request.form["category"], label=request.form["label"].strip(), amount=float(request.form["amount"].replace(",", ".")), notes=request.form.get("notes", "").strip())
+            amount = float(request.form["amount"].replace(",", "."))
+            entry = BudgetEntry(
+                entry_date=entry_date,
+                entry_type=request.form.get("entry_type", "expense"),
+                category=request.form.get("category", "Autre"),
+                label=request.form.get("label", "").strip() or "Ligne budget",
+                amount=amount,
+                notes=request.form.get("notes", "").strip(),
+            )
             db.session.add(entry)
             db.session.commit()
             flash("Ligne budget ajoutée.")
             return redirect(url_for("admin_budget"))
-        try:
-            dues_year = int(request.args.get("dues_year") or date.today().year)
-        except (TypeError, ValueError):
-            dues_year = date.today().year
         entries = BudgetEntry.query.order_by(BudgetEntry.entry_date.desc(), BudgetEntry.id.desc()).all()
-    except Exception as exc:
-        db.session.rollback()
-        print("\n--- ERREUR LECTURE LIGNES BUDGET ---")
-        traceback.print_exc()
-        print("------------------------------------\n")
-        entries = []
-        try:
-            dues_year = int(request.args.get("dues_year") or date.today().year)
-        except (TypeError, ValueError):
-            dues_year = date.today().year
-        flash("Impossible de lire les lignes budget existantes. La page reste accessible en mode sécurisé.")
-    try:
-        dues_rows = expected_dues_rows(dues_year)
     except Exception:
         db.session.rollback()
-        print("\n--- ERREUR COTISATIONS BUDGET ---")
+        print("\n--- ERREUR BUDGET SIMPLE ---")
         traceback.print_exc()
-        print("---------------------------------\n")
-        dues_rows = []
-        flash("Impossible de calculer les cotisations attendues pour le moment. Les lignes manuelles restent accessibles.")
+        print("----------------------------\n")
+        entries = []
+        flash("Budget ouvert en mode simplifié : anciennes données temporairement ignorées.")
     income = sum((e.amount or 0) for e in entries if e.entry_type == "income")
     expenses = sum((e.amount or 0) for e in entries if e.entry_type == "expense")
-    expected_dues = sum((row.get("total") or 0) for row in dues_rows)
-    total_income = income + expected_dues
-    try:
-        annual_fee = get_annual_membership_fee()
-        return render_template_string(TEMPLATE_BUDGET, entries=entries, income=total_income, expenses=expenses, balance=total_income-expenses, expected_dues=expected_dues, dues_rows=dues_rows, dues_year=dues_year, annual_membership_fee=annual_fee, today=date.today())
-    except Exception:
-        db.session.rollback()
-        print("\n--- ERREUR AFFICHAGE BUDGET ---")
-        traceback.print_exc()
-        print("-------------------------------\n")
-        try:
-            return render_template_string(TEMPLATE_BUDGET_SAFE, entries=entries, income=total_income, expenses=expenses, balance=total_income-expenses, expected_dues=expected_dues, dues_year=dues_year, today=date.today())
-        except Exception:
-            db.session.rollback()
-            print("\n--- ERREUR AFFICHAGE BUDGET SAFE ---")
-            traceback.print_exc()
-            print("------------------------------------\n")
-            return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Budget</title><style>body{{font-family:Arial,sans-serif;background:#f6f8fb;color:#111827;padding:32px}}.card{{background:white;border:1px solid #e5e7eb;border-radius:14px;padding:24px;max-width:900px;margin:auto}}.flash{{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;padding:12px;border-radius:10px}}</style></head><body><div class="card"><h1>Budget</h1><div class="flash">Mode urgence : le budget complet ne peut pas s'afficher. Les détails techniques sont dans les logs Render.</div><p>Recettes : {income:.2f} €</p><p>Dépenses : {expenses:.2f} €</p><p>Solde : {(total_income-expenses):.2f} €</p><p><a href="/">Retour au tableau de bord</a></p></div></body></html>"""
+    balance = income - expenses
+    return render_template_string(TEMPLATE_BUDGET_SIMPLE, entries=entries, income=income, expenses=expenses, balance=balance, today=date.today())
 
 
 @app.route("/admin/budget/dues/export")

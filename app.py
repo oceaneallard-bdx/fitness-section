@@ -915,6 +915,14 @@ def active_member_query():
     )
 
 
+def is_member_account(user):
+    return bool(user and user.account_status != "archived" and user.email != DEMO_ADHERENT_EMAIL and (
+        user.role == "adherent" or (
+            user.role == "admin" and user.subscription_type is not None and user.subscription_year is not None
+        )
+    ))
+
+
 def send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images):
     def worker():
         with app.app_context():
@@ -2135,13 +2143,7 @@ def member_coach_planning():
         flash("Accès réservé aux adhérents.")
         return redirect(url_for("index"))
     ensure_coach_absence_schema()
-    today = date.today()
-    year = int(request.args.get("year", today.year))
-    month = int(request.args.get("month", today.month))
-    if month < 1 or month > 12:
-        month = today.month
-    start = date(year, month, 1)
-    end = date(year, month, monthrange(year, month)[1])
+    view_mode, start, end, year, month = coach_planning_period(request.args)
     sessions = CourseSession.query.filter(
         CourseSession.course_date >= start,
         CourseSession.course_date <= end,
@@ -2179,6 +2181,10 @@ def member_coach_planning():
         weekday_labels=WEEKDAY_LABELS,
         year=year,
         month=month,
+        view_mode=view_mode,
+        start=start,
+        end=end,
+        range_label=f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}",
     )
 
 
@@ -2448,8 +2454,8 @@ def admin_edit_member(user_id):
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
     user = User.query.get_or_404(user_id)
-    if user.role != "adherent":
-        flash("Seuls les comptes adhérents peuvent être modifiés depuis cet écran.")
+    if not is_member_account(user):
+        flash("Seuls les comptes ayant un profil adhérent peuvent être modifiés depuis cet écran.")
         return redirect(url_for("admin_members"))
     if request.method == "POST":
         new_email = request.form["email"].strip().lower()
@@ -2506,8 +2512,8 @@ def admin_renew_member(user_id):
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
     user = User.query.get_or_404(user_id)
-    if user.role != "adherent":
-        flash("Compte non adhérent.")
+    if not is_member_account(user):
+        flash("Compte sans profil adhérent.")
         return redirect(url_for("admin_members"))
     subscription_type = normalize_subscription_type(request.form.get("subscription_type"))
     if subscription_type not in SUBSCRIPTION_PRICES:
@@ -2547,8 +2553,8 @@ def admin_member_reservations(user_id):
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
     user = User.query.get_or_404(user_id)
-    if user.role != "adherent":
-        flash("Compte non adhérent.")
+    if not is_member_account(user):
+        flash("Compte sans profil adhérent.")
         return redirect(url_for("admin_members"))
     today = date.today()
     end_date = today + timedelta(days=28)
@@ -2569,8 +2575,8 @@ def admin_book_for_member(user_id, session_id):
         return redirect(url_for("index"))
     user = User.query.get_or_404(user_id)
     session = CourseSession.query.get_or_404(session_id)
-    if user.role != "adherent":
-        flash("Compte non adhérent.")
+    if not is_member_account(user):
+        flash("Compte sans profil adhérent.")
         return redirect(url_for("admin_members"))
     can_book, reason = user_can_book_session(user, session)
     if not can_book:
@@ -2691,7 +2697,7 @@ def admin_members():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
-    query = active_adherent_query()
+    query = active_member_query()
     search = request.args.get("search", "").strip()
     profile = request.args.get("member_profile", "").strip()
     subscription = request.args.get("subscription_type", "").strip()
@@ -3386,7 +3392,7 @@ TEMPLATE_SESSION_DETAIL = """
 """
 
 TEMPLATE_MEMBERS = """
-{% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> <a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a></td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}
+{% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> {% if u.role == 'adherent' %}<a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a>{% else %}<span class="badge wait">Admin adhérent</span>{% endif %}</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}">""",
@@ -3549,7 +3555,7 @@ TEMPLATE_COACH_PLANNING = """
 """
 
 TEMPLATE_MEMBER_COACH_PLANNING = """
-{% set content %}<div class="card"><div class="top"><div><h1>Planning coachs</h1><p class="muted">Agenda visuel des cours. Les créneaux réservables peuvent être réservés directement ici.</p></div><form method="get"><input name="year" type="number" value="{{ year }}" style="width:90px;padding:10px;border-radius:10px;border:1px solid #ddd"> <input name="month" type="number" min="1" max="12" value="{{ month }}" style="width:70px;padding:10px;border-radius:10px;border:1px solid #ddd"> <button class="btn secondary" type="submit">Afficher</button></form></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto"><table class="table"><tr><th style="min-width:120px">Date</th>{% for coach in coach_names %}<th style="min-width:210px">{{ coach }}</th>{% endfor %}</tr>{% for day in month_days %}<tr><td><strong>{{ weekday_labels[day.weekday()] }}</strong><br>{{ day.strftime('%d/%m') }}</td>{% for coach in coach_names %}<td>{% set slots = coach_agenda.get((coach, day), []) %}{% for s in slots %}{% set a = abs_by_key.get((coach, day)) %}{% set booking = active_booking_by_session.get(s.id) %}<div style="border:1px solid #e5e7eb;border-left:4px solid #34a853;border-radius:10px;padding:8px;margin:6px 0;background:#fff"><strong>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</strong><br>{{ s.course_name }}<br>{% if a %}<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}<br>{% endif %}{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif a and a.status in ['absent','conge'] %}<span class="badge full">Indisponible</span>{% elif booking %}{% if booking.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(booking) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}<br><br><a class="btn danger" href="{{ url_for('cancel', booking_id=booking.id, next=request.full_path) }}">Annuler</a>{% else %}<span class="badge">{{ s.capacity - booked_count(s) if booked_count(s) < s.capacity else 0 }} places</span><br><br><a class="btn" href="{{ url_for('book', session_id=s.id, next=request.full_path) }}">Réserver</a>{% endif %}</div>{% else %}<span class="muted">-</span>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div></div>{% endset %}{{ shell(content, 'member_coach_planning')|safe }}
+{% set content %}<div class="card"><div class="top"><div><h1>Planning coachs</h1><p class="muted">Agenda visuel des cours. Par défaut : 30 jours glissants à partir d'aujourd'hui. Période affichée : {{ range_label }}.</p></div><form method="get" class="card" style="box-shadow:none;background:#f9fafb;min-width:360px"><div class="form-grid"><div class="field"><label>Affichage</label><select name="view_mode"><option value="rolling" {% if view_mode == 'rolling' %}selected{% endif %}>Glissant 30 jours</option><option value="month" {% if view_mode == 'month' %}selected{% endif %}>Mois entier</option><option value="range" {% if view_mode == 'range' %}selected{% endif %}>Date à date</option></select></div><div class="field"><label>Année</label><input name="year" type="number" value="{{ year }}" min="2024" max="2100"></div><div class="field"><label>Mois</label><input name="month" type="number" min="1" max="12" value="{{ month }}"></div><div class="field"><label>Début</label><input name="start_date" type="date" value="{{ start.isoformat() }}"></div><div class="field"><label>Fin</label><input name="end_date" type="date" value="{{ end.isoformat() }}"></div></div><br><button class="btn secondary" type="submit">Afficher</button></form></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto"><table class="table"><tr><th style="min-width:120px">Date</th>{% for coach in coach_names %}<th style="min-width:210px">{{ coach }}</th>{% endfor %}</tr>{% for day in month_days %}<tr><td><strong>{{ weekday_labels[day.weekday()] }}</strong><br>{{ day.strftime('%d/%m') }}</td>{% for coach in coach_names %}<td>{% set slots = coach_agenda.get((coach, day), []) %}{% for s in slots %}{% set a = abs_by_key.get((coach, day)) %}{% set booking = active_booking_by_session.get(s.id) %}<div style="border:1px solid #e5e7eb;border-left:4px solid #34a853;border-radius:10px;padding:8px;margin:6px 0;background:#fff"><strong>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</strong><br>{{ s.course_name }}<br>{% if a %}<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}<br>{% endif %}{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif a and a.status in ['absent','conge'] %}<span class="badge full">Indisponible</span>{% elif booking %}{% if booking.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(booking) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}<br><br><a class="btn danger" href="{{ url_for('cancel', booking_id=booking.id, next=request.full_path) }}">Annuler</a>{% else %}<span class="badge">{{ s.capacity - booked_count(s) if booked_count(s) < s.capacity else 0 }} places</span><br><br><a class="btn" href="{{ url_for('book', session_id=s.id, next=request.full_path) }}">Réserver</a>{% endif %}</div>{% else %}<span class="muted">-</span>{% endfor %}</td>{% endfor %}</tr>{% endfor %}</table></div></div>{% endset %}{{ shell(content, 'member_coach_planning')|safe }}
 """
 
 _ABSENCE_BADGE_SNIPPET = """<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>"""

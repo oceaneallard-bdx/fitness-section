@@ -555,7 +555,8 @@ def period_budget_line(period, seen_user_years=None):
     ).order_by(MembershipPeriod.start_date, MembershipPeriod.id).first()
     is_first_period_for_year = first_period.id == period.id if first_period else user_year_key not in seen_user_years
     seen_user_years.add(user_year_key)
-    is_renewal = "renouvellement" in (period.notes or "").lower()
+    note_text = (period.notes or "").lower()
+    is_renewal = "renouvellement" in note_text and "période précédente" not in note_text
     annual_fee_should_apply = bool(period.annual_fee_applies and is_first_period_for_year and not is_renewal)
     subscription_price = period.subscription_price_snapshot
     if subscription_price is None:
@@ -733,6 +734,82 @@ def create_membership_period(user, subscription_type, subscription_year, annual_
     )
     db.session.add(period)
     return period
+
+
+def ensure_current_membership_period_before_change(user, new_subscription_type, new_subscription_year, created_by=None):
+    old_subscription_type = normalize_subscription_type(user.subscription_type)
+    old_subscription_year = int(user.subscription_year or new_subscription_year or date.today().year)
+    new_subscription_type = normalize_subscription_type(new_subscription_type)
+    new_subscription_year = int(new_subscription_year or old_subscription_year)
+    if not old_subscription_type or old_subscription_type not in SUBSCRIPTION_PRICES:
+        return None
+    if old_subscription_type == new_subscription_type and old_subscription_year == new_subscription_year:
+        return None
+    existing = MembershipPeriod.query.filter_by(
+        user_id=user.id,
+        subscription_type=old_subscription_type,
+        subscription_year=old_subscription_year,
+    ).first()
+    if existing:
+        return existing
+    annual_fee_applies = not MembershipPeriod.query.filter_by(user_id=user.id, subscription_year=old_subscription_year).first()
+    return create_membership_period(
+        user,
+        old_subscription_type,
+        old_subscription_year,
+        annual_fee_applies=annual_fee_applies,
+        created_by=created_by,
+        notes="Période précédente conservée avant nouvelle adhésion",
+    )
+
+
+def inferred_previous_subscription(subscription_type):
+    subscription_type = normalize_subscription_type(subscription_type)
+    previous = {
+        "Semestre 2": "Semestre 1",
+        "T2": "Trimestre 1",
+        "T3": "T2",
+        "T4": "T3",
+    }
+    return previous.get(subscription_type)
+
+
+def repair_missing_prior_membership_periods(user):
+    repaired = False
+    periods = MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year, MembershipPeriod.start_date, MembershipPeriod.id).all()
+    for period in periods:
+        if "renouvellement" not in (period.notes or "").lower():
+            continue
+        prior_type = inferred_previous_subscription(period.subscription_type)
+        if not prior_type:
+            continue
+        prior_start, prior_end = subscription_range(prior_type, period.subscription_year)
+        if prior_end >= period.start_date:
+            continue
+        existing_prior = MembershipPeriod.query.filter_by(
+            user_id=user.id,
+            subscription_type=prior_type,
+            subscription_year=period.subscription_year,
+            start_date=prior_start,
+            end_date=prior_end,
+        ).first()
+        has_any_prior = MembershipPeriod.query.filter(
+            MembershipPeriod.user_id == user.id,
+            MembershipPeriod.subscription_year == period.subscription_year,
+            MembershipPeriod.end_date < period.start_date,
+        ).first()
+        if existing_prior or has_any_prior:
+            continue
+        create_membership_period(
+            user,
+            prior_type,
+            period.subscription_year,
+            annual_fee_applies=True,
+            created_by=period.created_by,
+            notes="Période précédente reconstituée avant nouvelle adhésion",
+        )
+        repaired = True
+    return repaired
 
 
 def recent_membership_actions(limit=40):
@@ -1417,6 +1494,52 @@ def coach_monthly_invoice_rows(start, end, coach_filter=None):
             "coach_initial": session.coach_name or "-",
         })
     return sorted(rows.values(), key=lambda item: item["coach"])
+
+
+def coach_invoice_detail_rows(start, end, coach_filter=None):
+    sessions = CourseSession.query.filter(
+        CourseSession.course_date >= start,
+        CourseSession.course_date <= end,
+    ).order_by(CourseSession.course_date, CourseSession.start_time, CourseSession.coach_name).all()
+    absences = CoachAbsence.query.filter(
+        CoachAbsence.absence_date >= start,
+        CoachAbsence.absence_date <= end,
+    ).all()
+    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
+    rows = []
+
+    def add_row(coach, session, statut, absence=None, coach_initial=None, replacement_name=None):
+        if not coach or coach == "-":
+            return
+        if coach_filter and coach != coach_filter:
+            return
+        rows.append({
+            "date": session.course_date,
+            "jour": WEEKDAY_LABELS[session.course_date.weekday()],
+            "coach": coach,
+            "statut": statut,
+            "coach_initial": coach_initial or session.coach_name or "",
+            "remplacant": replacement_name or "",
+            "cours": session.course_name,
+            "horaire": f"{session.start_time.strftime('%H:%M')} - {session.end_time.strftime('%H:%M')}",
+            "suivi_admin": absence.followup_status if absence else "",
+            "notes_admin": absence.admin_notes if absence and absence.admin_notes else "",
+            "notes_coach": absence.notes if absence and absence.notes else "",
+        })
+
+    for session in sessions:
+        absence = absence_for_session(abs_by_key, session)
+        original_coach = session.coach_name or "-"
+        if absence and replacement_is_confirmed(absence):
+            add_row(absence.coach_name, session, "Absence remplacée", absence=absence, coach_initial=original_coach, replacement_name=absence.replacement_name)
+            add_row(absence.replacement_name, session, "Remplacement effectué", absence=absence, coach_initial=original_coach, replacement_name=absence.replacement_name)
+        elif absence and (absence.followup_status == "annule" or absence.status == "cancelled"):
+            add_row(original_coach, session, "Cours annulé", absence=absence, coach_initial=original_coach, replacement_name=absence.replacement_name)
+        elif absence and absence.status in ["absent", "conge"]:
+            add_row(original_coach, session, absence_display_label(absence), absence=absence, coach_initial=original_coach, replacement_name=absence.replacement_name)
+        else:
+            add_row(original_coach, session, "Cours effectué", absence=absence, coach_initial=original_coach)
+    return sorted(rows, key=lambda item: (item["coach"], item["date"], item["horaire"], item["cours"]))
 
 
 def absence_session_label(absence):
@@ -2345,9 +2468,11 @@ def admin_edit_member(user_id):
         if user.member_profile == "ayant_droit" and not user.rights_holder_name:
             flash("Merci d'indiquer le nom et prénom de l'ouvrant droit.")
             return redirect(url_for("admin_edit_member", user_id=user.id))
-        user.subscription_type = request.form.get("subscription_type")
-        user.subscription_type = normalize_subscription_type(user.subscription_type)
-        user.subscription_year = int(request.form.get("subscription_year") or date.today().year)
+        new_subscription_type = normalize_subscription_type(request.form.get("subscription_type"))
+        new_subscription_year = int(request.form.get("subscription_year") or date.today().year)
+        ensure_current_membership_period_before_change(user, new_subscription_type, new_subscription_year, created_by=current_user.display_name())
+        user.subscription_type = new_subscription_type
+        user.subscription_year = new_subscription_year
         user.subscription_end_date = subscription_end(user.subscription_type, user.subscription_year)
         create_membership_period(user, user.subscription_type, user.subscription_year, annual_fee_applies=not MembershipPeriod.query.filter_by(user_id=user.id, subscription_year=user.subscription_year).first(), created_by=current_user.display_name(), notes="Modification admin")
         if user.account_status == "archived" and user.subscription_end_date >= date.today():
@@ -2368,6 +2493,8 @@ def admin_edit_member(user_id):
         db.session.commit()
         flash("Informations adhérent mises à jour.")
         return redirect(url_for("admin_members"))
+    if repair_missing_prior_membership_periods(user):
+        db.session.commit()
     membership_periods = membership_period_rows(MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year.desc(), MembershipPeriod.start_date.desc()).all())
     return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys())
 
@@ -2387,6 +2514,7 @@ def admin_renew_member(user_id):
         flash("Type d'abonnement invalide.")
         return redirect(url_for("admin_edit_member", user_id=user.id))
     subscription_year = int(request.form.get("subscription_year") or date.today().year)
+    ensure_current_membership_period_before_change(user, subscription_type, subscription_year, created_by=current_user.display_name())
     annual_fee_applies = not MembershipPeriod.query.filter_by(
         user_id=user.id,
         subscription_year=subscription_year,
@@ -2819,7 +2947,8 @@ def coach_schedule():
             else:
                 replacements.append({"absence": absence, "session": None})
     invoice_rows = coach_monthly_invoice_rows(start, end, coach_filter=current_user.display_name())
-    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
+    invoice_detail_rows = coach_invoice_detail_rows(start, end, coach_filter=current_user.display_name())
+    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/coach/profile/delete/<int:absence_id>")
@@ -3490,6 +3619,11 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2><table class="table"><tr><th>Coach</th><th>Cours effectués</th><th>Remplacements</th><th>Absences</th><th>Cours annulés</th></tr>{% for row in invoice_rows %}<tr><td>{{ row.coach }}</td><td><strong>{{ row.cours }}</strong></td><td>{{ row.remplacements }}</td><td>{{ row.absences }}</td><td>{{ row.annules }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table></div><br><div style="overflow:auto">""",
     1,
 )
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """</table></div><br><div style="overflow:auto">""",
+    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation par coach</summary><br><table class="table"><tr><th>Coach</th><th>Date</th><th>Horaire</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th><th>Notes coach</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.coach }}</td><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td><td>{{ row.notes_coach or '' }}</td></tr>{% else %}<tr><td colspan="10" class="muted">Aucun détail sur cette période.</td></tr>{% endfor %}</table></details></div><br><div style="overflow:auto">""",
+    1,
+)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(
     "{% set a = abs_by_key.get((coach, day)) %}",
@@ -3506,6 +3640,11 @@ TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<td>{{ item.absence.f
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
     """<div class="grid"><div class="card"><span class="muted">Cours rattachés</span><div class="stat">{{ sessions|length }}</div></div><div class="card"><span class="muted">Remplacements</span><div class="stat">{{ replacements|length }}</div></div></div><h2>Cours prévus</h2>""",
     """<div class="grid"><div class="card"><span class="muted">Cours rattachés</span><div class="stat">{{ sessions|length }}</div></div><div class="card"><span class="muted">Remplacements</span><div class="stat">{{ replacements|length }}</div></div></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2><table class="table"><tr><th>Coach</th><th>Cours effectués</th><th>Remplacements</th><th>Absences</th><th>Cours annulés</th></tr>{% for row in invoice_rows %}<tr><td>{{ row.coach }}</td><td><strong>{{ row.cours }}</strong></td><td>{{ row.remplacements }}</td><td>{{ row.absences }}</td><td>{{ row.annules }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune donnée sur ce mois.</td></tr>{% endfor %}</table></div><br><h2>Cours prévus</h2>""",
+    1,
+)
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
+    """</table></div><br><h2>Cours prévus</h2>""",
+    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation</summary><br><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td></tr>{% else %}<tr><td colspan="8" class="muted">Aucun détail sur ce mois.</td></tr>{% endfor %}</table></details></div><br><h2>Cours prévus</h2>""",
     1,
 )
 
@@ -3914,7 +4053,8 @@ def admin_coach_planning():
         coach_agenda.setdefault((effective_coach_for_session(session, abs_by_key), session.course_date), []).append(session)
     range_label = f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}"
     invoice_rows = coach_monthly_invoice_rows(start, end)
-    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
+    invoice_detail_rows = coach_invoice_detail_rows(start, end)
+    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/admin/coach-absence/<int:absence_id>/followup", methods=["POST"])
@@ -4038,6 +4178,22 @@ def export_coach_absences():
     ws3.append(["Coach", "Cours effectués", "Remplacements", "Absences", "Cours annulés"])
     for row in coach_monthly_invoice_rows(start, end):
         ws3.append([row["coach"], row["cours"], row["remplacements"], row["absences"], row["annules"]])
+    ws4 = wb.create_sheet("Détail facturation")
+    ws4.append(["Coach", "Date", "Jour", "Horaire", "Cours", "Statut", "Coach initial", "Remplaçant", "Suivi admin", "Notes admin", "Notes coach"])
+    for row in coach_invoice_detail_rows(start, end):
+        ws4.append([
+            row["coach"],
+            row["date"].strftime("%d/%m/%Y"),
+            row["jour"],
+            row["horaire"],
+            row["cours"],
+            row["statut"],
+            row["coach_initial"],
+            row["remplacant"],
+            row["suivi_admin"],
+            row["notes_admin"],
+            row["notes_coach"],
+        ])
     file = BytesIO()
     wb.save(file)
     file.seek(0)

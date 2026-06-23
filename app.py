@@ -1539,6 +1539,15 @@ def coach_invoice_detail_rows(start, end, coach_filter=None):
             "remplacant": replacement_name or "",
             "cours": session.course_name,
             "horaire": f"{session.start_time.strftime('%H:%M')} - {session.end_time.strftime('%H:%M')}",
+            "start_time": session.start_time,
+            "end_time": session.end_time,
+            "duration_hours": max(
+                0,
+                (
+                    datetime.combine(session.course_date, session.end_time)
+                    - datetime.combine(session.course_date, session.start_time)
+                ).total_seconds() / 3600,
+            ),
             "suivi_admin": absence.followup_status if absence else "",
             "notes_admin": absence.admin_notes if absence and absence.admin_notes else "",
             "notes_coach": absence.notes if absence and absence.notes else "",
@@ -1557,6 +1566,52 @@ def coach_invoice_detail_rows(start, end, coach_filter=None):
         else:
             add_row(original_coach, session, "Cours effectué", absence=absence, coach_initial=original_coach)
     return sorted(rows, key=lambda item: (item["coach"], item["date"], item["horaire"], item["cours"]))
+
+
+def format_time_compact(value):
+    return value.strftime("%Hh%M").replace("h00", "h")
+
+
+def format_duration_hours(hours):
+    total_minutes = int(round((hours or 0) * 60))
+    whole_hours, minutes = divmod(total_minutes, 60)
+    if minutes:
+        return f"{whole_hours}h{minutes:02d}"
+    return f"{whole_hours}h"
+
+
+def coach_invoice_summary_rows(start, end, coach_filter=None):
+    grouped = {}
+    for row in coach_invoice_detail_rows(start, end, coach_filter=coach_filter):
+        coach = row["coach"]
+        item = grouped.setdefault(coach, {"coach": coach, "items": [], "total_hours": 0.0})
+        label = (
+            f"{row['date'].strftime('%d/%m')} de "
+            f"{format_time_compact(row['start_time'])} à {format_time_compact(row['end_time'])} "
+            f"({format_duration_hours(row['duration_hours'])}) - {row['cours']} - {row['statut']}"
+        )
+        if row.get("coach_initial") and row["coach_initial"] != coach:
+            label += f" (coach initial : {row['coach_initial']})"
+        if row.get("remplacant") and row["remplacant"] != coach:
+            label += f" (remplaçant : {row['remplacant']})"
+        notes = []
+        if row.get("notes_admin"):
+            notes.append(f"note admin : {row['notes_admin']}")
+        if row.get("notes_coach"):
+            notes.append(f"note coach : {row['notes_coach']}")
+        if notes:
+            label += f" [{'; '.join(notes)}]"
+        item["items"].append(label)
+        item["total_hours"] += row["duration_hours"] or 0
+    rows = []
+    for item in grouped.values():
+        rows.append({
+            "coach": item["coach"],
+            "details": " ; ".join(item["items"]),
+            "total_hours": item["total_hours"],
+            "total_label": format_duration_hours(item["total_hours"]),
+        })
+    return sorted(rows, key=lambda item: item["coach"])
 
 
 def absence_session_label(absence):
@@ -2963,7 +3018,8 @@ def coach_schedule():
                 replacements.append({"absence": absence, "session": None})
     invoice_rows = coach_monthly_invoice_rows(start, end, coach_filter=current_user.display_name())
     invoice_detail_rows = coach_invoice_detail_rows(start, end, coach_filter=current_user.display_name())
-    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
+    invoice_summary_rows = coach_invoice_summary_rows(start, end, coach_filter=current_user.display_name())
+    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/coach/profile/delete/<int:absence_id>")
@@ -3636,7 +3692,7 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
 )
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """</table></div><br><div style="overflow:auto">""",
-    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation par coach</summary><br><table class="table"><tr><th>Coach</th><th>Date</th><th>Horaire</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th><th>Notes coach</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.coach }}</td><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td><td>{{ row.notes_coach or '' }}</td></tr>{% else %}<tr><td colspan="10" class="muted">Aucun détail sur cette période.</td></tr>{% endfor %}</table></details></div><br><div style="overflow:auto">""",
+    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation par coach</summary><br><table class="table"><tr><th>Coach</th><th>Créneaux</th><th>Total heures</th></tr>{% for row in invoice_summary_rows %}<tr><td><strong>{{ row.coach }}</strong></td><td>{{ row.details }}</td><td><strong>{{ row.total_label }}</strong></td></tr>{% else %}<tr><td colspan="3" class="muted">Aucun détail sur cette période.</td></tr>{% endfor %}</table></details></div><br><div style="overflow:auto">""",
     1,
 )
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
@@ -3659,7 +3715,7 @@ TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
 )
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
     """</table></div><br><h2>Cours prévus</h2>""",
-    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation</summary><br><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td></tr>{% else %}<tr><td colspan="8" class="muted">Aucun détail sur ce mois.</td></tr>{% endfor %}</table></details></div><br><h2>Cours prévus</h2>""",
+    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation</summary><br><table class="table"><tr><th>Coach</th><th>Créneaux</th><th>Total heures</th></tr>{% for row in invoice_summary_rows %}<tr><td><strong>{{ row.coach }}</strong></td><td>{{ row.details }}</td><td><strong>{{ row.total_label }}</strong></td></tr>{% else %}<tr><td colspan="3" class="muted">Aucun détail sur ce mois.</td></tr>{% endfor %}</table></details></div><br><h2>Cours prévus</h2>""",
     1,
 )
 
@@ -4069,7 +4125,8 @@ def admin_coach_planning():
     range_label = f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}"
     invoice_rows = coach_monthly_invoice_rows(start, end)
     invoice_detail_rows = coach_invoice_detail_rows(start, end)
-    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
+    invoice_summary_rows = coach_invoice_summary_rows(start, end)
+    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/admin/coach-absence/<int:absence_id>/followup", methods=["POST"])
@@ -4193,10 +4250,14 @@ def export_coach_absences():
     ws3.append(["Coach", "Cours effectués", "Remplacements", "Absences", "Cours annulés"])
     for row in coach_monthly_invoice_rows(start, end):
         ws3.append([row["coach"], row["cours"], row["remplacements"], row["absences"], row["annules"]])
-    ws4 = wb.create_sheet("Détail facturation")
-    ws4.append(["Coach", "Date", "Jour", "Horaire", "Cours", "Statut", "Coach initial", "Remplaçant", "Suivi admin", "Notes admin", "Notes coach"])
+    ws4 = wb.create_sheet("Facturation par coach")
+    ws4.append(["Coach", "Créneaux", "Total heures"])
+    for row in coach_invoice_summary_rows(start, end):
+        ws4.append([row["coach"], row["details"], row["total_label"]])
+    ws5 = wb.create_sheet("Détail brut facturation")
+    ws5.append(["Coach", "Date", "Jour", "Horaire", "Cours", "Statut", "Coach initial", "Remplaçant", "Suivi admin", "Notes admin", "Notes coach"])
     for row in coach_invoice_detail_rows(start, end):
-        ws4.append([
+        ws5.append([
             row["coach"],
             row["date"].strftime("%d/%m/%Y"),
             row["jour"],

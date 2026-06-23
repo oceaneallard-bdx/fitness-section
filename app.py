@@ -1537,7 +1537,6 @@ def coach_invoice_detail_rows(start, end, coach_filter=None):
                 - datetime.combine(session.course_date, session.start_time)
             ).total_seconds() / 3600,
         )
-        billed_hours = 1.5 if 0 < duration_hours <= 1 else duration_hours
         rows.append({
             "date": session.course_date,
             "jour": WEEKDAY_LABELS[session.course_date.weekday()],
@@ -1551,8 +1550,8 @@ def coach_invoice_detail_rows(start, end, coach_filter=None):
             "end_time": session.end_time,
             "duration_hours": duration_hours,
             "duration_label": format_duration_hours(duration_hours),
-            "billed_hours": billed_hours,
-            "billed_label": format_duration_hours(billed_hours),
+            "billed_hours": duration_hours,
+            "billed_label": format_duration_hours(duration_hours),
             "suivi_admin": absence.followup_status if absence else "",
             "notes_admin": absence.admin_notes if absence and absence.admin_notes else "",
             "notes_coach": absence.notes if absence and absence.notes else "",
@@ -1570,7 +1569,40 @@ def coach_invoice_detail_rows(start, end, coach_filter=None):
             add_row(original_coach, session, absence_display_label(absence), absence=absence, coach_initial=original_coach, replacement_name=absence.replacement_name)
         else:
             add_row(original_coach, session, "Cours effectué", absence=absence, coach_initial=original_coach)
+    apply_billing_duration_rule(rows)
     return sorted(rows, key=lambda item: (item["coach"], item["date"], item["horaire"], item["cours"]))
+
+
+def apply_billing_duration_rule(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault((row["coach"], row["date"]), []).append(row)
+    for day_rows in grouped.values():
+        ordered = sorted(day_rows, key=lambda item: (item["start_time"], item["end_time"], item["cours"]))
+        current_block = []
+        for row in ordered:
+            if current_block and row["start_time"] != current_block[-1]["end_time"]:
+                apply_billing_duration_block(current_block)
+                current_block = []
+            current_block.append(row)
+        if current_block:
+            apply_billing_duration_block(current_block)
+
+
+def apply_billing_duration_block(block):
+    total_hours = sum(row.get("duration_hours") or 0 for row in block)
+    if not block:
+        return
+    if 0 < total_hours <= 1:
+        block[0]["billed_hours"] = 1.5
+        block[0]["billed_label"] = "1h30"
+        for row in block[1:]:
+            row["billed_hours"] = 0
+            row["billed_label"] = "0h"
+    else:
+        for row in block:
+            row["billed_hours"] = row.get("duration_hours") or 0
+            row["billed_label"] = format_duration_hours(row["billed_hours"])
 
 
 def format_time_compact(value):
@@ -3697,7 +3729,7 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
 )
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """</table></div><br><div style="overflow:auto">""",
-    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation par coach</summary><p class="muted">Règle de facturation : tout créneau d'1h ou moins est compté 1h30.</p><br><table class="table"><tr><th>Coach</th><th>Date</th><th>Horaire</th><th>Durée réelle</th><th>Durée facturée</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th><th>Notes coach</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.coach }}</td><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.duration_label }}</td><td><strong>{{ row.billed_label }}</strong></td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td><td>{{ row.notes_coach or '' }}</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun détail sur cette période.</td></tr>{% endfor %}</table></details></div><br><div style="overflow:auto">""",
+    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation par coach</summary><p class="muted">Règle de facturation : un créneau isolé ou un bloc continu de cours d'1h ou moins est compté 1h30. Deux cours accolés d'1h sont donc comptés 2h.</p><br><table class="table"><tr><th>Coach</th><th>Date</th><th>Horaire</th><th>Durée réelle</th><th>Durée facturée</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th><th>Notes coach</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.coach }}</td><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.duration_label }}</td><td><strong>{{ row.billed_label }}</strong></td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td><td>{{ row.notes_coach or '' }}</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun détail sur cette période.</td></tr>{% endfor %}</table></details></div><br><div style="overflow:auto">""",
     1,
 )
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
@@ -3720,7 +3752,7 @@ TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
 )
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
     """</table></div><br><h2>Cours prévus</h2>""",
-    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation</summary><p class="muted">Règle de facturation : tout créneau d'1h ou moins est compté 1h30.</p><br><table class="table"><tr><th>Date</th><th>Horaire</th><th>Durée réelle</th><th>Durée facturée</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.duration_label }}</td><td><strong>{{ row.billed_label }}</strong></td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td></tr>{% else %}<tr><td colspan="10" class="muted">Aucun détail sur ce mois.</td></tr>{% endfor %}</table></details></div><br><h2>Cours prévus</h2>""",
+    """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation</summary><p class="muted">Règle de facturation : un créneau isolé ou un bloc continu de cours d'1h ou moins est compté 1h30. Deux cours accolés d'1h sont donc comptés 2h.</p><br><table class="table"><tr><th>Date</th><th>Horaire</th><th>Durée réelle</th><th>Durée facturée</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.duration_label }}</td><td><strong>{{ row.billed_label }}</strong></td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td></tr>{% else %}<tr><td colspan="10" class="muted">Aucun détail sur ce mois.</td></tr>{% endfor %}</table></details></div><br><h2>Cours prévus</h2>""",
     1,
 )
 
@@ -4256,7 +4288,7 @@ def export_coach_absences():
     for row in coach_monthly_invoice_rows(start, end):
         ws3.append([row["coach"], row["cours"], row["remplacements"], row["absences"], row["annules"]])
     ws4 = wb.create_sheet("Détail facturation")
-    ws4.append(["Règle", "Tout créneau d'1h ou moins est compté 1h30 pour la facturation."])
+    ws4.append(["Règle", "Un créneau isolé ou un bloc continu de cours d'1h ou moins est compté 1h30. Deux cours accolés d'1h sont comptés 2h."])
     ws4.append([])
     ws4.append(["Coach", "Date", "Jour", "Horaire", "Durée réelle", "Durée facturée", "Cours", "Statut", "Coach initial", "Remplaçant", "Suivi admin", "Notes admin", "Notes coach"])
     for row in coach_invoice_detail_rows(start, end):

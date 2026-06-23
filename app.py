@@ -545,6 +545,46 @@ def first_registration_fee_applies(user, year):
     return user.subscription_year == year
 
 
+def period_budget_line(period, seen_user_years=None):
+    seen_user_years = seen_user_years if seen_user_years is not None else set()
+    user = period.user
+    subscription_type = normalize_subscription_type(period.subscription_type)
+    user_year_key = (period.user_id, period.subscription_year)
+    first_period = MembershipPeriod.query.filter_by(
+        user_id=period.user_id,
+        subscription_year=period.subscription_year,
+    ).order_by(MembershipPeriod.start_date, MembershipPeriod.id).first()
+    is_first_period_for_year = first_period.id == period.id if first_period else user_year_key not in seen_user_years
+    seen_user_years.add(user_year_key)
+    is_renewal = "renouvellement" in (period.notes or "").lower()
+    annual_fee_should_apply = bool(period.annual_fee_applies and is_first_period_for_year and not is_renewal)
+    subscription_price = period.subscription_price_snapshot
+    if subscription_price is None:
+        subscription_price, fallback_fee, _ = membership_tariff_snapshot(user, subscription_type, annual_fee_should_apply)
+        annual_fee = fallback_fee if annual_fee_should_apply else 0.0
+    else:
+        annual_fee = (period.annual_fee_snapshot or 0.0) if annual_fee_should_apply else 0.0
+    total = (subscription_price or 0.0) + (annual_fee or 0.0)
+    return {
+        "period": period,
+        "user": user,
+        "subscription_type": subscription_type,
+        "subscription_year": period.subscription_year,
+        "member_profile_label": member_profile_label(user.member_profile or "ouvrant_droit"),
+        "profile_rate": 0,
+        "base_subscription_price": subscription_price or 0.0,
+        "subscription_price": subscription_price or 0.0,
+        "annual_fee": annual_fee or 0.0,
+        "total": total,
+        "annual_fee_applies": annual_fee_should_apply,
+    }
+
+
+def membership_period_rows(periods):
+    seen_user_years = set()
+    return [period_budget_line(period, seen_user_years) for period in periods]
+
+
 def expected_dues_rows(year=None):
     year = int(year or date.today().year)
     rows = []
@@ -554,33 +594,7 @@ def expected_dues_rows(year=None):
         MembershipPeriod.subscription_year == year,
     ).order_by(User.full_name, User.email, MembershipPeriod.start_date, MembershipPeriod.id).all()
     period_user_ids = {p.user_id for p in periods}
-    first_period_seen = set()
-    for period in periods:
-        user = period.user
-        member_profile = user.member_profile or "ouvrant_droit"
-        subscription_type = normalize_subscription_type(period.subscription_type)
-        subscription_price = period.subscription_price_snapshot
-        user_year_key = (period.user_id, period.subscription_year)
-        is_first_period_for_year = user_year_key not in first_period_seen
-        first_period_seen.add(user_year_key)
-        is_renewal = "renouvellement" in (period.notes or "").lower()
-        annual_fee_should_apply = period.annual_fee_applies and is_first_period_for_year and not is_renewal
-        first_fee = period.annual_fee_snapshot if annual_fee_should_apply else 0.0
-        if subscription_price is None:
-            subscription_price, fallback_fee, _ = membership_tariff_snapshot(user, subscription_type, annual_fee_should_apply)
-            first_fee = fallback_fee if annual_fee_should_apply else 0.0
-        total = (subscription_price or 0.0) + (first_fee or 0.0)
-        rows.append({
-            "user": user,
-            "subscription_type": subscription_type,
-            "subscription_year": period.subscription_year,
-            "member_profile_label": member_profile_label(member_profile),
-            "profile_rate": 0,
-            "base_subscription_price": subscription_price,
-            "subscription_price": subscription_price,
-            "annual_fee": first_fee,
-            "total": total,
-        })
+    rows.extend(membership_period_rows(periods))
     users = active_member_query().filter(User.subscription_year == year, ~User.id.in_(period_user_ids or {0})).order_by(User.full_name, User.email).all()
     for user in users:
         member_profile = user.member_profile or "ouvrant_droit"
@@ -2531,7 +2545,7 @@ def admin_members():
     start_date = parse_iso_date(followup_start, None) if followup_start else None
     end_date = parse_iso_date(followup_end, None) if followup_end else None
     followup_year_value = int(followup_year) if followup_year.isdigit() else None
-    membership_actions = membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).limit(25).all()
+    membership_actions = membership_period_rows(membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).limit(25).all())
     return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys(), membership_actions=membership_actions)
 
 
@@ -2547,22 +2561,23 @@ def export_membership_followup():
     start_date = parse_iso_date(followup_start, None) if followup_start else None
     end_date = parse_iso_date(followup_end, None) if followup_end else None
     followup_year_value = int(followup_year) if followup_year.isdigit() else None
-    periods = membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).all()
+    rows = membership_period_rows(membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).all())
     wb = Workbook()
     ws = wb.active
     ws.title = "Suivi inscriptions"
     ws.append(["Date action", "Adhérent", "Email", "Abonnement", "Année", "Période", "Tarif abonnement figé", "Cotisation annuelle figée", "Total figé", "Créé par", "Note"])
-    for period in periods:
+    for row in rows:
+        period = row["period"]
         ws.append([
             period.created_at.strftime("%d/%m/%Y %H:%M") if period.created_at else "",
-            period.user.display_name(),
-            period.user.email,
-            period.subscription_type,
-            period.subscription_year,
+            row["user"].display_name(),
+            row["user"].email,
+            row["subscription_type"],
+            row["subscription_year"],
             f"{period.start_date.strftime('%d/%m/%Y')} - {period.end_date.strftime('%d/%m/%Y')}",
-            period.subscription_price_snapshot or 0,
-            period.annual_fee_snapshot or 0,
-            period.total_snapshot or 0,
+            row["subscription_price"],
+            row["annual_fee"],
+            row["total"],
             period.created_by or "",
             period.notes or "",
         ])
@@ -3199,7 +3214,7 @@ TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
 )
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """</form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
-    """</form><br><details class="card" style="box-shadow:none;background:#f9fafb" {% if filter_values.followup_year or filter_values.followup_start or filter_values.followup_end %}open{% endif %}><summary style="cursor:pointer;font-weight:800;font-size:18px">Suivi inscriptions / renouvellements</summary><p class="muted">Affichage limité aux 25 dernières lignes de la période choisie. Les montants sont figés à la date d'inscription.</p><form method="get" action="{{ url_for('admin_members') }}"><div class="form-grid"><div class="field"><label>Année d'adhésion</label><input name="followup_year" type="number" value="{{ filter_values.followup_year }}" placeholder="2026"></div><div class="field"><label>Date action début</label><input name="followup_start" type="date" value="{{ filter_values.followup_start }}"></div><div class="field"><label>Date action fin</label><input name="followup_end" type="date" value="{{ filter_values.followup_end }}"></div></div><br><button class="btn secondary" type="submit">Afficher le suivi</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a> <a class="btn" href="{{ url_for('export_membership_followup', followup_year=filter_values.followup_year, followup_start=filter_values.followup_start, followup_end=filter_values.followup_end) }}">Exporter ce suivi</a></form><br><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_actions %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y %H:%M') if p.created_at else '-' }}</td><td>{{ p.user.display_name() }}<br><small class="muted">{{ p.user.email }}</small></td><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(p.subscription_price_snapshot or 0) }} €</td><td>{% if p.annual_fee_applies %}{{ '%.2f'|format(p.annual_fee_snapshot or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(p.total_snapshot or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="9" class="muted">Aucune action d'adhésion sur cette période.</td></tr>{% endfor %}</table></details><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    """</form><br><details class="card" style="box-shadow:none;background:#f9fafb" {% if filter_values.followup_year or filter_values.followup_start or filter_values.followup_end %}open{% endif %}><summary style="cursor:pointer;font-weight:800;font-size:18px">Suivi inscriptions / renouvellements</summary><p class="muted">Affichage limité aux 25 dernières lignes de la période choisie. Les montants sont figés à la date d'inscription.</p><form method="get" action="{{ url_for('admin_members') }}"><div class="form-grid"><div class="field"><label>Année d'adhésion</label><input name="followup_year" type="number" value="{{ filter_values.followup_year }}" placeholder="2026"></div><div class="field"><label>Date action début</label><input name="followup_start" type="date" value="{{ filter_values.followup_start }}"></div><div class="field"><label>Date action fin</label><input name="followup_end" type="date" value="{{ filter_values.followup_end }}"></div></div><br><button class="btn secondary" type="submit">Afficher le suivi</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a> <a class="btn" href="{{ url_for('export_membership_followup', followup_year=filter_values.followup_year, followup_start=filter_values.followup_start, followup_end=filter_values.followup_end) }}">Exporter ce suivi</a></form><br><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for row in membership_actions %}{% set p = row.period %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y %H:%M') if p.created_at else '-' }}</td><td>{{ row.user.display_name() }}<br><small class="muted">{{ row.user.email }}</small></td><td>{{ row.subscription_type }} {{ row.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(row.subscription_price or 0) }} €</td><td>{% if row.annual_fee %}{{ '%.2f'|format(row.annual_fee or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(row.total or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="9" class="muted">Aucune action d'adhésion sur cette période.</td></tr>{% endfor %}</table></details><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
     1,
 )
 

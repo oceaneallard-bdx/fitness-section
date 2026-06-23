@@ -1766,6 +1766,35 @@ def cancel_booking_and_promote(booking, cancelled_by_admin=False):
     return None
 
 
+def cancel_course_session(session, admin_user):
+    absence = upsert_coach_absence(
+        session.coach_name or "-",
+        session.course_date,
+        "cancelled",
+        "",
+        f"Cours annulé par {admin_user.display_name()}",
+        session=session,
+    )
+    absence.followup_status = "annule"
+    absence.admin_notes = f"Annulation admin le {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
+    absence.reviewed_at = datetime.utcnow()
+    absence.reviewed_by = admin_user.display_name()
+    active_bookings = Booking.query.filter(
+        Booking.session_id == session.id,
+        Booking.status.in_(["booked", "waiting_list"]),
+    ).all()
+    for booking in active_bookings:
+        booking.status = "cancelled"
+    db.session.commit()
+    for booking in active_bookings:
+        send_email(
+            booking.user.email,
+            "Cours annulé - Section Fitness",
+            f"Bonjour {booking.user.display_name()},\n\nLe cours {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} à {session.start_time.strftime('%H:%M')} est annulé par la Section Fitness.\n\nVotre réservation est donc annulée.\n\nSection Fitness",
+        )
+    return len(active_bookings)
+
+
 def absence_count(user):
     three_months_ago = date.today() - timedelta(days=90)
     return Booking.query.join(CourseSession).filter(
@@ -3723,6 +3752,16 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     1,
 )
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """{{ s.course_name }}<br>{% if a %}""",
+    """{{ s.course_name }}<br>{% if not (a and absence_display_label(a) == 'cours annulé') %}<form method="post" action="{{ url_for('admin_cancel_session', session_id=s.id) }}" style="margin-top:8px"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn danger" type="submit" onclick="return confirm('Annuler ce cours ? Les réservations actives seront annulées.')">Annuler ce cours</button></form>{% endif %}{% if a %}""",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """{{ s.course_name }}<br>{% if not s.is_reservable %}""",
+    """{{ s.course_name }}<br>{% if not (a and absence_display_label(a) == 'cours annulé') %}<form method="post" action="{{ url_for('admin_cancel_session', session_id=s.id) }}" style="margin-top:8px"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn danger" type="submit" onclick="return confirm('Annuler ce cours ? Les réservations actives seront annulées.')">Annuler ce cours</button></form>{% endif %}{% if not s.is_reservable %}""",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto">""",
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2><table class="table"><tr><th>Coach</th><th>Cours effectués</th><th>Remplacements</th><th>Absences</th><th>Cours annulés</th></tr>{% for row in invoice_rows %}<tr><td>{{ row.coach }}</td><td><strong>{{ row.cours }}</strong></td><td>{{ row.remplacements }}</td><td>{{ row.absences }}</td><td>{{ row.annules }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table></div><br><div style="overflow:auto">""",
     1,
@@ -4238,6 +4277,27 @@ def update_coach_absence_followup(absence_id):
             sent_parts.append(f"{sent} coach(s) contacté(s) pour remplacement")
     flash("Suivi de la demande mis à jour." + (f" Emails : {', '.join(sent_parts)}." if sent_parts else ""))
     return redirect(url_for("admin_coach_planning", view_mode=request.form.get("view_mode", "rolling"), start_date=request.form.get("start_date", ""), end_date=request.form.get("end_date", ""), year=request.form.get("year", absence.absence_date.year), month=request.form.get("month", absence.absence_date.month)))
+
+
+@app.route("/admin/session/<int:session_id>/cancel", methods=["POST"])
+@login_required
+def admin_cancel_session(session_id):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    ensure_coach_absence_schema()
+    session = CourseSession.query.get_or_404(session_id)
+    absence = CoachAbsence.query.filter_by(
+        coach_name=session.coach_name or "-",
+        absence_date=session.course_date,
+        session_id=session.id,
+    ).first()
+    if absence and (absence.followup_status == "annule" or absence.status == "cancelled"):
+        flash("Ce cours est déjà annulé.")
+        return redirect(next_url("admin_coach_planning"))
+    cancelled_count = cancel_course_session(session, current_user)
+    flash(f"Cours annulé. {cancelled_count} réservation(s) active(s) annulée(s).")
+    return redirect(next_url("admin_coach_planning"))
 
 
 @app.route("/admin/coach-planning/export")

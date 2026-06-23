@@ -1766,35 +1766,6 @@ def cancel_booking_and_promote(booking, cancelled_by_admin=False):
     return None
 
 
-def cancel_course_session(session, admin_user):
-    absence = upsert_coach_absence(
-        session.coach_name or "-",
-        session.course_date,
-        "cancelled",
-        "",
-        f"Cours annulé par {admin_user.display_name()}",
-        session=session,
-    )
-    absence.followup_status = "annule"
-    absence.admin_notes = f"Annulation admin le {datetime.utcnow().strftime('%d/%m/%Y %H:%M')}"
-    absence.reviewed_at = datetime.utcnow()
-    absence.reviewed_by = admin_user.display_name()
-    active_bookings = Booking.query.filter(
-        Booking.session_id == session.id,
-        Booking.status.in_(["booked", "waiting_list"]),
-    ).all()
-    for booking in active_bookings:
-        booking.status = "cancelled"
-    db.session.commit()
-    for booking in active_bookings:
-        send_email(
-            booking.user.email,
-            "Cours annulé - Section Fitness",
-            f"Bonjour {booking.user.display_name()},\n\nLe cours {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} à {session.start_time.strftime('%H:%M')} est annulé par la Section Fitness.\n\nVotre réservation est donc annulée.\n\nSection Fitness",
-        )
-    return len(active_bookings)
-
-
 def absence_count(user):
     three_months_ago = date.today() - timedelta(days=90)
     return Booking.query.join(CourseSession).filter(
@@ -1958,6 +1929,36 @@ def planned_sessions_for_day(day):
         if tpl.week_parity in ("all", parity):
             sessions_to_create.append((tpl.course_name, tpl.start_time, tpl.end_time, tpl.capacity, tpl.coach_name, tpl.is_reservable, tpl.waitlist_capacity))
     return sessions_to_create
+
+
+def template_matches_session(template, session):
+    if template.weekday != session.course_date.weekday():
+        return False
+    iso_week = session.course_date.isocalendar().week
+    parity = "even" if iso_week % 2 == 0 else "odd"
+    if template.week_parity not in ("all", parity):
+        return False
+    return (
+        template.course_name == session.course_name
+        and template.start_time == session.start_time
+        and template.end_time == session.end_time
+        and (template.coach_name or "") == (session.coach_name or "")
+    )
+
+
+def is_single_session(session, templates=None):
+    templates = templates if templates is not None else CourseTemplate.query.all()
+    return not any(template_matches_session(template, session) for template in templates)
+
+
+def single_course_sessions():
+    templates = CourseTemplate.query.all()
+    sessions = CourseSession.query.filter(CourseSession.course_date >= date.today()).order_by(
+        CourseSession.course_date,
+        CourseSession.start_time,
+        CourseSession.coach_name,
+    ).all()
+    return [session for session in sessions if is_single_session(session, templates)]
 
 
 def create_session_if_missing(day, course_name, start, end, capacity, booking_open_date, coach_name=None, is_reservable=True, waitlist_capacity_value=5):
@@ -3752,16 +3753,6 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     1,
 )
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
-    """{{ s.course_name }}<br>{% if a %}""",
-    """{{ s.course_name }}<br>{% if not (a and absence_display_label(a) == 'cours annulé') %}<form method="post" action="{{ url_for('admin_cancel_session', session_id=s.id) }}" style="margin-top:8px"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn danger" type="submit" onclick="return confirm('Annuler ce cours ? Les réservations actives seront annulées.')">Annuler ce cours</button></form>{% endif %}{% if a %}""",
-    1,
-)
-TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
-    """{{ s.course_name }}<br>{% if not s.is_reservable %}""",
-    """{{ s.course_name }}<br>{% if not (a and absence_display_label(a) == 'cours annulé') %}<form method="post" action="{{ url_for('admin_cancel_session', session_id=s.id) }}" style="margin-top:8px"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn danger" type="submit" onclick="return confirm('Annuler ce cours ? Les réservations actives seront annulées.')">Annuler ce cours</button></form>{% endif %}{% if not s.is_reservable %}""",
-    1,
-)
-TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto">""",
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2><table class="table"><tr><th>Coach</th><th>Cours effectués</th><th>Remplacements</th><th>Absences</th><th>Cours annulés</th></tr>{% for row in invoice_rows %}<tr><td>{{ row.coach }}</td><td><strong>{{ row.cours }}</strong></td><td>{{ row.remplacements }}</td><td>{{ row.absences }}</td><td>{{ row.annules }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table></div><br><div style="overflow:auto">""",
     1,
@@ -3831,7 +3822,7 @@ TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace("""<tr><td colspan="9" class="muted">Aucun cours.</td></tr>""", """<tr><td colspan="10" class="muted">Aucun cours.</td></tr>""", 1)
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
     """<h3>Profs</h3><table class="table"><tr><th>Prof</th><th>Action</th></tr>{% for coach in coaches %}<tr><td>{{ coach }}</td><td><a class="btn danger" href="{{ url_for('delete_settings_coach', coach_name=coach) }}" onclick="return confirm('Supprimer ce prof des cours paramétrés et des futurs cours sans réservation ?')">Supprimer ce prof des cours</a></td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun prof.</td></tr>{% endfor %}</table>""",
-    """<h3>Ajouter un coach</h3><form method="post" action="{{ url_for('add_settings_coach') }}" class="card" style="box-shadow:none;background:#f9fafb"><div class="form-grid"><div class="field"><label>Nom coach</label><input name="full_name" placeholder="Ex. Coach Fitness" required></div><div class="field"><label>Email coach</label><input name="email" type="email" required></div><div class="field"><label>Rôle</label><select name="coach_type"><option value="titulaire">Titulaire</option><option value="remplacant">Remplaçant</option></select></div></div><br><button class="btn" type="submit">Ajouter et envoyer le lien d'activation</button></form><br><h3>Profs</h3><table class="table"><tr><th>Prof</th><th>Email</th><th>Rôle</th><th>Action</th></tr>{% for coach in coaches %}<tr><form method="post" action="{{ url_for('update_settings_coach', coach_name=coach.name) }}"><td><input name="coach_name" value="{{ coach.name }}" required></td><td><input name="coach_email" type="email" value="{{ coach.email or '' }}" placeholder="email de connexion"></td><td><select name="coach_type"><option value="titulaire" {% if coach.coach_type == 'titulaire' %}selected{% endif %}>Titulaire</option><option value="remplacant" {% if coach.coach_type == 'remplacant' %}selected{% endif %}>Remplaçant</option></select></td><td><button class="btn secondary" type="submit">Modifier</button> {% if coach.user_id %}<a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=coach.user_id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('admin_send_coach_activation', user_id=coach.user_id) }}">Renvoyer activation</a>{% endif %} <a class="btn danger" href="{{ url_for('delete_settings_coach', coach_name=coach.name) }}" onclick="return confirm('Supprimer ce prof des cours paramétrés et des futurs cours sans réservation ?')">Supprimer</a></td></form></tr>{% else %}<tr><td colspan="4" class="muted">Aucun prof.</td></tr>{% endfor %}</table>""",
+    """<h3>Sessions ponctuelles à venir</h3><p class="muted">Ces cours ont été créés pour une date précise et ne dépendent pas d'un créneau type récurrent.</p><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Coach</th><th>Jauge</th><th>Réservation</th><th>Action</th></tr>{% for s in single_sessions %}<tr><td>{{ weekday_labels[s.course_date.weekday()] }} {{ s.course_date.strftime('%d/%m/%Y') }}</td><td>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</td><td>{{ s.course_name }}</td><td>{{ s.coach_name or '-' }}</td><td>{{ s.capacity }}</td><td>{% if s.is_reservable %}<span class="badge">Oui</span>{% else %}<span class="badge wait">Sans réservation</span>{% endif %}</td><td><form method="post" action="{{ url_for('delete_single_session', session_id=s.id) }}"><button class="btn danger" type="submit" onclick="return confirm('Supprimer définitivement cette session ponctuelle ? Les réservations associées seront aussi supprimées.')">Supprimer définitivement</button></form></td></tr>{% else %}<tr><td colspan="7" class="muted">Aucune session ponctuelle à venir.</td></tr>{% endfor %}</table><br><h3>Ajouter un coach</h3><form method="post" action="{{ url_for('add_settings_coach') }}" class="card" style="box-shadow:none;background:#f9fafb"><div class="form-grid"><div class="field"><label>Nom coach</label><input name="full_name" placeholder="Ex. Coach Fitness" required></div><div class="field"><label>Email coach</label><input name="email" type="email" required></div><div class="field"><label>Rôle</label><select name="coach_type"><option value="titulaire">Titulaire</option><option value="remplacant">Remplaçant</option></select></div></div><br><button class="btn" type="submit">Ajouter et envoyer le lien d'activation</button></form><br><h3>Profs</h3><table class="table"><tr><th>Prof</th><th>Email</th><th>Rôle</th><th>Action</th></tr>{% for coach in coaches %}<tr><form method="post" action="{{ url_for('update_settings_coach', coach_name=coach.name) }}"><td><input name="coach_name" value="{{ coach.name }}" required></td><td><input name="coach_email" type="email" value="{{ coach.email or '' }}" placeholder="email de connexion"></td><td><select name="coach_type"><option value="titulaire" {% if coach.coach_type == 'titulaire' %}selected{% endif %}>Titulaire</option><option value="remplacant" {% if coach.coach_type == 'remplacant' %}selected{% endif %}>Remplaçant</option></select></td><td><button class="btn secondary" type="submit">Modifier</button> {% if coach.user_id %}<a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=coach.user_id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('admin_send_coach_activation', user_id=coach.user_id) }}">Renvoyer activation</a>{% endif %} <a class="btn danger" href="{{ url_for('delete_settings_coach', coach_name=coach.name) }}" onclick="return confirm('Supprimer ce prof des cours paramétrés et des futurs cours sans réservation ?')">Supprimer</a></td></form></tr>{% else %}<tr><td colspan="4" class="muted">Aucun prof.</td></tr>{% endfor %}</table>""",
     1,
 )
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
@@ -4279,27 +4270,6 @@ def update_coach_absence_followup(absence_id):
     return redirect(url_for("admin_coach_planning", view_mode=request.form.get("view_mode", "rolling"), start_date=request.form.get("start_date", ""), end_date=request.form.get("end_date", ""), year=request.form.get("year", absence.absence_date.year), month=request.form.get("month", absence.absence_date.month)))
 
 
-@app.route("/admin/session/<int:session_id>/cancel", methods=["POST"])
-@login_required
-def admin_cancel_session(session_id):
-    if not is_admin():
-        flash("Accès réservé à l’admin.")
-        return redirect(url_for("index"))
-    ensure_coach_absence_schema()
-    session = CourseSession.query.get_or_404(session_id)
-    absence = CoachAbsence.query.filter_by(
-        coach_name=session.coach_name or "-",
-        absence_date=session.course_date,
-        session_id=session.id,
-    ).first()
-    if absence and (absence.followup_status == "annule" or absence.status == "cancelled"):
-        flash("Ce cours est déjà annulé.")
-        return redirect(next_url("admin_coach_planning"))
-    cancelled_count = cancel_course_session(session, current_user)
-    flash(f"Cours annulé. {cancelled_count} réservation(s) active(s) annulée(s).")
-    return redirect(next_url("admin_coach_planning"))
-
-
 @app.route("/admin/coach-planning/export")
 @login_required
 def export_coach_absences():
@@ -4438,7 +4408,7 @@ def admin_settings():
         flash("Cours créé. Il apparaît dans le planning coach et sera généré automatiquement sur le planning glissant.")
         return redirect(url_for("admin_settings"))
     templates = CourseTemplate.query.order_by(CourseTemplate.weekday, CourseTemplate.start_time).all()
-    return render_template_string(TEMPLATE_SETTINGS, templates=templates, coaches=configured_coach_rows(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)
+    return render_template_string(TEMPLATE_SETTINGS, templates=templates, single_sessions=single_course_sessions(), coaches=configured_coach_rows(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)
 
 
 @app.route("/admin/settings/template/<int:template_id>/edit", methods=["POST"])
@@ -4525,6 +4495,26 @@ def delete_template(template_id):
     db.session.delete(tpl)
     db.session.commit()
     flash("Cours supprimé. Les séances futures sans réservation ont été retirées.")
+    return redirect(url_for("admin_settings"))
+
+
+@app.route("/admin/settings/session/<int:session_id>/delete", methods=["POST"])
+@login_required
+def delete_single_session(session_id):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    session = CourseSession.query.get_or_404(session_id)
+    if not is_single_session(session):
+        flash("Cette séance dépend d'un créneau type récurrent : modifiez ou supprimez le créneau type plutôt que cette session.")
+        return redirect(url_for("admin_settings"))
+    booking_count = Booking.query.filter_by(session_id=session.id).count()
+    absence_count_for_session = CoachAbsence.query.filter_by(session_id=session.id).count()
+    Booking.query.filter_by(session_id=session.id).delete(synchronize_session=False)
+    CoachAbsence.query.filter_by(session_id=session.id).delete(synchronize_session=False)
+    db.session.delete(session)
+    db.session.commit()
+    flash(f"Session ponctuelle supprimée définitivement. {booking_count} réservation(s) et {absence_count_for_session} suivi(s) associés supprimés.")
     return redirect(url_for("admin_settings"))
 
 

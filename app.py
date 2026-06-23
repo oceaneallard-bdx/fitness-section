@@ -303,6 +303,19 @@ def titular_coach_names():
     return sorted({name for name in configured_coach_names() if coach_type_for_name(name) == "titulaire" and name not in replacements})
 
 
+def all_coach_users():
+    return User.query.filter_by(role="coach").order_by(User.full_name, User.email).all()
+
+
+def coach_user_for_name(name):
+    if not name:
+        return None
+    for user in all_coach_users():
+        if name in {user.email, user.full_name, user.display_name()}:
+            return user
+    return None
+
+
 def valid_email(value):
     value = (value or "").strip().lower()
     return value if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value) else ""
@@ -826,6 +839,52 @@ def notify_members_of_coach_absence(coach_name, start_date, end_date, status, re
     return sent
 
 
+def notify_coach_absence_validated(absence):
+    user = coach_user_for_name(absence.coach_name)
+    if not user:
+        return False
+    body = (
+        f"Bonjour {user.display_name()},\n\n"
+        f"Votre demande d'absence/congé du {absence.absence_date.strftime('%d/%m/%Y')} "
+        f"({absence_session_label(absence)}) a été validée par le Bureau Fitness.\n"
+    )
+    if absence.replacement_name:
+        body += f"\nRemplaçant identifié : {absence.replacement_name}.\n"
+    body += "\nSection Fitness"
+    return send_email(user.email, "Demande d'absence validée", body)
+
+
+def notify_replacement_assigned(absence):
+    user = coach_user_for_name(absence.replacement_name)
+    if not user:
+        return False
+    body = (
+        f"Bonjour {user.display_name()},\n\n"
+        f"Vous êtes indiqué(e) comme remplaçant(e) pour {absence.coach_name} "
+        f"le {absence.absence_date.strftime('%d/%m/%Y')} ({absence_session_label(absence)}).\n\n"
+        "Ce cours apparaît désormais dans votre planning coach.\n\nSection Fitness"
+    )
+    return send_email(user.email, "Remplacement confirmé - Section Fitness", body)
+
+
+def notify_coaches_replacement_needed(absence):
+    subject = "Remplacement à trouver - Section Fitness"
+    body = (
+        "Bonjour,\n\n"
+        f"Un remplacement est recherché pour {absence.coach_name} "
+        f"le {absence.absence_date.strftime('%d/%m/%Y')} ({absence_session_label(absence)}).\n\n"
+        "Merci de répondre via vos canaux habituels (adresse professionnelle / groupe WhatsApp) si vous pouvez assurer ce créneau.\n\n"
+        "Section Fitness"
+    )
+    sent = 0
+    for user in all_coach_users():
+        if user.display_name() == absence.coach_name:
+            continue
+        if send_email(user.email, subject, body):
+            sent += 1
+    return sent
+
+
 def admin_email_signature_body(body):
     return body.rstrip() + "\n\nSportivement,\nBureau Fitness,"
 
@@ -1201,8 +1260,14 @@ def attendance_badge_class(booking):
 def absence_display_label(absence):
     if not absence:
         return ""
+    if absence.followup_status == "annule" or absence.status == "cancelled":
+        return "cours annulé"
+    if absence.followup_status == "remplacement_a_trouver":
+        return "remplacement à trouver"
     if absence.followup_status == "remplacement_trouve" or absence.status == "replaced":
         return "remplacé"
+    if absence.followup_status == "valide":
+        return "validé"
     labels = {"absent": "absent", "conge": "congé", "present": "présent"}
     return labels.get(absence.status, absence.status)
 
@@ -1210,8 +1275,12 @@ def absence_display_label(absence):
 def absence_badge_class(absence):
     if not absence:
         return ""
+    if absence.followup_status == "annule" or absence.status == "cancelled":
+        return "full"
     if absence.followup_status == "remplacement_trouve" or absence.status in ["present", "replaced"]:
         return ""
+    if absence.followup_status in ["remplacement_a_trouver", "en_cours", "valide"]:
+        return "wait"
     if absence.status in ["absent", "conge"]:
         return "full"
     return "wait"
@@ -1222,13 +1291,59 @@ def absence_blocks_booking(absence):
         return False
     if absence.followup_status == "remplacement_trouve" or absence.status in ["present", "replaced"]:
         return False
-    return absence.status in ["absent", "conge"]
+    return absence.status in ["absent", "conge", "cancelled"] or absence.followup_status in ["annule", "remplacement_a_trouver", "en_cours", "valide"]
 
 
 def absence_for_session(abs_by_key, session):
     if not session:
         return None
     return abs_by_key.get((session.coach_name, session.course_date, session.id)) or abs_by_key.get((session.coach_name, session.course_date, None))
+
+
+def replacement_is_confirmed(absence):
+    return bool(absence and absence.replacement_name and absence.followup_status in ["remplacement_trouve", "valide"])
+
+
+def effective_coach_for_session(session, abs_by_key):
+    absence = absence_for_session(abs_by_key, session)
+    if replacement_is_confirmed(absence):
+        return absence.replacement_name
+    return session.coach_name or "-"
+
+
+def coach_monthly_invoice_rows(start, end, coach_filter=None):
+    sessions = CourseSession.query.filter(CourseSession.course_date >= start, CourseSession.course_date <= end).order_by(CourseSession.course_date, CourseSession.start_time).all()
+    absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).all()
+    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
+    rows = {}
+    for session in sessions:
+        absence = absence_for_session(abs_by_key, session)
+        effective = effective_coach_for_session(session, abs_by_key)
+        if coach_filter and effective != coach_filter and session.coach_name != coach_filter:
+            continue
+        row = rows.setdefault(effective, {"coach": effective, "cours": 0, "remplacements": 0, "absences": 0, "annules": 0, "details": []})
+        detail_status = "effectué"
+        if absence:
+            label = absence_display_label(absence)
+            if replacement_is_confirmed(absence):
+                row["remplacements"] += 1
+                detail_status = f"remplacement de {absence.coach_name}"
+            elif absence.followup_status in ["annule"] or absence.status == "cancelled":
+                row["annules"] += 1
+                detail_status = "annulé"
+            elif absence.status in ["absent", "conge"]:
+                rows.setdefault(absence.coach_name, {"coach": absence.coach_name, "cours": 0, "remplacements": 0, "absences": 0, "annules": 0, "details": []})["absences"] += 1
+                detail_status = label
+        if detail_status not in ["annulé", "absent", "congé", "remplacement à trouver"]:
+            row["cours"] += 1
+        row["details"].append({
+            "date": session.course_date,
+            "horaire": f"{session.start_time.strftime('%H:%M')} - {session.end_time.strftime('%H:%M')}",
+            "cours": session.course_name,
+            "statut": detail_status,
+            "coach_initial": session.coach_name or "-",
+        })
+    return sorted(rows.values(), key=lambda item: item["coach"])
 
 
 def absence_session_label(absence):
@@ -1268,8 +1383,6 @@ def upsert_coach_absence(coach_name, day, status, replacement, notes, session=No
         existing.admin_notes = None
         existing.reviewed_at = None
         existing.reviewed_by = None
-    if replacement and existing.followup_status in ["a_traiter", "remplacement_a_trouver"]:
-        existing.followup_status = "remplacement_trouve"
     return existing
 
 
@@ -1285,6 +1398,8 @@ def template_helpers():
         "attendance_badge_class": attendance_badge_class,
         "attendance_label": attendance_label,
         "booked_count": booked_count,
+        "effective_coach_for_session": effective_coach_for_session,
+        "replacement_is_confirmed": replacement_is_confirmed,
         "user_can_book_session": user_can_book_session,
         "waitlist_rank": waitlist_rank,
         "split_name": split_name,
@@ -1422,6 +1537,59 @@ def section_admin_stats():
         "profiles": sorted(profiles.items(), key=lambda item: (-item[1], item[0])),
         "statuses": sorted(status_counts.items(), key=lambda item: (-item[1], item[0])),
     }
+
+
+def course_booking_stats(start, end, course_filter=""):
+    query = db.session.query(CourseSession).filter(
+        CourseSession.course_date >= start,
+        CourseSession.course_date <= end,
+    )
+    if course_filter:
+        query = query.filter(CourseSession.course_name == course_filter)
+    sessions = query.order_by(CourseSession.course_date, CourseSession.start_time).all()
+    rows = []
+    monthly = {}
+    for session in sessions:
+        bookings = Booking.query.join(User).filter(
+            Booking.session_id == session.id,
+            Booking.status.in_(["booked", "waiting_list", "absent_unexcused"]),
+        ).all()
+        booked = [b for b in bookings if b.status == "booked"]
+        waiting = [b for b in bookings if b.status == "waiting_list"]
+        absent = [b for b in bookings if b.status == "absent_unexcused" or b.attendance_status == "absent"]
+        mensuels = sum(1 for b in booked if b.user.status == "mensuel")
+        cadres_autres = len(booked) - mensuels
+        ratio_mensuel = (mensuels / len(booked) * 100) if booked else 0
+        fill_rate = (len(booked) / session.capacity * 100) if session.capacity else 0
+        rows.append({
+            "date": session.course_date,
+            "month": session.course_date.strftime("%Y-%m"),
+            "course": session.course_name,
+            "coach": session.coach_name or "-",
+            "time": f"{session.start_time.strftime('%H:%M')} - {session.end_time.strftime('%H:%M')}",
+            "capacity": session.capacity,
+            "booked": len(booked),
+            "waiting": len(waiting),
+            "absent": len(absent),
+            "mensuels": mensuels,
+            "cadres_autres": cadres_autres,
+            "ratio_mensuel": ratio_mensuel,
+            "fill_rate": fill_rate,
+        })
+        month = monthly.setdefault(session.course_date.strftime("%Y-%m"), {"month": session.course_date.strftime("%Y-%m"), "sessions": 0, "booked": 0, "mensuels": 0, "waiting": 0})
+        month["sessions"] += 1
+        month["booked"] += len(booked)
+        month["mensuels"] += mensuels
+        month["waiting"] += len(waiting)
+    monthly_rows = []
+    for item in sorted(monthly.values(), key=lambda row: row["month"]):
+        item["ratio_mensuel"] = (item["mensuels"] / item["booked"] * 100) if item["booked"] else 0
+        monthly_rows.append(item)
+    return rows, monthly_rows
+
+
+def course_name_options():
+    return [row[0] for row in db.session.query(CourseSession.course_name).distinct().order_by(CourseSession.course_name).all()]
 
 
 def apply_absence_sanction(user):
@@ -1637,13 +1805,23 @@ def admin_statistics():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
+    today = date.today()
+    default_start = date(today.year, today.month, 1)
+    default_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
+    stats_start = parse_iso_date(request.args.get("start_date", ""), default_start)
+    stats_end = parse_iso_date(request.args.get("end_date", ""), default_end)
+    if stats_end < stats_start:
+        stats_end = stats_start
+    course_filter = request.args.get("course_filter", "").strip()
+    course_rows, course_monthly_rows = course_booking_stats(stats_start, stats_end, course_filter)
     stats = {
         "today_sessions": CourseSession.query.filter_by(course_date=date.today()).count(),
         "bookings": Booking.query.filter(Booking.status.in_(["booked", "waiting_list"])).count(),
         "members": active_member_query().count(),
         "blocked": User.query.filter(User.blocked_until >= date.today()).count()
     }
-    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats())
+    filter_values = {"start_date": stats_start.isoformat(), "end_date": stats_end.isoformat(), "course_filter": course_filter}
+    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values)
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -1777,13 +1955,15 @@ def member_coach_planning():
         CoachAbsence.absence_date <= end,
     ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
     abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
-    coach_names = sorted({s.coach_name for s in sessions if s.coach_name and coach_type_for_name(s.coach_name) == "titulaire"} | set(titular_coach_names()))
+    effective_names = {effective_coach_for_session(s, abs_by_key) for s in sessions if effective_coach_for_session(s, abs_by_key) != "-"}
+    coach_names = sorted({name for name in effective_names if coach_type_for_name(name) == "titulaire"} | set(titular_coach_names()) | {name for name in effective_names if name in get_replacement_coaches()})
     planning_weekdays = set(get_coach_planning_weekdays())
     month_days = [start + timedelta(days=i) for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() in planning_weekdays]
     coach_agenda = {}
     for session in sessions:
-        if session.coach_name in coach_names:
-            coach_agenda.setdefault((session.coach_name or "-", session.course_date), []).append(session)
+        display_coach = effective_coach_for_session(session, abs_by_key)
+        if display_coach in coach_names:
+            coach_agenda.setdefault((display_coach, session.course_date), []).append(session)
     active_bookings = Booking.query.join(CourseSession).filter(
         Booking.user_id == current_user.id,
         Booking.status.in_(["booked", "waiting_list"]),
@@ -2137,7 +2317,6 @@ def admin_renew_member(user_id):
     annual_fee_applies = not MembershipPeriod.query.filter_by(
         user_id=user.id,
         subscription_year=subscription_year,
-        annual_fee_applies=True,
     ).first()
     create_membership_period(
         user,
@@ -2533,10 +2712,9 @@ def coach_schedule():
     start = date(year, month, 1)
     end = date(year, month, monthrange(year, month)[1])
     identities = coach_identity_names(current_user)
-    sessions = CourseSession.query.filter(
+    all_sessions = CourseSession.query.filter(
         CourseSession.course_date >= start,
         CourseSession.course_date <= end,
-        CourseSession.coach_name.in_(identities),
     ).order_by(CourseSession.course_date, CourseSession.start_time).all()
     absences = CoachAbsence.query.filter(
         CoachAbsence.absence_date >= start,
@@ -2548,7 +2726,13 @@ def coach_schedule():
         CoachAbsence.absence_date <= end,
         CoachAbsence.coach_name.in_(identities),
     ).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name).all()
-    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in own_absences}
+    abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in (own_absences + absences)}
+    all_absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).all()
+    all_abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in all_absences}
+    sessions = [
+        session for session in all_sessions
+        if session.coach_name in identities or effective_coach_for_session(session, all_abs_by_key) in identities
+    ]
     replacements = []
     for absence in absences:
         if absence.session_id:
@@ -2560,7 +2744,8 @@ def coach_schedule():
                     replacements.append({"absence": absence, "session": session})
             else:
                 replacements.append({"absence": absence, "session": None})
-    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
+    invoice_rows = coach_monthly_invoice_rows(start, end, coach_filter=current_user.display_name())
+    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/coach/profile/delete/<int:absence_id>")
@@ -2741,6 +2926,48 @@ def export_excel():
     return send_file(file, as_attachment=True, download_name="presences_fitness.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+@app.route("/admin/statistics/export")
+@login_required
+def export_statistics_excel():
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    today = date.today()
+    start = parse_iso_date(request.args.get("start_date", ""), date(today.year, today.month, 1))
+    end = parse_iso_date(request.args.get("end_date", ""), date(today.year, today.month, monthrange(today.year, today.month)[1]))
+    if end < start:
+        end = start
+    course_filter = request.args.get("course_filter", "").strip()
+    rows, monthly_rows = course_booking_stats(start, end, course_filter)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Stats cours"
+    ws.append(["Date", "Cours", "Coach", "Horaire", "Jauge", "Réservés", "Liste attente", "Absents", "Mensuels", "Cadres/autres", "Ratio mensuels %", "Remplissage %"])
+    for row in rows:
+        ws.append([
+            row["date"].strftime("%d/%m/%Y"),
+            row["course"],
+            row["coach"],
+            row["time"],
+            row["capacity"],
+            row["booked"],
+            row["waiting"],
+            row["absent"],
+            row["mensuels"],
+            row["cadres_autres"],
+            round(row["ratio_mensuel"], 1),
+            round(row["fill_rate"], 1),
+        ])
+    ws2 = wb.create_sheet("Stats mensuelles")
+    ws2.append(["Mois", "Séances", "Réservations", "Mensuels", "Liste attente", "Ratio mensuels %"])
+    for row in monthly_rows:
+        ws2.append([row["month"], row["sessions"], row["booked"], row["mensuels"], row["waiting"], round(row["ratio_mensuel"], 1)])
+    file = BytesIO()
+    wb.save(file)
+    file.seek(0)
+    return send_file(file, as_attachment=True, download_name=f"statistiques_cours_{start.isoformat()}_{end.isoformat()}.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 @app.route("/admin/email-diagnostic")
 @login_required
 def admin_email_diagnostic():
@@ -2827,7 +3054,6 @@ def shell(content, active=""):
             f'<a class="{"active" if active=="useful_info" else ""}" href="{url_for("useful_info")}">Infos utiles</a>'
             f'<a class="{"active" if active=="blocked" else ""}" href="{url_for("blocked_members")}">Adhérents bloqués</a>'
             f'<a class="{"active" if active=="archives" else ""}" href="{url_for("archived_members")}">Archives</a>'
-            f'<a href="{url_for("export_excel")}">Export des données</a>'
             f'<a class="{"active" if active=="member_profile" else ""}" href="{url_for("member_profile")}">Mon profil adhérent</a>'
             f'<a class="{"active" if active=="member_coach_planning" else ""}" href="{url_for("member_coach_planning")}">Réserver mes cours</a>'
         )
@@ -2894,6 +3120,11 @@ TEMPLATE_INDEX = """
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
     """<section class="card"><h2>Dernières actions adhérents</h2><table class="table">""",
     """<section class="card"><h2>Dernières actions adhérents</h2><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue adhérent démo</h2><p class="muted">Pour voir l'affichage exact d'un profil adhérent, déconnectez-vous puis connectez-vous avec <code>adherent@fitness.local</code> et le mot de passe <code>adherent123</code>.</p></div><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue coach démo</h2><p class="muted">Pour voir l'affichage exact d'un profil coach, déconnectez-vous puis connectez-vous avec <code>coach@fitness.local</code> et le mot de passe <code>coach123</code>.</p></div><table class="table">""",
+    1,
+)
+TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
+    """{% if current_user.role == 'adherent' %}<div class="flash">Période de reprise : les réservations du {{ temporary_booking_grace_start.strftime('%d/%m/%Y') }} au {{ temporary_booking_grace_end.strftime('%d/%m/%Y') }} restent ouvertes pendant la mise à jour des adhésions.</div>{% endif %}""",
+    """{% if current_user.role == 'adherent' %}<div class="flash">Période de reprise : les réservations du {{ temporary_booking_grace_start.strftime('%d/%m/%Y') }} au {{ temporary_booking_grace_end.strftime('%d/%m/%Y') }} restent ouvertes pendant la mise à jour des adhésions.</div><section class="card"><h2>Mes cours réservés</h2><p class="muted">Vos prochaines réservations, pour vous les remémorer ou annuler rapidement.</p><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th>Action</th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}<br><small class="muted">{{ b.session.coach_name or '-' }}</small></td><td>{% set a = absence_for_session(abs_by_key, b.session) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span><br>{% endif %}{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d'attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td><a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a></td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table></section><br>{% endif %}""",
     1,
 )
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
@@ -3039,6 +3270,10 @@ TEMPLATE_STATISTICS = """
 {% set content %}<div class="card"><h1>Statistiques</h1><p class="muted">Données utiles pour piloter la section Fitness.</p><div class="grid"><div class="card"><span class="muted">Séances aujourd'hui</span><div class="stat">{{ stats.today_sessions }}</div></div><div class="card"><span class="muted">Réservations</span><div class="stat">{{ stats.bookings }}</div></div><div class="card"><span class="muted">Adhérents</span><div class="stat">{{ stats.members }}</div></div><div class="card"><span class="muted">Bloqués</span><div class="stat">{{ stats.blocked }}</div></div></div><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Préférences adhérents</h2><div class="grid"><div><h3>Cours</h3><table class="table">{% for label, count in preference_stats.course %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Coachs</h3><table class="table">{% for label, count in preference_stats.coach %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Créneaux</h3><table class="table">{% for label, count in preference_stats.slot %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div></div></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Statistiques section</h2><div class="grid"><div><h3>Adhérents par année</h3><table class="table"><tr><th>Année</th><th>Adhérents</th><th>Évolution</th></tr>{% for row in section_stats.annual %}<tr><td>{{ row.year }}</td><td><strong>{{ row.count }}</strong></td><td>{% if row.evolution is none %}<span class="muted">-</span>{% else %}{{ '%+.1f'|format(row.evolution) }} %{% endif %}</td></tr>{% else %}<tr><td class="muted" colspan="3">Aucune donnée</td></tr>{% endfor %}</table></div><div><h3>Abonnements</h3><table class="table">{% for label, count in section_stats.subscriptions %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Profils</h3><table class="table">{% for label, count in section_stats.profiles %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Statuts</h3><table class="table">{% for label, count in section_stats.statuses %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div></div></div></div>{% endset %}{{ shell(content, 'statistics')|safe }}
 """
 
+TEMPLATE_STATISTICS = """
+{% set content %}<div class="card"><h1>Statistiques</h1><p class="muted">Données utiles pour piloter la section Fitness.</p><div class="grid"><div class="card"><span class="muted">Séances aujourd'hui</span><div class="stat">{{ stats.today_sessions }}</div></div><div class="card"><span class="muted">Réservations</span><div class="stat">{{ stats.bookings }}</div></div><div class="card"><span class="muted">Adhérents</span><div class="stat">{{ stats.members }}</div></div><div class="card"><span class="muted">Bloqués</span><div class="stat">{{ stats.blocked }}</div></div></div><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Statistiques réservations par cours</h2><form method="get"><div class="form-grid"><div class="field"><label>Début</label><input type="date" name="start_date" value="{{ filter_values.start_date }}"></div><div class="field"><label>Fin</label><input type="date" name="end_date" value="{{ filter_values.end_date }}"></div><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in course_options %}<option value="{{ name }}" {% if filter_values.course_filter == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn" href="{{ url_for('export_statistics_excel', start_date=filter_values.start_date, end_date=filter_values.end_date, course_filter=filter_values.course_filter) }}">Exporter Excel</a></form><br><h3>Résumé mensuel</h3><table class="table"><tr><th>Mois</th><th>Séances</th><th>Réservations</th><th>Mensuels</th><th>Liste attente</th><th>Ratio mensuels</th></tr>{% for row in course_monthly_rows %}<tr><td>{{ row.month }}</td><td>{{ row.sessions }}</td><td>{{ row.booked }}</td><td>{{ row.mensuels }}</td><td>{{ row.waiting }}</td><td>{{ '%.1f'|format(row.ratio_mensuel) }} %</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table><br><h3>Détail par cours</h3><table class="table"><tr><th>Date</th><th>Cours</th><th>Coach</th><th>Horaire</th><th>Jauge</th><th>Réservés</th><th>Attente</th><th>Absents</th><th>Mensuels</th><th>Cadres/autres</th><th>Ratio mensuels</th><th>Remplissage</th></tr>{% for row in course_rows %}<tr><td>{{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.course }}</td><td>{{ row.coach }}</td><td>{{ row.time }}</td><td>{{ row.capacity }}</td><td><strong>{{ row.booked }}</strong></td><td>{{ row.waiting }}</td><td>{{ row.absent }}</td><td>{{ row.mensuels }}</td><td>{{ row.cadres_autres }}</td><td>{{ '%.1f'|format(row.ratio_mensuel) }} %</td><td>{{ '%.1f'|format(row.fill_rate) }} %</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun cours sur cette période.</td></tr>{% endfor %}</table></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Préférences adhérents</h2><div class="grid"><div><h3>Cours</h3><table class="table">{% for label, count in preference_stats.course %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Coachs</h3><table class="table">{% for label, count in preference_stats.coach %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Créneaux</h3><table class="table">{% for label, count in preference_stats.slot %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div></div></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Statistiques section</h2><div class="grid"><div><h3>Adhérents par année</h3><table class="table"><tr><th>Année</th><th>Adhérents</th><th>Évolution</th></tr>{% for row in section_stats.annual %}<tr><td>{{ row.year }}</td><td><strong>{{ row.count }}</strong></td><td>{% if row.evolution is none %}<span class="muted">-</span>{% else %}{{ '%+.1f'|format(row.evolution) }} %{% endif %}</td></tr>{% else %}<tr><td class="muted" colspan="3">Aucune donnée</td></tr>{% endfor %}</table></div><div><h3>Abonnements</h3><table class="table">{% for label, count in section_stats.subscriptions %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Profils</h3><table class="table">{% for label, count in section_stats.profiles %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Statuts</h3><table class="table">{% for label, count in section_stats.statuses %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div></div></div></div>{% endset %}{{ shell(content, 'statistics')|safe }}
+"""
+
 TEMPLATE_ARCHIVES = """
 {% set content %}<div class="card"><h1>Archives des réservations</h1><p class="muted">Les réservations passées sont archivées automatiquement. Cette page permet de vérifier ultérieurement qui était inscrit à un cours.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Nom</th><th>Email</th><th>Statut réservation</th><th>Date inscription</th></tr>{% for b in bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</td><td>{{ b.session.course_name }}</td><td>{{ b.user.display_name() }}</td><td>{{ b.user.email }}</td><td><span class="badge {% if b.status == 'absent_unexcused' %}full{% elif b.status == 'waiting_list' %}wait{% endif %}">{{ b.status }}</span></td><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucune réservation archivée pour l'instant.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'archives')|safe }}
 """
@@ -3167,8 +3402,18 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     1,
 )
 TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """<option value="refuse" {% if a.followup_status == 'refuse' %}selected{% endif %}>Refusé</option>""",
+    """<option value="refuse" {% if a.followup_status == 'refuse' %}selected{% endif %}>Refusé</option><option value="annule" {% if a.followup_status == 'annule' %}selected{% endif %}>Cours annulé</option>""",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """<input type="hidden" name="year" value="{{ year }}"><input type="hidden" name="month" value="{{ month }}"><div class="field"><select name="followup_status">""",
     """<input type="hidden" name="year" value="{{ year }}"><input type="hidden" name="month" value="{{ month }}"><input type="hidden" name="view_mode" value="{{ view_mode }}"><input type="hidden" name="start_date" value="{{ start.isoformat() }}"><input type="hidden" name="end_date" value="{{ end.isoformat() }}"><div class="field"><label>Créneau</label><select name="session_id"><option value="">Toute la journée</option>{% for s in absence_session_options(a) %}<option value="{{ s.id }}" {% if a.session_id == s.id %}selected{% endif %}>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }} · {{ s.course_name }}</option>{% endfor %}</select></div><div class="field" style="margin-top:8px"><label>Suivi</label><select name="followup_status">""",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div style="overflow:auto">""",
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2><table class="table"><tr><th>Coach</th><th>Cours effectués</th><th>Remplacements</th><th>Absences</th><th>Cours annulés</th></tr>{% for row in invoice_rows %}<tr><td>{{ row.coach }}</td><td><strong>{{ row.cours }}</strong></td><td>{{ row.remplacements }}</td><td>{{ row.absences }}</td><td>{{ row.annules }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table></div><br><div style="overflow:auto">""",
     1,
 )
 TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(_ABSENCE_BADGE_SNIPPET, _ABSENCE_BADGE_RENDER)
@@ -3184,6 +3429,11 @@ TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
 )
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace('<tr><td colspan="4" class="muted">Aucun cours rattaché sur ce mois.</td></tr>', '<tr><td colspan="5" class="muted">Aucun cours rattaché sur ce mois.</td></tr>')
 TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("<td>{{ item.absence.followup_status or '-' }}</td>", """<td><span class="badge {{ absence_badge_class(item.absence) }}">{{ absence_display_label(item.absence) }}</span></td>""")
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
+    """<div class="grid"><div class="card"><span class="muted">Cours rattachés</span><div class="stat">{{ sessions|length }}</div></div><div class="card"><span class="muted">Remplacements</span><div class="stat">{{ replacements|length }}</div></div></div><h2>Cours prévus</h2>""",
+    """<div class="grid"><div class="card"><span class="muted">Cours rattachés</span><div class="stat">{{ sessions|length }}</div></div><div class="card"><span class="muted">Remplacements</span><div class="stat">{{ replacements|length }}</div></div></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2><table class="table"><tr><th>Coach</th><th>Cours effectués</th><th>Remplacements</th><th>Absences</th><th>Cours annulés</th></tr>{% for row in invoice_rows %}<tr><td>{{ row.coach }}</td><td><strong>{{ row.cours }}</strong></td><td>{{ row.remplacements }}</td><td>{{ row.absences }}</td><td>{{ row.annules }}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune donnée sur ce mois.</td></tr>{% endfor %}</table></div><br><h2>Cours prévus</h2>""",
+    1,
+)
 
 TEMPLATE_SETTINGS = """
 {% set content %}<div class="card"><h1>Paramètres</h1>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><input type="hidden" name="settings_section" value="pricing"><h3>Tarifs des abonnements par statut</h3><p class="muted">Renseigner le montant attendu pour chaque combinaison abonnement / statut. Ces montants alimentent automatiquement l'onglet Budget.</p><div class="field" style="max-width:360px"><label>Cotisation annuelle première inscription (€)</label><input name="annual_membership_fee" value="{{ '%.2f'|format(annual_membership_fee) }}"></div><br><table class="table"><tr><th>Abonnement</th>{% for profile_key, profile_label in member_profile_labels.items() %}<th>{{ profile_label }}</th>{% endfor %}</tr>{% for name in subscription_prices %}<tr><td><strong>{{ name }}</strong></td>{% for profile_key, profile_label in member_profile_labels.items() %}<td><input name="{{ subscription_profile_price_key(name, profile_key) }}" value="{{ '%.2f'|format(subscription_price_matrix[name][profile_key]) }}" style="width:110px;padding:10px;border:1px solid #d1d5db;border-radius:10px"> €</td>{% endfor %}</tr>{% endfor %}</table><br><button class="btn" type="submit">Enregistrer les tarifs</button></form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3><div class="form-grid"><div class="field"><label>Nom du coach</label><input name="coach_name" required></div><div class="field"><label>Intitulé cours</label><input name="course_name" required></div><div class="field"><label>Jour</label><select name="weekday">{% for label in weekday_labels %}<option value="{{ loop.index0 }}">{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Semaine odd/even</label><select name="week_parity"><option value="all">Toutes</option><option value="even">Even / paire</option><option value="odd">Odd / impaire</option></select></div><div class="field"><label>Début</label><input name="start_time" type="time" required></div><div class="field"><label>Fin</label><input name="end_time" type="time" required></div><div class="field"><label>Jauge</label><input name="capacity" type="number" value="35" min="1" required></div><div class="field"><label>Réservation</label><label style="font-weight:600"><input name="is_reservable" type="checkbox" checked style="width:auto"> Créneau à réserver</label></div></div><br><button class="btn" type="submit">Créer le cours</button></form><br><table class="table"><tr><th>Jour</th><th>Semaine</th><th>Cours</th><th>Horaire</th><th>Jauge</th><th>Coach</th><th>Réservation</th><th>Statut</th><th>Actions</th></tr>{% for t in templates %}<tr><form method="post" action="{{ url_for('edit_template', template_id=t.id) }}"><td><select name="weekday">{% for label in weekday_labels %}<option value="{{ loop.index0 }}" {% if t.weekday == loop.index0 %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td><td><select name="week_parity"><option value="all" {% if t.week_parity == 'all' %}selected{% endif %}>Toutes</option><option value="even" {% if t.week_parity == 'even' %}selected{% endif %}>Even</option><option value="odd" {% if t.week_parity == 'odd' %}selected{% endif %}>Odd</option></select></td><td><input name="course_name" value="{{ t.course_name }}" required></td><td><input name="start_time" type="time" value="{{ t.start_time.strftime('%H:%M') }}" required><br><input name="end_time" type="time" value="{{ t.end_time.strftime('%H:%M') }}" required></td><td><input name="capacity" type="number" min="1" value="{{ t.capacity }}" required style="width:80px"></td><td><input name="coach_name" value="{{ t.coach_name or '' }}" required></td><td><label style="font-weight:600"><input name="is_reservable" type="checkbox" {% if t.is_reservable %}checked{% endif %} style="width:auto"> Oui</label></td><td>{% if t.active %}<span class="badge">Actif</span>{% else %}<span class="badge full">Inactif</span>{% endif %}</td><td><button class="btn secondary" type="submit">Modifier</button> <a class="btn secondary" href="{{ url_for('toggle_template', template_id=t.id) }}">Activer / désactiver</a> <a class="btn danger" href="{{ url_for('delete_template', template_id=t.id) }}" onclick="return confirm('Supprimer ce cours ? Les séances futures sans réservation seront supprimées.')">Supprimer</a></td></form></tr>{% else %}<tr><td colspan="9" class="muted">Aucun cours.</td></tr>{% endfor %}</table><br><h3>Profs</h3><table class="table"><tr><th>Prof</th><th>Action</th></tr>{% for coach in coaches %}<tr><td>{{ coach }}</td><td><a class="btn danger" href="{{ url_for('delete_settings_coach', coach_name=coach) }}" onclick="return confirm('Supprimer ce prof des cours paramétrés et des futurs cours sans réservation ?')">Supprimer ce prof des cours</a></td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun prof.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'settings')|safe }}
@@ -3557,14 +3807,16 @@ def admin_coach_planning():
     absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).order_by(CoachAbsence.absence_date, CoachAbsence.coach_name, CoachAbsence.session_id).all()
     abs_by_key = {(a.coach_name, a.absence_date, a.session_id): a for a in absences}
     coaches = titular_coach_names()
-    coach_names = sorted({s.coach_name for s in sessions if s.coach_name and coach_type_for_name(s.coach_name) == "titulaire"} | set(coaches))
+    effective_names = {effective_coach_for_session(s, abs_by_key) for s in sessions if effective_coach_for_session(s, abs_by_key) != "-"}
+    coach_names = sorted(set(coaches) | {name for name in effective_names if coach_type_for_name(name) == "titulaire"} | {name for name in effective_names if name in get_replacement_coaches()})
     planning_weekdays = set(get_coach_planning_weekdays())
     month_days = [start + timedelta(days=i) for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() in planning_weekdays]
     coach_agenda = {}
     for session in sessions:
-        coach_agenda.setdefault((session.coach_name or "-", session.course_date), []).append(session)
+        coach_agenda.setdefault((effective_coach_for_session(session, abs_by_key), session.course_date), []).append(session)
     range_label = f"{start.strftime('%d/%m/%Y')} - {end.strftime('%d/%m/%Y')}"
-    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
+    invoice_rows = coach_monthly_invoice_rows(start, end)
+    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/admin/coach-absence/<int:absence_id>/followup", methods=["POST"])
@@ -3575,7 +3827,7 @@ def update_coach_absence_followup(absence_id):
         return redirect(url_for("index"))
     ensure_coach_absence_schema()
     absence = CoachAbsence.query.get_or_404(absence_id)
-    allowed = {"a_traiter", "en_cours", "remplacement_a_trouver", "remplacement_trouve", "valide", "refuse"}
+    allowed = {"a_traiter", "en_cours", "remplacement_a_trouver", "remplacement_trouve", "valide", "refuse", "annule"}
     status = request.form.get("followup_status", "a_traiter")
     absence.followup_status = status if status in allowed else "a_traiter"
     if "session_id" in request.form:
@@ -3605,13 +3857,39 @@ def update_coach_absence_followup(absence_id):
     replacement_name = request.form.get("replacement_name")
     if replacement_name is not None:
         absence.replacement_name = replacement_name.strip()
-        if absence.replacement_name and absence.followup_status in ["a_traiter", "remplacement_a_trouver"]:
+        if absence.replacement_name and absence.followup_status in ["a_traiter", "remplacement_a_trouver", "valide"]:
             absence.followup_status = "remplacement_trouve"
+    notify_replacement = False
+    notify_absent = False
+    notify_search = False
+    if absence.followup_status == "valide":
+        notify_absent = True
+        if absence.replacement_name:
+            absence.followup_status = "remplacement_trouve"
+            notify_replacement = True
+        else:
+            absence.followup_status = "remplacement_a_trouver"
+            notify_search = True
+    elif absence.followup_status == "remplacement_trouve" and absence.replacement_name:
+        notify_absent = True
+        notify_replacement = True
+    elif absence.followup_status == "remplacement_a_trouver":
+        notify_absent = True
+        notify_search = True
     absence.admin_notes = request.form.get("admin_notes", "").strip()
     absence.reviewed_at = datetime.utcnow()
     absence.reviewed_by = current_user.display_name()
     db.session.commit()
-    flash("Suivi de la demande mis à jour.")
+    sent_parts = []
+    if notify_absent and notify_coach_absence_validated(absence):
+        sent_parts.append("coach absent notifié")
+    if notify_replacement and notify_replacement_assigned(absence):
+        sent_parts.append("coach remplaçant notifié")
+    if notify_search:
+        sent = notify_coaches_replacement_needed(absence)
+        if sent:
+            sent_parts.append(f"{sent} coach(s) contacté(s) pour remplacement")
+    flash("Suivi de la demande mis à jour." + (f" Emails : {', '.join(sent_parts)}." if sent_parts else ""))
     return redirect(url_for("admin_coach_planning", view_mode=request.form.get("view_mode", "rolling"), start_date=request.form.get("start_date", ""), end_date=request.form.get("end_date", ""), year=request.form.get("year", absence.absence_date.year), month=request.form.get("month", absence.absence_date.month)))
 
 
@@ -3658,6 +3936,10 @@ def export_coach_absences():
             absence_display_label(absence) if absence else "",
             absence.replacement_name if absence and absence.replacement_name else "",
         ])
+    ws3 = wb.create_sheet("Récap facturation")
+    ws3.append(["Coach", "Cours effectués", "Remplacements", "Absences", "Cours annulés"])
+    for row in coach_monthly_invoice_rows(start, end):
+        ws3.append([row["coach"], row["cours"], row["remplacements"], row["absences"], row["annules"]])
     file = BytesIO()
     wb.save(file)
     file.seek(0)
@@ -3974,6 +4256,7 @@ def admin_budget():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
+    ensure_schema()
     if request.method == "POST":
         entry_date = datetime.strptime(request.form["entry_date"], "%Y-%m-%d").date()
         entry = BudgetEntry(entry_date=entry_date, entry_type=request.form["entry_type"], category=request.form["category"], label=request.form["label"].strip(), amount=float(request.form["amount"].replace(",", ".")), notes=request.form.get("notes", "").strip())
@@ -3981,12 +4264,21 @@ def admin_budget():
         db.session.commit()
         flash("Ligne budget ajoutée.")
         return redirect(url_for("admin_budget"))
-    entries = BudgetEntry.query.order_by(BudgetEntry.entry_date.desc(), BudgetEntry.id.desc()).all()
-    income = sum(e.amount for e in entries if e.entry_type == "income")
-    expenses = sum(e.amount for e in entries if e.entry_type == "expense")
     dues_year = int(request.args.get("dues_year", date.today().year))
-    dues_rows = expected_dues_rows(dues_year)
-    expected_dues = sum(row["total"] for row in dues_rows)
+    try:
+        entries = BudgetEntry.query.order_by(BudgetEntry.entry_date.desc(), BudgetEntry.id.desc()).all()
+        dues_rows = expected_dues_rows(dues_year)
+    except Exception as exc:
+        db.session.rollback()
+        print("\n--- ERREUR BUDGET ---")
+        print(exc)
+        print("---------------------\n")
+        entries = []
+        dues_rows = []
+        flash("Le budget a rencontré une ancienne donnée incompatible. La page reste accessible ; vérifiez les logs Render pour le détail.")
+    income = sum((e.amount or 0) for e in entries if e.entry_type == "income")
+    expenses = sum((e.amount or 0) for e in entries if e.entry_type == "expense")
+    expected_dues = sum((row.get("total") or 0) for row in dues_rows)
     total_income = income + expected_dues
     return render_template_string(TEMPLATE_BUDGET, entries=entries, income=total_income, expenses=expenses, balance=total_income-expenses, expected_dues=expected_dues, dues_rows=dues_rows, dues_year=dues_year, annual_membership_fee=get_annual_membership_fee(), today=date.today())
 

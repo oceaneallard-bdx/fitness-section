@@ -367,7 +367,6 @@ def parse_amount(value, default=0.0):
 
 
 def setting_value(key, default=""):
-    db.create_all()
     setting = AppSetting.query.filter_by(key=key).first()
     return setting.value if setting and setting.value is not None else str(default)
 
@@ -2369,7 +2368,7 @@ def admin_edit_member(user_id):
         db.session.commit()
         flash("Informations adhérent mises à jour.")
         return redirect(url_for("admin_members"))
-    membership_periods = MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year.desc(), MembershipPeriod.start_date.desc()).all()
+    membership_periods = membership_period_rows(MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year.desc(), MembershipPeriod.start_date.desc()).all())
     return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys())
 
 
@@ -3317,7 +3316,7 @@ TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
 )
 TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
     """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}""",
-    """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Renouveler l'adhésion</h2><p class="muted">Ajoute une nouvelle période d'adhésion dans l'historique. Les tarifs sont figés à la date du renouvellement.</p><form method="post" action="{{ url_for('admin_renew_member', user_id=user.id) }}"><div class="form-grid"><div class="field"><label>Nouvel abonnement</label><select name="subscription_type" required>{% for opt in subscription_options %}<option>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" min="2024" max="2100" value="{{ current_year }}" required></div></div><br><button class="btn" type="submit">Renouveler</button></form><br><h3>Historique adhésions</h3><table class="table"><tr><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for p in membership_periods %}<tr><td>{{ p.subscription_type }} {{ p.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(p.subscription_price_snapshot or 0) }} €</td><td>{% if p.annual_fee_applies %}{{ '%.2f'|format(p.annual_fee_snapshot or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(p.total_snapshot or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun historique d'adhésion.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
+    """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Renouveler l'adhésion</h2><p class="muted">Ajoute une nouvelle période d'adhésion dans l'historique. Les tarifs sont figés à la date du renouvellement.</p><form method="post" action="{{ url_for('admin_renew_member', user_id=user.id) }}"><div class="form-grid"><div class="field"><label>Nouvel abonnement</label><select name="subscription_type" required>{% for opt in subscription_options %}<option>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" min="2024" max="2100" value="{{ current_year }}" required></div></div><br><button class="btn" type="submit">Renouveler</button></form><br><h3>Historique adhésions</h3><table class="table"><tr><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for row in membership_periods %}{% set p = row.period %}<tr><td>{{ row.subscription_type }} {{ row.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(row.subscription_price or 0) }} €</td><td>{% if row.annual_fee %}{{ '%.2f'|format(row.annual_fee or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(row.total or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun historique d'adhésion.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
     1,
 )
 
@@ -4813,6 +4812,8 @@ def ensure_schema():
 
 def create_default_admin():
     admin_email = os.getenv("ADMIN_EMAIL", "admin@fitness.local").strip().lower()
+    if admin_email == "oceane.allard@gmail.com":
+        admin_email = "admin@fitness.local"
     admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
     admin_name = os.getenv("ADMIN_NAME", "Admin Fitness")
     admin = User.query.filter_by(email=admin_email).first()

@@ -15,7 +15,7 @@ import traceback
 import urllib.error
 import urllib.request
 import certifi
-from email.utils import parseaddr
+from email.utils import formataddr, parseaddr
 from email.message import EmailMessage
 
 from flask import Flask, render_template_string, redirect, url_for, request, flash, send_file
@@ -53,7 +53,7 @@ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 # export SMTP_PORT="465"
 # export SMTP_USER="tonadresse@smtp-brevo.com"
 # export SMTP_PASSWORD="SMTP key"
-# export MAIL_FROM="Section Fitness <tonadresse@gmail.com>"
+# export MAIL_FROM="NoReply Section Fitness <noreply@votre-domaine.fr>"
 SMTP_HOST = os.getenv("SMTP_HOST")
 try:
     SMTP_PORT = int(str(os.getenv("SMTP_PORT", "465")).strip().strip('"').strip("'"))
@@ -67,6 +67,11 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "section-fitness@local")
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+CAMPAIGN_EXCLUDED_EMAILS = {
+    email.strip().lower()
+    for email in os.getenv("CAMPAIGN_EXCLUDED_EMAILS", "oceane.allard@gmail.com").split(",")
+    if email.strip()
+}
 LAST_DAILY_TASK_FILE = BASE_DIR / ".last_daily_fitness_tasks"
 SCHEMA_READY = False
 
@@ -486,6 +491,44 @@ def membership_tariff_snapshot(user, subscription_type, annual_fee_applies=False
     return subscription_price, annual_fee, subscription_price + annual_fee
 
 
+def annual_fee_should_apply_for_period(period):
+    first_period = MembershipPeriod.query.filter_by(
+        user_id=period.user_id,
+        subscription_year=period.subscription_year,
+    ).order_by(MembershipPeriod.start_date, MembershipPeriod.id).first()
+    note_text = (period.notes or "").lower()
+    is_renewal = "renouvellement" in note_text and "période précédente" not in note_text
+    return bool(period.annual_fee_applies and first_period and first_period.id == period.id and not is_renewal)
+
+
+def reapply_current_tariffs_to_memberships(subscription_year, subscription_type="", member_profile=""):
+    query = MembershipPeriod.query.join(User).filter(
+        User.role.in_(["adherent", "admin"]),
+        User.account_status != "archived",
+        MembershipPeriod.subscription_year == int(subscription_year),
+    )
+    if subscription_type:
+        query = query.filter(MembershipPeriod.subscription_type == normalize_subscription_type(subscription_type))
+    if member_profile:
+        if member_profile == "ouvrant_droit":
+            query = query.filter(db.or_(User.member_profile == member_profile, User.member_profile.is_(None), User.member_profile == ""))
+        else:
+            query = query.filter(User.member_profile == member_profile)
+
+    updated = 0
+    for period in query.order_by(MembershipPeriod.start_date, MembershipPeriod.id).all():
+        annual_fee_applies = annual_fee_should_apply_for_period(period)
+        subscription_price, annual_fee, total = membership_tariff_snapshot(period.user, period.subscription_type, annual_fee_applies)
+        period.subscription_price_snapshot = subscription_price
+        period.annual_fee_snapshot = annual_fee
+        period.total_snapshot = total
+        period.tariff_snapshot_at = datetime.utcnow()
+        updated += 1
+    if updated:
+        db.session.commit()
+    return updated
+
+
 def get_replacement_coaches():
     default_names = {"Mathieu", "Mélanie"}
     raw = setting_value("replacement_coaches", "")
@@ -566,9 +609,7 @@ def period_budget_line(period, seen_user_years=None):
     ).order_by(MembershipPeriod.start_date, MembershipPeriod.id).first()
     is_first_period_for_year = first_period.id == period.id if first_period else user_year_key not in seen_user_years
     seen_user_years.add(user_year_key)
-    note_text = (period.notes or "").lower()
-    is_renewal = "renouvellement" in note_text and "période précédente" not in note_text
-    annual_fee_should_apply = bool(period.annual_fee_applies and is_first_period_for_year and not is_renewal)
+    annual_fee_should_apply = annual_fee_should_apply_for_period(period) if first_period else bool(period.annual_fee_applies and is_first_period_for_year)
     subscription_price = period.subscription_price_snapshot
     if subscription_price is None:
         subscription_price, fallback_fee, _ = membership_tariff_snapshot(user, subscription_type, annual_fee_should_apply)
@@ -970,20 +1011,31 @@ def find_member_for_last_minute(query):
     return (matches[0] if len(matches) == 1 else None), matches
 
 
-def send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images):
+def send_member_campaign_async(user_ids, subject, signed_body, signed_html):
     def worker():
         with app.app_context():
             sent_count = 0
             failed_count = 0
+            excluded_emails = campaign_excluded_emails()
             users = User.query.filter(User.id.in_(user_ids), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
             for user in users:
-                if send_email(user.email, subject, signed_body, html_body=signed_html, inline_images=inline_images):
+                if (user.email or "").strip().lower() in excluded_emails:
+                    continue
+                if send_email(user.email, subject, signed_body, html_body=signed_html):
                     sent_count += 1
                 else:
                     failed_count += 1
             print(f"\n--- CAMPAGNE EMAIL TERMINÉE ---\nEnvoyés: {sent_count}\nÉchecs: {failed_count}\n-------------------------------\n")
 
     Thread(target=worker, daemon=True).start()
+
+
+def campaign_excluded_emails():
+    excluded_emails = set(CAMPAIGN_EXCLUDED_EMAILS)
+    sender_email = mail_sender_email()
+    if sender_email:
+        excluded_emails.add(sender_email.lower())
+    return excluded_emails
 
 
 def notify_admins_of_coach_absence(coach_name, start_date, end_date, status, replacement_name="", notes=""):
@@ -1091,20 +1143,21 @@ def notify_coaches_replacement_needed(absence):
 
 
 def admin_email_signature_body(body):
-    return body.rstrip() + "\n\nSportivement,\nBureau Fitness,"
+    return body.rstrip() + "\n\nSportivement,\nBureau Fitness\n\nNB : merci de ne pas répondre à cette adresse générique. Si besoin, contactez les membres du Bureau Fitness sur leurs adresses professionnelles habituelles."
 
 
-def admin_email_signature_html(body):
+def admin_email_signature_html(body, logo_url=""):
     escaped_body = escape(body).replace("\n", "<br>")
-    logo_html = '<br><br><img src="cid:fitness_logo" alt="Bureau Fitness" style="width:120px;height:auto;">' if LOGO_PATH.exists() else ""
-    return f"""<!doctype html><html><body style="font-family:Arial,sans-serif;font-size:15px;line-height:1.45;color:#111827">{escaped_body}<br><br>Sportivement,<br>Bureau Fitness,{logo_html}</body></html>"""
+    logo_html = f'<br><br><img src="{escape(logo_url)}" alt="Logo Section Fitness" width="120" style="width:120px;height:auto;display:block;border:0;outline:none;text-decoration:none;">' if logo_url else ""
+    return f"""<!doctype html><html><body style="font-family:Arial,sans-serif;font-size:15px;line-height:1.45;color:#111827">{escaped_body}<br><br>Sportivement,<br>Bureau Fitness{logo_html}<br><br><small style="color:#6b7280">NB : merci de ne pas répondre à cette adresse générique. Si besoin, contactez les membres du Bureau Fitness sur leurs adresses professionnelles habituelles.</small></body></html>"""
 
 
 def mail_sender_payload():
     name, email = parseaddr(MAIL_FROM)
     if not email:
         email = MAIL_FROM
-        name = "Section Fitness"
+    if not name or "noreply" not in name.lower():
+        name = "NoReply Section Fitness"
     payload = {"email": email}
     if name:
         payload["name"] = name
@@ -1113,6 +1166,11 @@ def mail_sender_payload():
 
 def mail_sender_email():
     return mail_sender_payload()["email"]
+
+
+def mail_from_header():
+    sender = mail_sender_payload()
+    return formataddr((sender.get("name") or "NoReply Section Fitness", sender["email"]))
 
 
 def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
@@ -1174,7 +1232,7 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
             return False
 
         msg = EmailMessage()
-        msg["From"] = MAIL_FROM
+        msg["From"] = mail_from_header()
         msg["Bcc"] = to
         msg["Subject"] = subject
         msg.set_content(body)
@@ -3387,6 +3445,8 @@ def admin_email_members():
         users = User.query.filter(User.account_status != "archived", db.or_(*user_filters)).order_by(User.role, User.full_name, User.email).all() if user_filters else []
     else:
         users = User.query.filter(User.role.in_(target_roles), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
+    excluded_emails = campaign_excluded_emails()
+    users = [u for u in users if (u.email or "").strip().lower() not in excluded_emails]
     if request.method == "POST":
         subject = request.form["subject"].strip()
         body = request.form["body"].strip()
@@ -3394,10 +3454,10 @@ def admin_email_members():
             flash("Merci de renseigner un objet et un message.")
             return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles)
         signed_body = admin_email_signature_body(body)
-        signed_html = admin_email_signature_html(body)
-        inline_images = {"fitness_logo": LOGO_PATH} if LOGO_PATH.exists() else {}
+        logo_url = url_for("static", filename="logo.png", _external=True) if LOGO_PATH.exists() else ""
+        signed_html = admin_email_signature_html(body, logo_url=logo_url)
         user_ids = [u.id for u in users]
-        send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images)
+        send_member_campaign_async(user_ids, subject, signed_body, signed_html)
         flash(f"Campagne email lancée pour {len(user_ids)} destinataire(s). L'envoi continue en arrière-plan pour éviter une erreur serveur.")
         return redirect(url_for("admin_members"))
     return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles)
@@ -4110,6 +4170,11 @@ TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
     """<td><input name="capacity" type="number" min="1" value="{{ t.capacity }}" required style="width:80px"></td><td><input name="waitlist_capacity" type="number" min="0" value="{{ t.waitlist_capacity }}" required style="width:80px"></td><td><select name="coach_name" required>{% for c in coach_options %}<option value="{{ c }}" {% if t.coach_name == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></td>""",
     1,
 )
+TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
+    """</form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><input type="hidden" name="settings_section" value="coach_planning_display">""",
+    """</form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb" onsubmit="return confirm('Recalculer les anciennes lignes avec les tarifs actuels ? Cette action modifie les montants visibles dans le budget pour les adhésions filtrées.');"><input type="hidden" name="settings_section" value="pricing_retroactive"><h3>Correction rétroactive des tarifs</h3><p class="muted">À utiliser si une AG modifie un tarif après des inscriptions déjà saisies. Les nouvelles inscriptions utilisent automatiquement les tarifs ci-dessus ; ce bouton met à jour les lignes déjà enregistrées correspondant aux filtres.</p><div class="form-grid"><div class="field"><label>Année</label><input name="retro_year" type="number" min="2024" max="2100" value="{{ current_year }}" required></div><div class="field"><label>Abonnement</label><select name="retro_subscription_type"><option value="">Tous les abonnements</option>{% for name in subscription_prices %}<option value="{{ name }}">{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Catégorie</label><select name="retro_member_profile"><option value="">Toutes les catégories</option>{% for profile_key, profile_label in member_profile_labels.items() %}<option value="{{ profile_key }}">{{ profile_label }}</option>{% endfor %}</select></div></div><br><button class="btn danger" type="submit">Recalculer les anciennes lignes filtrées</button></form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><input type="hidden" name="settings_section" value="coach_planning_display">""",
+    1,
+)
 
 TEMPLATE_BUDGET = """
 {% set content %}<div class="card"><h1>Budget</h1><div class="grid"><div class="card"><span class="muted">Recettes</span><div class="stat">{{ '%.2f'|format(income) }} €</div><small class="muted">Inclut {{ '%.2f'|format(expected_dues) }} € de cotisations attendues {{ dues_year }}</small></div><div class="card"><span class="muted">Dépenses</span><div class="stat">{{ '%.2f'|format(expenses) }} €</div></div><div class="card"><span class="muted">Solde</span><div class="stat">{{ '%.2f'|format(balance) }} €</div></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter une ligne</h3><div class="form-grid"><div class="field"><label>Date</label><input name="entry_date" type="date" value="{{ today.isoformat() }}" required></div><div class="field"><label>Type</label><select name="entry_type"><option value="income">Recette</option><option value="expense">Dépense</option></select></div><div class="field"><label>Catégorie</label><select name="category"><option>Abonnement</option><option>Cotisation adhérent</option><option>Facture coach</option><option>Achat matériel</option><option>Autre</option></select></div><div class="field"><label>Libellé</label><input name="label" required></div><div class="field"><label>Montant (€)</label><input name="amount" required></div><div class="field"><label>Notes</label><input name="notes"></div></div><br><button class="btn" type="submit">Ajouter</button></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Cotisations attendues</h2><p class="muted">La cotisation annuelle de première inscription est ajoutée aux adhérents créés dans l'année sélectionnée. Le tarif d'abonnement est repris depuis les tarifs paramétrés par statut.</p></div><form method="get"><input name="dues_year" type="number" value="{{ dues_year }}" style="width:100px;padding:10px;border-radius:10px;border:1px solid #ddd"> <button class="btn secondary" type="submit">Afficher</button> <a class="btn" href="{{ url_for('export_budget_dues', dues_year=dues_year) }}">Exporter</a></form></div><table class="table"><tr><th>Adhérent</th><th>Email</th><th>Profil</th><th>Abonnement</th><th>Tarif indicatif</th><th>Tarif statut</th><th>Cotisation annuelle</th><th>Total</th></tr>{% for row in dues_rows %}<tr><td>{{ row.user.display_name() }}</td><td>{{ row.user.email }}</td><td>{{ row.member_profile_label }}</td><td>{{ row.user.subscription_type or '-' }}</td><td>{{ '%.2f'|format(row.base_subscription_price) }} €</td><td>{{ '%.2f'|format(row.subscription_price) }} €</td><td>{% if row.annual_fee %}{{ '%.2f'|format(row.annual_fee) }} €{% else %}<span class="muted">-</span>{% endif %}</td><td><strong>{{ '%.2f'|format(row.total) }} €</strong></td></tr>{% else %}<tr><td colspan="8" class="muted">Aucune cotisation attendue pour cette année.</td></tr>{% endfor %}</table></div><br><table class="table"><tr><th>Date</th><th>Type</th><th>Catégorie</th><th>Libellé</th><th>Montant</th><th>Notes</th></tr>{% for e in entries %}<tr><td>{{ e.entry_date.strftime('%d/%m/%Y') }}</td><td>{{ e.entry_type }}</td><td>{{ e.category }}</td><td>{{ e.label }}</td><td>{{ '%.2f'|format(e.amount) }} €</td><td>{{ e.notes or '' }}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune ligne budget.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'budget')|safe }}
@@ -4651,6 +4716,24 @@ def admin_settings():
             db.session.commit()
             flash("Tarifs des abonnements mis à jour.")
             return redirect(url_for("admin_settings"))
+        if request.form.get("settings_section") == "pricing_retroactive":
+            try:
+                target_year = int(request.form.get("retro_year", date.today().year))
+            except (TypeError, ValueError):
+                target_year = date.today().year
+            raw_subscription = request.form.get("retro_subscription_type", "").strip()
+            target_subscription = normalize_subscription_type(raw_subscription) if raw_subscription else ""
+            if target_subscription not in SUBSCRIPTION_PRICES:
+                target_subscription = ""
+            target_profile = request.form.get("retro_member_profile", "").strip()
+            if target_profile not in MEMBER_PROFILE_LABELS:
+                target_profile = ""
+            updated = reapply_current_tariffs_to_memberships(target_year, target_subscription, target_profile)
+            if updated:
+                flash(f"{updated} ligne(s) d'adhésion recalculée(s) avec les tarifs actuels.")
+            else:
+                flash("Aucune ligne d'adhésion ne correspond aux filtres choisis.")
+            return redirect(url_for("admin_settings"))
         parity = request.form.get("week_parity", "all")
         if parity == "single":
             if not request.form.get("session_date"):
@@ -4688,7 +4771,7 @@ def admin_settings():
         flash("Cours créé. Il apparaît dans le planning coach et sera généré automatiquement sur le planning glissant.")
         return redirect(url_for("admin_settings"))
     templates = CourseTemplate.query.order_by(CourseTemplate.weekday, CourseTemplate.start_time).all()
-    return render_template_string(TEMPLATE_SETTINGS, templates=templates, single_sessions=single_course_sessions(), coaches=configured_coach_rows(), coach_options=configured_coach_names(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)
+    return render_template_string(TEMPLATE_SETTINGS, templates=templates, single_sessions=single_course_sessions(), coaches=configured_coach_rows(), coach_options=configured_coach_names(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), current_year=date.today().year, subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)
 
 
 @app.route("/admin/settings/template/<int:template_id>/edit", methods=["POST"])

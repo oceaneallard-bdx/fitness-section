@@ -924,12 +924,48 @@ def active_member_query():
     )
 
 
+def active_member_options():
+    users = active_member_query().order_by(User.first_name, User.last_name, User.full_name, User.email).all()
+    return [f"{user.display_name()} - {user.email}" for user in users]
+
+
 def is_member_account(user):
     return bool(user and user.account_status != "archived" and user.email != DEMO_ADHERENT_EMAIL and (
         user.role == "adherent" or (
             user.role == "admin" and user.subscription_type is not None and user.subscription_year is not None
         )
     ))
+
+
+def find_member_for_last_minute(query):
+    query = (query or "").strip().lower()
+    if not query:
+        return None, []
+    if " - " in query:
+        possible_email = query.rsplit(" - ", 1)[1].strip().lower()
+        user = active_member_query().filter(db.func.lower(User.email) == possible_email).first()
+        if user:
+            return user, [user]
+    members = active_member_query().all()
+    exact_matches = []
+    partial_matches = []
+    terms = [term for term in re.split(r"\s+", query) if term]
+    for user in members:
+        labels = {
+            (user.display_name() or "").strip().lower(),
+            (user.full_name or "").strip().lower(),
+            f"{user.first_name or ''} {user.last_name or ''}".strip().lower(),
+            f"{user.last_name or ''} {user.first_name or ''}".strip().lower(),
+            (user.email or "").strip().lower(),
+        }
+        if query in labels:
+            exact_matches.append(user)
+            continue
+        searchable = " ".join(label for label in labels if label)
+        if terms and all(term in searchable for term in terms):
+            partial_matches.append(user)
+    matches = exact_matches or partial_matches
+    return (matches[0] if len(matches) == 1 else None), matches
 
 
 def send_member_campaign_async(user_ids, subject, signed_body, signed_html, inline_images):
@@ -2501,7 +2537,37 @@ def session_detail(session_id):
         b.created_at or datetime.utcnow(),
         b.id,
     ))
-    return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings, waitlist_rank=waitlist_rank)
+    return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings, waitlist_rank=waitlist_rank, member_options=active_member_options())
+
+
+@app.route("/session/<int:session_id>/add-member", methods=["POST"])
+@login_required
+def add_last_minute_member(session_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé au coach ou à l’admin.")
+        return redirect(url_for("index"))
+    session = CourseSession.query.get_or_404(session_id)
+    user, matches = find_member_for_last_minute(request.form.get("member_search", ""))
+    if not user:
+        if matches:
+            names = ", ".join(f"{match.display_name()} ({match.email})" for match in matches[:5])
+            flash(f"Plusieurs adhérents correspondent : {names}. Merci de préciser avec l'email.")
+        else:
+            flash("Aucun adhérent actif trouvé avec ce nom/prénom.")
+        return redirect(url_for("session_detail", session_id=session.id))
+    existing = Booking.query.filter(
+        Booking.user_id == user.id,
+        Booking.session_id == session.id,
+        Booking.status.in_(["booked", "waiting_list", "absent_unexcused"]),
+    ).first()
+    if existing:
+        flash(f"{user.display_name()} est déjà dans la liste de ce cours.")
+        return redirect(url_for("session_detail", session_id=session.id) + f"#booking-{existing.id}")
+    booking = Booking(user_id=user.id, session_id=session.id, status="booked", attendance_status="present")
+    db.session.add(booking)
+    db.session.commit()
+    flash(f"{user.display_name()} ajouté en dernière minute et marqué présent.")
+    return redirect(url_for("session_detail", session_id=session.id) + f"#booking-{booking.id}")
 
 
 @app.route("/presence/present/<int:booking_id>")
@@ -2513,12 +2579,12 @@ def mark_present(booking_id):
     booking = Booking.query.get_or_404(booking_id)
     if booking.status not in ["booked", "absent_unexcused"]:
         flash("Seules les réservations confirmées peuvent être pointées présentes.")
-        return redirect(url_for("session_detail", session_id=booking.session_id))
+        return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "booked"
     booking.attendance_status = "present"
     db.session.commit()
     flash(f"{booking.user.display_name()} marqué présent.")
-    return redirect(url_for("session_detail", session_id=booking.session_id))
+    return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
 
 
 @app.route("/presence/skip/<int:booking_id>")
@@ -2530,11 +2596,11 @@ def mark_skipped(booking_id):
     booking = Booking.query.get_or_404(booking_id)
     if booking.status != "booked":
         flash("Seules les réservations confirmées peuvent être mises de côté.")
-        return redirect(url_for("session_detail", session_id=booking.session_id))
+        return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.attendance_status = "skipped"
     db.session.commit()
     flash(f"{booking.user.display_name()} mis de côté pour revenir dessus après.")
-    return redirect(url_for("session_detail", session_id=booking.session_id))
+    return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
 
 
 @app.route("/presence/absent/<int:booking_id>")
@@ -2546,7 +2612,7 @@ def mark_absent(booking_id):
     booking = Booking.query.get_or_404(booking_id)
     if booking.status != "booked":
         flash("Seules les réservations confirmées peuvent être marquées absentes.")
-        return redirect(url_for("session_detail", session_id=booking.session_id))
+        return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "absent_unexcused"
     booking.attendance_status = "absent"
     db.session.commit()
@@ -2557,7 +2623,7 @@ def mark_absent(booking_id):
         f"Bonjour {booking.user.display_name()},\n\nVotre absence au cours {booking.session.course_name} du {booking.session.course_date.strftime('%d/%m/%Y')} a été enregistrée comme non excusée, car la réservation n'avait pas été annulée dans les délais.\n\nSection Fitness"
     )
     flash("Absence non excusée enregistrée.")
-    return redirect(url_for("session_detail", session_id=booking.session_id))
+    return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
 
 
 @app.route("/presence/late/<int:booking_id>")
@@ -2569,13 +2635,13 @@ def mark_late(booking_id):
     booking = Booking.query.get_or_404(booking_id)
     if booking.status != "absent_unexcused":
         flash("Seule une absence peut être transformée en retard.")
-        return redirect(url_for("session_detail", session_id=booking.session_id))
+        return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "booked"
     booking.attendance_status = "late"
     refresh_absence_block_status(booking.user)
     db.session.commit()
     flash(f"{booking.user.display_name()} marqué en retard : aucune pénalité d'absence.")
-    return redirect(url_for("session_detail", session_id=booking.session_id))
+    return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
 
 
 @app.route("/admin/members/edit/<int:user_id>", methods=["GET", "POST"])
@@ -3522,6 +3588,31 @@ TEMPLATE_SESSION_DETAIL = """
 TEMPLATE_SESSION_DETAIL = """
 {% set content %}<style>.attendance-list{display:grid;gap:14px}.attendance-card{display:grid;grid-template-columns:76px 1fr;gap:14px;align-items:center;border:1px solid #e5e7eb;border-radius:16px;padding:14px;background:#fff}.attendance-card.absent{border-left:6px solid var(--danger);background:#fff7f7}.attendance-photo{width:76px;height:76px;border-radius:16px;object-fit:cover;background:#e5e7eb;border:1px solid #e5e7eb}.attendance-name{font-size:20px;font-weight:800;margin-bottom:4px}.attendance-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr;gap:10px}.attendance-actions .btn{text-align:center;padding:14px 8px}.btn.warn{background:#f59e0b}@media(max-width:700px){.main{padding:14px}.card{padding:16px;border-radius:14px}.attendance-card{grid-template-columns:68px 1fr;padding:12px}.attendance-photo{width:68px;height:68px}.attendance-name{font-size:18px}.attendance-actions .btn{width:100%;font-size:16px}}</style><div class="card"><h1>{{ session.course_name }}</h1><p class="muted">{{ session.course_date.strftime('%d/%m/%Y') }} · {{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }}</p><p class="muted">Appel mobile : marquez uniquement les absents. Si une personne arrive après l'appel, utilisez “Retard” pour retirer la pénalité.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">{% for b in bookings %}<div class="attendance-card {% if b.status == 'absent_unexcused' or b.attendance_status == 'absent' %}absent{% endif %}">{% if b.user.profile_photo or b.user.profile_photo_data %}<img class="attendance-photo" src="{{ url_for('profile_photo_file', user_id=b.user.id) }}" alt="Photo {{ b.user.display_name() }}">{% else %}<div class="attendance-photo"></div>{% endif %}<div><div class="attendance-name">{{ b.user.display_name() }}</div><div class="muted">{{ b.user.email }}</div><div style="margin-top:8px"><span class="badge {{ attendance_badge_class(b) }}">{{ attendance_label(b) }}</span>{% if b.status == 'waiting_list' %} <span class="badge wait">rang {{ waitlist_rank(b) }}</span>{% endif %}</div></div><div class="attendance-actions">{% if b.status == 'booked' %}<a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="return confirm('Marquer cet adhérent absent ?')">Absent</a>{% elif b.status == 'absent_unexcused' %}<a class="btn warn" href="{{ url_for('mark_late', booking_id=b.id) }}">Retard</a>{% else %}<span class="muted">Liste d'attente, pas d'appel.</span>{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
 """
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">""",
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" action="{{ url_for('add_last_minute_member', session_id=session.id) }}" class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:16px"><h3>Ajouter un adhérent de dernière minute</h3><div class="form-grid"><div class="field"><label>Nom / prénom</label><input name="member_search" list="member-options" placeholder="Commencer à saisir le nom ou prénom" required><datalist id="member-options">{% for option in member_options %}<option value="{{ option }}">{% endfor %}</datalist></div></div><br><button class="btn" type="submit">Ajouter à ce cours</button></form><div class="attendance-list">""",
+    1,
+)
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """<div class="attendance-card {% if b.status == 'absent_unexcused' or b.attendance_status == 'absent' %}absent{% endif %}">""",
+    """<div id="booking-{{ b.id }}" class="attendance-card {% if b.status == 'absent_unexcused' or b.attendance_status == 'absent' %}absent{% endif %}">""",
+    1,
+)
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """<a class="btn danger" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="return confirm('Marquer cet adhérent absent ?')">Absent</a>""",
+    """<a class="btn danger attendance-action" href="{{ url_for('mark_absent', booking_id=b.id) }}" onclick="rememberAttendanceScroll(); return confirm('Marquer cet adhérent absent ?')">Absent</a>""",
+    1,
+)
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """<a class="btn warn" href="{{ url_for('mark_late', booking_id=b.id) }}">Retard</a>""",
+    """<a class="btn warn attendance-action" href="{{ url_for('mark_late', booking_id=b.id) }}" onclick="rememberAttendanceScroll()">Retard</a>""",
+    1,
+)
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """<br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}""",
+    """<br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a><script>const attendanceScrollKey='attendance-scroll-'+window.location.pathname;function rememberAttendanceScroll(){sessionStorage.setItem(attendanceScrollKey,String(window.scrollY));}window.addEventListener('DOMContentLoaded',()=>{const y=sessionStorage.getItem(attendanceScrollKey);if(y!==null){sessionStorage.removeItem(attendanceScrollKey);setTimeout(()=>window.scrollTo(0,Number(y)),0);}});</script></div>{% endset %}""",
+    1,
+)
 
 TEMPLATE_MEMBERS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> {% if u.role == 'adherent' %}<a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a>{% else %}<span class="badge wait">Admin adhérent</span>{% endif %}</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}

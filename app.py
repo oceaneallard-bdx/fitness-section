@@ -3117,7 +3117,7 @@ def admin_members():
     followup_end = request.args.get("followup_end", "").strip()
     if search:
         like = f"%{search.lower()}%"
-        query = query.filter(db.or_(db.func.lower(User.full_name).like(like), db.func.lower(User.first_name).like(like), db.func.lower(User.last_name).like(like), db.func.lower(User.email).like(like), db.func.lower(User.member_number).like(like)))
+        query = query.filter(db.or_(db.func.lower(User.full_name).like(like), db.func.lower(User.first_name).like(like), db.func.lower(User.last_name).like(like), db.func.lower(User.email).like(like), db.func.lower(User.member_number).like(like), db.func.lower(User.rights_holder_name).like(like)))
     if profile:
         query = query.filter(User.member_profile == profile)
     if subscription:
@@ -3483,14 +3483,7 @@ def admin_email_members():
     target_roles = [role for role in target_roles if role in valid_roles] or ["adherent"]
     if selected_ids:
         selected_member_ids = [int(i) for i in selected_ids if str(i).isdigit()]
-        user_filters = []
-        if "adherent" in target_roles and selected_member_ids:
-            user_filters.append(db.and_(User.role == "adherent", User.id.in_(selected_member_ids)))
-        if "admin" in target_roles:
-            user_filters.append(User.role == "admin")
-        if "coach" in target_roles:
-            user_filters.append(User.role == "coach")
-        users = User.query.filter(User.account_status != "archived", db.or_(*user_filters)).order_by(User.role, User.full_name, User.email).all() if user_filters else []
+        users = User.query.filter(User.id.in_(selected_member_ids), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all() if selected_member_ids else []
     else:
         users = User.query.filter(User.role.in_(target_roles), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
     excluded_emails = campaign_excluded_emails()
@@ -3894,13 +3887,87 @@ TEMPLATE_MEMBERS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> {% if u.role == 'adherent' %}<a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a>{% else %}<span class="badge wait">Admin adhérent</span>{% endif %}</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
+    """<a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a>""",
+    """<a class="btn" id="member-campaign-link" href="{{ url_for('admin_email_members') }}">Campagne email</a>""",
+    1,
+)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
+    """onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)" """,
+    """onclick="document.querySelectorAll('.member-check').forEach(c=>{c.checked=this.checked;c.dispatchEvent(new Event('change'));})" """,
+    1,
+)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}">""",
-    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_members') }}" class="card" style="box-shadow:none;background:#f9fafb"><h3>Filtres</h3><div class="form-grid"><div class="field"><label>Recherche</label><input name="search" value="{{ filter_values.search }}" placeholder="Nom, email, ID"></div><div class="field"><label>Profil</label><select name="member_profile"><option value="">Tous</option>{% for key, label in member_profile_labels.items() %}<option value="{{ key }}" {% if filter_values.member_profile == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Abonnement</label><select name="subscription_type"><option value="">Tous</option>{% for opt in subscription_options %}<option value="{{ opt }}" {% if filter_values.subscription_type == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" value="{{ filter_values.subscription_year }}" placeholder="2026"></div><div class="field"><label>Compte</label><select name="account_status"><option value="">Tous</option><option value="active" {% if filter_values.account_status == 'active' %}selected{% endif %}>Actif</option><option value="pending" {% if filter_values.account_status == 'pending' %}selected{% endif %}>Activation à faire</option></select></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a></form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Sélection campagne email</strong><p class="muted"><span id="member-selection-count">0</span> adhérent(s) sélectionné(s) au fil des recherches.</p><button class="btn secondary" type="button" id="clear-member-selection">Vider la sélection</button></div><br><form method="get" action="{{ url_for('admin_members') }}" class="card" style="box-shadow:none;background:#f9fafb"><h3>Filtres</h3><div class="form-grid"><div class="field"><label>Recherche</label><input name="search" value="{{ filter_values.search }}" placeholder="Nom, email, ID, ouvrant droit"></div><div class="field"><label>Profil</label><select name="member_profile"><option value="">Tous</option>{% for key, label in member_profile_labels.items() %}<option value="{{ key }}" {% if filter_values.member_profile == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Abonnement</label><select name="subscription_type"><option value="">Tous</option>{% for opt in subscription_options %}<option value="{{ opt }}" {% if filter_values.subscription_type == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" value="{{ filter_values.subscription_year }}" placeholder="2026"></div><div class="field"><label>Compte</label><select name="account_status"><option value="">Tous</option><option value="active" {% if filter_values.account_status == 'active' %}selected{% endif %}>Actif</option><option value="pending" {% if filter_values.account_status == 'pending' %}selected{% endif %}>Activation à faire</option></select></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a></form><br><form method="get" action="{{ url_for('admin_email_members') }}" id="member-email-form">""",
     1,
 )
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """</form><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
     """</form><br><details class="card" style="box-shadow:none;background:#f9fafb" {% if filter_values.followup_year or filter_values.followup_start or filter_values.followup_end %}open{% endif %}><summary style="cursor:pointer;font-weight:800;font-size:18px">Suivi inscriptions / renouvellements</summary><p class="muted">Affichage limité aux 25 dernières lignes de la période choisie. Les montants sont figés à la date d'inscription.</p><form method="get" action="{{ url_for('admin_members') }}"><div class="form-grid"><div class="field"><label>Année d'adhésion</label><input name="followup_year" type="number" value="{{ filter_values.followup_year }}" placeholder="2026"></div><div class="field"><label>Date action début</label><input name="followup_start" type="date" value="{{ filter_values.followup_start }}"></div><div class="field"><label>Date action fin</label><input name="followup_end" type="date" value="{{ filter_values.followup_end }}"></div></div><br><button class="btn secondary" type="submit">Afficher le suivi</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Réinitialiser</a> <a class="btn" href="{{ url_for('export_membership_followup', followup_year=filter_values.followup_year, followup_start=filter_values.followup_start, followup_end=filter_values.followup_end) }}">Exporter ce suivi</a></form><br><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for row in membership_actions %}{% set p = row.period %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y %H:%M') if p.created_at else '-' }}</td><td>{{ row.user.display_name() }}<br><small class="muted">{{ row.user.email }}</small></td><td>{{ row.subscription_type }} {{ row.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(row.subscription_price or 0) }} €</td><td>{% if row.annual_fee %}{{ '%.2f'|format(row.annual_fee or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(row.total or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="9" class="muted">Aucune action d'adhésion sur cette période.</td></tr>{% endfor %}</table></details><br><form method="get" action="{{ url_for('admin_email_members') }}">""",
+    1,
+)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
+    """</div>{% endset %}{{ shell(content, 'members')|safe }}""",
+    """<script>
+const memberSelectionKey = 'fitness-member-email-selection';
+function selectedMemberIds(){
+  try { return new Set(JSON.parse(localStorage.getItem(memberSelectionKey) || '[]').map(String)); }
+  catch(e){ return new Set(); }
+}
+function saveMemberIds(ids){ localStorage.setItem(memberSelectionKey, JSON.stringify(Array.from(ids))); }
+function refreshMemberSelectionUi(){
+  const ids = selectedMemberIds();
+  document.querySelectorAll('.member-check').forEach(cb => { cb.checked = ids.has(String(cb.value)); });
+  const count = document.getElementById('member-selection-count');
+  if(count) count.textContent = ids.size;
+}
+function appendSelectionToTarget(target){
+  const ids = Array.from(selectedMemberIds());
+  ids.forEach(id => {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = 'user_ids';
+    input.value = id;
+    target.appendChild(input);
+  });
+  return ids.length;
+}
+document.addEventListener('DOMContentLoaded', () => {
+  refreshMemberSelectionUi();
+  document.querySelectorAll('.member-check').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const ids = selectedMemberIds();
+      if(cb.checked) ids.add(String(cb.value)); else ids.delete(String(cb.value));
+      saveMemberIds(ids);
+      refreshMemberSelectionUi();
+    });
+  });
+  const clearBtn = document.getElementById('clear-member-selection');
+  if(clearBtn) clearBtn.addEventListener('click', () => { saveMemberIds(new Set()); refreshMemberSelectionUi(); });
+  const campaignLink = document.getElementById('member-campaign-link');
+  if(campaignLink) campaignLink.addEventListener('click', event => {
+    const ids = Array.from(selectedMemberIds());
+    if(ids.length){
+      event.preventDefault();
+      const url = new URL(campaignLink.href, window.location.origin);
+      ids.forEach(id => url.searchParams.append('user_ids', id));
+      window.location.href = url.toString();
+    }
+  });
+  const emailForm = document.getElementById('member-email-form');
+  if(emailForm) emailForm.addEventListener('submit', () => {
+    emailForm.querySelectorAll('input[data-selection-hidden=\"1\"]').forEach(input => input.remove());
+    Array.from(selectedMemberIds()).forEach(id => {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'user_ids';
+      input.value = id;
+      input.dataset.selectionHidden = '1';
+      emailForm.appendChild(input);
+    });
+  });
+});
+</script></div>{% endset %}{{ shell(content, 'members')|safe }}""",
     1,
 )
 
@@ -3992,7 +4059,7 @@ TEMPLATE_ARCHIVES = """
 """
 
 TEMPLATE_EMAIL_MEMBERS = """
-{% set content %}<div class="card form-wrap"><h1>Campagne email</h1><p class="muted">Choisissez les groupes destinataires. La signature du Bureau Fitness et le logo sont ajoutés automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post">{% for u in users if u.role == 'adherent' %}<input type="hidden" name="user_ids" value="{{ u.id }}">{% endfor %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Destinataires</strong><div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px"><label><input type="checkbox" name="target_roles" value="adherent" {% if 'adherent' in target_roles %}checked{% endif %}> Adhérents</label><label><input type="checkbox" name="target_roles" value="admin" {% if 'admin' in target_roles %}checked{% endif %}> Admins</label><label><input type="checkbox" name="target_roles" value="coach" {% if 'coach' in target_roles %}checked{% endif %}> Coachs</label></div><p class="muted">{{ users|length }} destinataire(s) actuellement listé(s). Si des adhérents ont été sélectionnés depuis l'onglet Adhérents, seuls ces adhérents sont repris.</p><p class="muted">{% for u in users %}{{ u.display_name() }} &lt;{{ u.email }}&gt;{% if not loop.last %}, {% endif %}{% else %}Aucun destinataire pour cette sélection.{% endfor %}</p></div><br><div class="field"><label>Objet</label><input name="subject" required placeholder="Ex. Informations Section Fitness"></div><br><div class="field"><label>Message</label><textarea name="body" required rows="10" style="width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px"></textarea></div><br><button class="btn" type="submit">Envoyer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'members')|safe }}
+{% set content %}<div class="card form-wrap"><h1>Campagne email</h1><p class="muted">Choisissez les groupes destinataires. La signature du Bureau Fitness et le logo sont ajoutés automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post">{% for u in users %}<input type="hidden" name="user_ids" value="{{ u.id }}">{% endfor %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Destinataires</strong><div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px"><label><input type="checkbox" name="target_roles" value="adherent" {% if 'adherent' in target_roles %}checked{% endif %}> Adhérents</label><label><input type="checkbox" name="target_roles" value="admin" {% if 'admin' in target_roles %}checked{% endif %}> Admins</label><label><input type="checkbox" name="target_roles" value="coach" {% if 'coach' in target_roles %}checked{% endif %}> Coachs</label></div><p class="muted">{{ users|length }} destinataire(s) actuellement listé(s). Si des adhérents ont été sélectionnés depuis l'onglet Adhérents, seuls ces adhérents sont repris.</p><p class="muted">{% for u in users %}{{ u.display_name() }} &lt;{{ u.email }}&gt;{% if not loop.last %}, {% endif %}{% else %}Aucun destinataire pour cette sélection.{% endfor %}</p></div><br><div class="field"><label>Objet</label><input name="subject" required placeholder="Ex. Informations Section Fitness"></div><br><div class="field"><label>Message</label><textarea name="body" required rows="10" style="width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px"></textarea></div><br><button class="btn" type="submit">Envoyer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 
 TEMPLATE_BLOCKED = """

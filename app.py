@@ -973,7 +973,7 @@ def active_member_options():
 
 
 def is_member_account(user):
-    return bool(user and user.account_status != "archived" and user.email != DEMO_ADHERENT_EMAIL and (
+    return bool(user and user.email != DEMO_ADHERENT_EMAIL and (
         user.role == "adherent" or (
             user.role == "admin" and user.subscription_type is not None and user.subscription_year is not None
         )
@@ -1009,6 +1009,31 @@ def find_member_for_last_minute(query):
             partial_matches.append(user)
     matches = exact_matches or partial_matches
     return (matches[0] if len(matches) == 1 else None), matches
+
+
+def create_trial_user(full_name):
+    full_name = (full_name or "").strip()
+    token = secrets.token_hex(6)
+    user = User(
+        email=f"essai-{token}@fitness.local",
+        role="trial",
+        status="autre",
+        full_name=full_name,
+        account_status="active",
+    )
+    first_name, last_name = split_name(full_name)
+    user.first_name = first_name
+    user.last_name = last_name
+    user.set_password(secrets.token_urlsafe(18))
+    db.session.add(user)
+    db.session.flush()
+    return user
+
+
+def user_contact_label(user):
+    if user.role == "trial":
+        return "Personne à l'essai"
+    return user.email
 
 
 def send_member_campaign_async(user_ids, subject, signed_body, signed_html):
@@ -2701,7 +2726,7 @@ def session_detail(session_id):
         b.created_at or datetime.utcnow(),
         b.id,
     ))
-    return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings, waitlist_rank=waitlist_rank, member_options=active_member_options())
+    return render_template_string(TEMPLATE_SESSION_DETAIL, session=session, bookings=bookings, waitlist_rank=waitlist_rank, member_options=active_member_options(), user_contact_label=user_contact_label)
 
 
 @app.route("/session/<int:session_id>/add-member", methods=["POST"])
@@ -2731,6 +2756,25 @@ def add_last_minute_member(session_id):
     db.session.add(booking)
     db.session.commit()
     flash(f"{user.display_name()} ajouté en dernière minute et marqué présent.")
+    return redirect(url_for("session_detail", session_id=session.id) + f"#booking-{booking.id}")
+
+
+@app.route("/session/<int:session_id>/add-trial", methods=["POST"])
+@login_required
+def add_trial_participant(session_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé au coach ou à l’admin.")
+        return redirect(url_for("index"))
+    session = CourseSession.query.get_or_404(session_id)
+    trial_name = request.form.get("trial_name", "").strip()
+    if not trial_name:
+        flash("Merci d'indiquer le nom/prénom de la personne à l'essai.")
+        return redirect(url_for("session_detail", session_id=session.id))
+    user = create_trial_user(trial_name)
+    booking = Booking(user_id=user.id, session_id=session.id, status="booked", attendance_status="present")
+    db.session.add(booking)
+    db.session.commit()
+    flash(f"{user.display_name()} ajouté comme personne à l'essai et marqué présent.")
     return redirect(url_for("session_detail", session_id=session.id) + f"#booking-{booking.id}")
 
 
@@ -2780,13 +2824,16 @@ def mark_absent(booking_id):
     booking.status = "absent_unexcused"
     booking.attendance_status = "absent"
     db.session.commit()
-    apply_absence_sanction(booking.user)
-    send_email(
-        booking.user.email,
-        "Absence enregistrée - Section Fitness",
-        f"Bonjour {booking.user.display_name()},\n\nVotre absence au cours {booking.session.course_name} du {booking.session.course_date.strftime('%d/%m/%Y')} a été enregistrée comme non excusée, car la réservation n'avait pas été annulée dans les délais.\n\nSection Fitness"
-    )
-    flash("Absence non excusée enregistrée.")
+    if booking.user.role != "trial":
+        apply_absence_sanction(booking.user)
+        send_email(
+            booking.user.email,
+            "Absence enregistrée - Section Fitness",
+            f"Bonjour {booking.user.display_name()},\n\nVotre absence au cours {booking.session.course_name} du {booking.session.course_date.strftime('%d/%m/%Y')} a été enregistrée comme non excusée, car la réservation n'avait pas été annulée dans les délais.\n\nSection Fitness"
+        )
+        flash("Absence non excusée enregistrée.")
+    else:
+        flash("Personne à l'essai marquée absente, sans pénalité.")
     return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
 
 
@@ -2802,7 +2849,8 @@ def mark_late(booking_id):
         return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "booked"
     booking.attendance_status = "late"
-    refresh_absence_block_status(booking.user)
+    if booking.user.role != "trial":
+        refresh_absence_block_status(booking.user)
     db.session.commit()
     flash(f"{booking.user.display_name()} marqué en retard : aucune pénalité d'absence.")
     return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
@@ -2863,7 +2911,7 @@ def admin_edit_member(user_id):
     if repair_missing_prior_membership_periods(user):
         db.session.commit()
     membership_periods = membership_period_rows(MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year.desc(), MembershipPeriod.start_date.desc()).all())
-    return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys())
+    return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys(), split_name=split_name)
 
 
 @app.route("/admin/members/<int:user_id>/renew", methods=["POST"])
@@ -3664,7 +3712,7 @@ def delete_useful_document(document_id):
 BASE_TEMPLATE_STYLE = """
 <style>
 :root{--green:#34a853;--green2:#8ee35f;--dark:#061417;--muted:#6b7280;--line:#e5e7eb;--bg:#f6f8fb;--danger:#ef4444;--orange:#f59e0b}
-*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:var(--bg);color:#111827}.layout{display:flex;min-height:100vh}.side{width:250px;background:linear-gradient(180deg,#07161a,#031014);color:white;padding:26px 18px;position:sticky;top:0;height:100vh}.logo{width:118px;height:118px;border-radius:50%;background:white;display:block;margin:0 auto 26px;object-fit:contain}.nav a{display:block;color:white;text-decoration:none;padding:12px 14px;border-radius:10px;margin:8px 0;font-weight:600}.nav a:hover,.nav .active{background:var(--green)}.logout{color:#ff6b6b!important;margin-top:26px}.main{flex:1;padding:30px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}.btn{border:0;background:var(--green);color:white;padding:11px 16px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block;cursor:pointer}.btn.secondary{background:white;color:#111827;border:1px solid var(--line)}.btn.danger{background:var(--danger)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:24px}.card{background:white;border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 10px 25px rgba(15,23,42,.05)}.stat{font-size:34px;font-weight:800;margin-top:8px}.muted{color:var(--muted)}.content-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:22px}.session{display:flex;justify-content:space-between;gap:14px;align-items:center;border:1px solid var(--line);padding:15px;border-radius:14px;margin:12px 0;background:#fff}.badge{padding:6px 10px;border-radius:999px;font-size:13px;font-weight:700;background:#e8f8ed;color:#18793a}.badge.full{background:#fee2e2;color:#b91c1c}.badge.wait{background:#fff7ed;color:#c2410c}.table{width:100%;border-collapse:collapse;background:white;border-radius:18px;overflow:hidden}.table th,.table td{padding:14px;border-bottom:1px solid var(--line);text-align:left}.table th{background:#f9fafb}.form-wrap{max-width:760px;margin:30px auto}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field label{font-weight:700;display:block;margin-bottom:7px}.field input,.field select{width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px}.flash{background:#ecfdf5;border:1px solid #bbf7d0;color:#166534;padding:12px 16px;border-radius:12px;margin-bottom:18px}.login{min-height:100vh;display:grid;place-items:center;padding:22px}.login-box{width:100%;max-width:430px}.photo-preview{width:115px;height:115px;border-radius:50%;object-fit:cover;background:#e5e7eb}.admin-photo{width:54px;height:54px;border-radius:12px;object-fit:cover;background:#e5e7eb;border:1px solid var(--line)}.card-preview{width:100%;border-radius:16px;border:1px solid var(--line)}@media(max-width:900px){.layout{display:block}.side{width:auto;height:auto;position:relative}.grid,.content-grid,.form-grid{grid-template-columns:1fr}.main{padding:18px}}
+*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:var(--bg);color:#111827}.layout{display:flex;min-height:100vh}.side{width:250px;background:linear-gradient(180deg,#07161a,#031014);color:white;padding:26px 18px;position:sticky;top:0;height:100vh;overflow-y:auto;overscroll-behavior:contain}.logo{width:118px;height:118px;border-radius:50%;background:white;display:block;margin:0 auto 26px;object-fit:contain}.nav a{display:block;color:white;text-decoration:none;padding:12px 14px;border-radius:10px;margin:8px 0;font-weight:600}.nav a:hover,.nav .active{background:var(--green)}.logout{color:#ff6b6b!important;margin-top:26px}.main{flex:1;padding:30px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}.btn{border:0;background:var(--green);color:white;padding:11px 16px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block;cursor:pointer}.btn.secondary{background:white;color:#111827;border:1px solid var(--line)}.btn.danger{background:var(--danger)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:24px}.card{background:white;border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 10px 25px rgba(15,23,42,.05)}.stat{font-size:34px;font-weight:800;margin-top:8px}.muted{color:var(--muted)}.content-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:22px}.session{display:flex;justify-content:space-between;gap:14px;align-items:center;border:1px solid var(--line);padding:15px;border-radius:14px;margin:12px 0;background:#fff}.badge{padding:6px 10px;border-radius:999px;font-size:13px;font-weight:700;background:#e8f8ed;color:#18793a}.badge.full{background:#fee2e2;color:#b91c1c}.badge.wait{background:#fff7ed;color:#c2410c}.table{width:100%;border-collapse:collapse;background:white;border-radius:18px;overflow:hidden}.table th,.table td{padding:14px;border-bottom:1px solid var(--line);text-align:left}.table th{background:#f9fafb}.form-wrap{max-width:760px;margin:30px auto}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field label{font-weight:700;display:block;margin-bottom:7px}.field input,.field select{width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px}.flash{background:#ecfdf5;border:1px solid #bbf7d0;color:#166534;padding:12px 16px;border-radius:12px;margin-bottom:18px}.login{min-height:100vh;display:grid;place-items:center;padding:22px}.login-box{width:100%;max-width:430px}.photo-preview{width:115px;height:115px;border-radius:50%;object-fit:cover;background:#e5e7eb}.admin-photo{width:54px;height:54px;border-radius:12px;object-fit:cover;background:#e5e7eb;border:1px solid var(--line)}.card-preview{width:100%;border-radius:16px;border:1px solid var(--line)}@media(max-width:900px){.layout{display:block}.side{width:auto;height:auto;position:relative;overflow:visible}.grid,.content-grid,.form-grid{grid-template-columns:1fr}.main{padding:18px}}
 </style>
 """
 
@@ -3813,7 +3861,12 @@ TEMPLATE_SESSION_DETAIL = """
 """
 TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="attendance-list">""",
-    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" action="{{ url_for('add_last_minute_member', session_id=session.id) }}" class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:16px"><h3>Ajouter un adhérent de dernière minute</h3><div class="form-grid"><div class="field"><label>Nom / prénom</label><input name="member_search" list="member-options" placeholder="Commencer à saisir le nom ou prénom" required><datalist id="member-options">{% for option in member_options %}<option value="{{ option }}">{% endfor %}</datalist></div></div><br><button class="btn" type="submit">Ajouter à ce cours</button></form><div class="attendance-list">""",
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:16px"><h3>Ajouter une personne au cours</h3><div class="form-grid"><form method="post" action="{{ url_for('add_last_minute_member', session_id=session.id) }}"><div class="field"><label>Adhérent existant</label><input name="member_search" list="member-options" placeholder="Commencer à saisir le nom ou prénom" required><datalist id="member-options">{% for option in member_options %}<option value="{{ option }}">{% endfor %}</datalist></div><br><button class="btn" type="submit">Ajouter l'adhérent</button></form><form method="post" action="{{ url_for('add_trial_participant', session_id=session.id) }}"><div class="field"><label>Personne à l'essai</label><input name="trial_name" placeholder="Nom et prénom" required></div><br><button class="btn secondary" type="submit">Ajouter essai</button></form></div></div><div class="attendance-list">""",
+    1,
+)
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """<div class="muted">{{ b.user.email }}</div>""",
+    """<div class="muted">{{ user_contact_label(b.user) }}</div>""",
     1,
 )
 TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
@@ -3898,6 +3951,11 @@ TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
 TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
     """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}""",
     """<a class="btn secondary" href="{{ url_for('download_card', user_id=user.id) }}">Générer la carte</a> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Renouveler l'adhésion</h2><p class="muted">Ajoute une nouvelle période d'adhésion dans l'historique. Les tarifs sont figés à la date du renouvellement.</p><form method="post" action="{{ url_for('admin_renew_member', user_id=user.id) }}"><div class="form-grid"><div class="field"><label>Nouvel abonnement</label><select name="subscription_type" required>{% for opt in subscription_options %}<option>{{ opt }}</option>{% endfor %}</select></div><div class="field"><label>Année</label><input name="subscription_year" type="number" min="2024" max="2100" value="{{ current_year }}" required></div></div><br><button class="btn" type="submit">Renouveler</button></form><br><h3>Historique adhésions</h3><table class="table"><tr><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>{% for row in membership_periods %}{% set p = row.period %}<tr><td>{{ row.subscription_type }} {{ row.subscription_year }}</td><td>{{ p.start_date.strftime('%d/%m/%Y') }} - {{ p.end_date.strftime('%d/%m/%Y') }}</td><td>{{ '%.2f'|format(row.subscription_price or 0) }} €</td><td>{% if row.annual_fee %}{{ '%.2f'|format(row.annual_fee or 0) }} €{% else %}<span class="muted">Non</span>{% endif %}</td><td><strong>{{ '%.2f'|format(row.total or 0) }} €</strong></td><td>{{ p.created_by or '-' }}</td><td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun historique d'adhésion.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
+    1,
+)
+TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}""",
+    """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if user.account_status == 'archived' %}<div class="flash">Ce dossier est archivé. Utilisez le bloc “Renouveler l'adhésion” pour le réactiver et le faire réapparaître dans l'onglet Adhérents.</div>{% endif %}""",
     1,
 )
 

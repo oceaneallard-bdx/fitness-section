@@ -3843,7 +3843,6 @@ def shell(content, active=""):
             f'<a class="{"active" if active=="inventory" else ""}" href="{url_for("admin_inventory")}">Inventaire</a>'
             f'<a class="{"active" if active=="settings" else ""}" href="{url_for("admin_settings")}">Paramètres</a>'
             f'<a class="{"active" if active=="useful_info" else ""}" href="{url_for("useful_info")}">Infos utiles</a>'
-            f'<a class="{"active" if active=="blocked" else ""}" href="{url_for("blocked_members")}">Adhérents bloqués</a>'
             f'<a class="{"active" if active=="archives" else ""}" href="{url_for("admin_archives")}">Archives</a>'
             f'<a class="{"active" if active=="member_profile" else ""}" href="{url_for("member_profile")}">Mon profil adhérent</a>'
             f'<a class="{"active" if active=="member_coach_planning" else ""}" href="{url_for("member_coach_planning")}">Réserver mes cours</a>'
@@ -4043,7 +4042,7 @@ TEMPLATE_MEMBERS = """
 """
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
     """<a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a>""",
-    """<a class="btn" id="member-campaign-link" href="{{ url_for('admin_email_members') }}">Campagne email</a>""",
+    """<a class="btn" id="member-campaign-link" href="{{ url_for('admin_email_members') }}">Campagne email</a> <a class="btn secondary" href="{{ url_for('blocked_members') }}">Adhérents bloqués</a> <a class="btn secondary" href="{{ url_for('archived_members') }}">Archives adhérents</a>""",
     1,
 )
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(
@@ -4223,6 +4222,11 @@ TEMPLATE_BLOCKED = """
 TEMPLATE_BLOCKED = """
 {% set content %}<div class="card"><h1>Adhérents bloqués</h1><p class="muted">Suivi des blocages automatiques et des absences non excusées à corriger si besoin.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<h2>Comptes bloqués</h2><table class="table"><tr><th>Nom</th><th>Email</th><th>Jusqu'au</th><th>Motif</th><th>Absences 90j</th><th>Action</th></tr>{% for u in users %}<tr><td>{{ u.display_name() }}</td><td>{{ u.email }}</td><td>{{ u.blocked_until }}</td><td>{{ u.blocked_reason or '-' }}</td><td>{{ absence_count(u) }}</td><td><a class="btn" href="{{ url_for('unblock_member', user_id=u.id) }}">Débloquer</a></td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun adhérent bloqué.</td></tr>{% endfor %}</table><br><h2>Absences à vérifier</h2><p class="muted">Cette liste inclut les absences non excusées des 90 derniers jours, même si l'adhérent n'est pas encore bloqué.</p><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Adhérent</th><th>Email</th><th>Absences 90j</th><th>Action</th></tr>{% for b in recent_absences %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</td><td>{{ b.session.course_name }}</td><td>{{ b.user.display_name() }}</td><td>{{ b.user.email }}</td><td>{{ absence_count(b.user) }}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Voir cours</a> <a class="btn danger" href="{{ url_for('remove_unexcused_absence', booking_id=b.id) }}" onclick="return confirm('Retirer ce marquage absent ?')">Retirer absence</a></td></tr>{% else %}<tr><td colspan="7" class="muted">Aucune absence non excusée récente.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'blocked')|safe }}
 """
+TEMPLATE_BLOCKED = TEMPLATE_BLOCKED.replace(
+    """{{ shell(content, 'blocked')|safe }}""",
+    """{{ shell(content, 'members')|safe }}""",
+    1,
+)
 
 TEMPLATE_USEFUL_INFO = """
 {% set content %}<div class="card"><div class="top"><div><h1>Infos utiles</h1><p class="muted">Documents partagés par le Bureau Fitness.</p></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if current_user.role == 'admin' %}<form method="post" enctype="multipart/form-data" class="card" style="box-shadow:none;background:#f9fafb"><h3>Ajouter un document</h3><div class="form-grid"><div class="field"><label>Titre</label><input name="title" placeholder="Ex. Planning 2026"></div><div class="field"><label>Catégorie</label><input name="category" placeholder="Planning, adhésion, tarifs..."></div><div class="field" style="grid-column:1/-1"><label>Document</label><input name="document_file" type="file" accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx" required></div><div class="field" style="grid-column:1/-1"><label>Notes</label><input name="notes" placeholder="Information complémentaire facultative"></div></div><br><button class="btn" type="submit">Téléverser</button></form><br>{% endif %}<table class="table"><tr><th>Document</th><th>Catégorie</th><th>Notes</th><th>Ajouté le</th><th>Action</th></tr>{% for d in documents %}<tr><td><strong>{{ d.title }}</strong></td><td>{{ d.category or '-' }}</td><td>{{ d.notes or '' }}</td><td>{{ d.uploaded_at.strftime('%d/%m/%Y') if d.uploaded_at else '-' }}</td><td><a class="btn secondary" href="{{ url_for('static', filename=d.file_path) }}" target="_blank">Ouvrir</a>{% if current_user.role == 'admin' %} <a class="btn danger" href="{{ url_for('delete_useful_document', document_id=d.id) }}" onclick="return confirm('Retirer ce document des infos utiles ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucun document disponible pour le moment.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'useful_info')|safe }}
@@ -4526,6 +4530,21 @@ TEMPLATE_INVENTORY = """
 TEMPLATE_ARCHIVED_MEMBERS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Archives adhérents</h1><p class="muted">Dossiers adhérents archivés par année civile. Si une personne revient plus tard, ouvrez sa fiche puis renouvelez son adhésion.</p></div><a class="btn secondary" href="{{ url_for('admin_archives') }}">Archives des cours</a></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" class="card" style="box-shadow:none;background:#f9fafb"><h3>Rechercher dans les archives</h3><div class="form-grid"><div class="field"><label>Recherche</label><input name="search" value="{{ filter_values.search }}" placeholder="Nom, email, ID"></div><div class="field"><label>Année d'archivage</label><input name="archived_year" type="number" value="{{ filter_values.archived_year }}" placeholder="2026"></div><div class="field"><label>Année d'abonnement</label><input name="subscription_year" type="number" value="{{ filter_values.subscription_year }}" placeholder="2026"></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('archived_members') }}">Réinitialiser</a></form><br><table class="table"><tr><th>Nom</th><th>Email</th><th>Abonnement</th><th>Fin abonnement</th><th>Archivé le</th><th>Motif</th><th>Action</th></tr>{% for u in users %}<tr><td>{{ u.display_name() }}</td><td>{{ u.email }}</td><td>{{ u.subscription_type }} {{ u.subscription_year }}</td><td>{{ u.subscription_end_date or '-' }}</td><td>{{ u.archived_at or '-' }}</td><td>{{ u.archived_reason or '-' }}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Ouvrir / renouveler</a></td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun ancien adhérent archivé.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'archives')|safe }}
 """
+TEMPLATE_ARCHIVES = TEMPLATE_ARCHIVES.replace(
+    """<div><a class="btn secondary" href="{{ url_for('archived_members') }}">Archives adhérents</a></div>""",
+    "",
+    1,
+)
+TEMPLATE_ARCHIVED_MEMBERS = TEMPLATE_ARCHIVED_MEMBERS.replace(
+    """<a class="btn secondary" href="{{ url_for('admin_archives') }}">Archives des cours</a>""",
+    """<a class="btn secondary" href="{{ url_for('admin_members') }}">Retour adhérents</a>""",
+    1,
+)
+TEMPLATE_ARCHIVED_MEMBERS = TEMPLATE_ARCHIVED_MEMBERS.replace(
+    """{{ shell(content, 'archives')|safe }}""",
+    """{{ shell(content, 'members')|safe }}""",
+    1,
+)
 # -------------------- Gestion avancée admin : bureau, import, budget, inventaire, coachs --------------------
 
 WEEKDAY_LABELS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]

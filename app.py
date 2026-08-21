@@ -1610,6 +1610,18 @@ def absence_display_label(absence):
     return labels.get(absence.status, absence.status)
 
 
+def absence_planning_label(absence):
+    if not absence:
+        return ""
+    if absence.followup_status == "annule" or absence.status == "cancelled":
+        return "cours annulé"
+    if replacement_is_confirmed(absence):
+        return "remplacé"
+    if absence.status in ["absent", "conge"]:
+        return "absent"
+    return absence_display_label(absence)
+
+
 def absence_badge_class(absence):
     if not absence:
         return ""
@@ -1842,6 +1854,14 @@ def absence_target_sessions(coach_name, day):
     ).order_by(CourseSession.start_time).all()
 
 
+def coach_has_planned_course_on_day(coach_name, day):
+    return any((item[4] or "") == coach_name for item in planned_sessions_for_day(day))
+
+
+def inferred_absence_followup(replacement):
+    return "remplacement_trouve" if (replacement or "").strip() else "remplacement_a_trouver"
+
+
 def upsert_coach_absence(coach_name, day, status, replacement, notes, session=None, reset_followup=False):
     existing = CoachAbsence.query.filter_by(
         coach_name=coach_name,
@@ -1854,12 +1874,28 @@ def upsert_coach_absence(coach_name, day, status, replacement, notes, session=No
     existing.status = status
     existing.replacement_name = replacement
     existing.notes = notes
+    existing.followup_status = inferred_absence_followup(replacement)
     if reset_followup:
-        existing.followup_status = "a_traiter"
         existing.admin_notes = None
         existing.reviewed_at = None
         existing.reviewed_by = None
     return existing
+
+
+def upsert_coach_absences_for_period(coach_name, start_date, end_date, replacement, notes, reset_followup=False):
+    saved = 0
+    current_day = start_date
+    while current_day <= end_date:
+        target_sessions = absence_target_sessions(coach_name, current_day)
+        if target_sessions:
+            for session in target_sessions:
+                upsert_coach_absence(coach_name, current_day, "absent", replacement, notes, session=session, reset_followup=reset_followup)
+                saved += 1
+        elif coach_has_planned_course_on_day(coach_name, current_day):
+            upsert_coach_absence(coach_name, current_day, "absent", replacement, notes, session=None, reset_followup=reset_followup)
+            saved += 1
+        current_day += timedelta(days=1)
+    return saved
 
 
 @app.context_processor
@@ -1869,6 +1905,7 @@ def template_helpers():
         "absence_blocks_booking": absence_blocks_booking,
         "absence_display_label": absence_display_label,
         "absence_for_session": absence_for_session,
+        "absence_planning_label": absence_planning_label,
         "absence_session_label": absence_session_label,
         "absence_session_options": absence_session_options,
         "attendance_badge_class": attendance_badge_class,
@@ -3367,30 +3404,19 @@ def coach_profile():
         if end_date < start_date:
             flash("La date de fin doit être postérieure ou égale à la date de début.")
             return redirect(url_for("coach_profile", coach_name=coach_name))
-        status = request.form.get("status", "absent")
         replacement = request.form.get("replacement_name", "").strip()
         notes = request.form.get("notes", "").strip()
-        current_day = start_date
-        saved = 0
-        while current_day <= end_date:
-            target_sessions = absence_target_sessions(coach_name, current_day)
-            if target_sessions:
-                for session in target_sessions:
-                    upsert_coach_absence(coach_name, current_day, status, replacement, notes, session=session, reset_followup=current_user.role == "coach")
-                    saved += 1
-            else:
-                pass
-            current_day += timedelta(days=1)
+        saved = upsert_coach_absences_for_period(coach_name, start_date, end_date, replacement, notes, reset_followup=current_user.role == "coach")
         db.session.commit()
         if saved == 0:
             flash("Aucune absence créée : aucun cours n'existe pour cette coach sur la période sélectionnée.")
             return redirect(url_for("coach_profile", coach_name=coach_name))
         if current_user.role == "coach":
-            sent = notify_admins_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
-            member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
+            sent = notify_admins_of_coach_absence(coach_name, start_date, end_date, "absent", replacement, notes)
+            member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, "absent", replacement, notes)
             flash(f"Absence/congé enregistré sur {saved} jour(s). Email envoyé à {sent} admin(s) et {member_sent} adhérent(s) inscrit(s)." if sent or member_sent else f"Absence/congé enregistré sur {saved} jour(s). Aucun email envoyé.")
         else:
-            member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
+            member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, "absent", replacement, notes)
             flash(f"Absence/congé enregistré sur {saved} jour(s). Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else f"Absence/congé enregistré sur {saved} jour(s).")
         return redirect(url_for("coach_profile", coach_name=coach_name))
     today = date.today()
@@ -4414,6 +4440,33 @@ TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
     """<select name="followup_status"><option value="remplacement_a_trouver" {% if a.followup_status in ['remplacement_a_trouver','a_traiter','en_cours','valide','refuse'] %}selected{% endif %}>Remplacement à trouver</option><option value="remplacement_trouve" {% if a.followup_status == 'remplacement_trouve' %}selected{% endif %}>Remplacement trouvé</option><option value="annule" {% if a.followup_status == 'annule' %}selected{% endif %}>Annulé</option></select>""",
     1,
 )
+TEMPLATE_COACH_PROFILE = TEMPLATE_COACH_PROFILE.replace(
+    """<div class="field"><label>Type</label><select name="status"><option value="absent">Absence</option><option value="conge">Congé</option><option value="replaced">Remplacé</option></select></div>""",
+    "",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """<div class="field"><label>Statut</label><select name="status"><option value="absent">Absent</option><option value="conge">Congé</option><option value="present">Présent</option><option value="replaced">Remplacé</option></select></div>""",
+    "",
+    1,
+)
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace(
+    """{{ absence_display_label(a) }}""",
+    """{{ absence_planning_label(a) }}""",
+    1,
+)
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(
+    """{% set a = abs_by_key.get((coach, day)) %}""",
+    """{% set a = absence_for_session(abs_by_key, s) %}""",
+)
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(
+    """<span class="badge {% if a.status in ['absent','conge'] %}full{% elif a.status == 'replaced' %}wait{% endif %}">{{ a.status }}</span>""",
+    """<span class="badge {{ absence_badge_class(a) }}">{{ absence_planning_label(a) }}</span>""",
+)
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace(
+    """{% elif a and a.status in ['absent','conge'] %}<span class="badge full">Indisponible</span>""",
+    """{% elif a and absence_blocks_booking(a) %}<span class="badge full">Indisponible</span>""",
+)
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
     """<div class="field"><label>Nom du coach</label><input name="coach_name" required></div>""",
     """<div class="field"><label>Nom du coach</label><select name="coach_name" required>{% for c in coach_options %}<option>{{ c }}</option>{% endfor %}</select></div>""",
@@ -4756,25 +4809,14 @@ def admin_coach_planning():
         if end_date < start_date:
             flash("La date de fin doit être postérieure ou égale à la date de début.")
             return redirect(url_for("admin_coach_planning", view_mode=view_mode, start_date=start.isoformat(), end_date=end.isoformat(), year=year, month=month))
-        status = request.form.get("status", "absent")
         replacement = request.form.get("replacement_name", "").strip()
         notes = request.form.get("notes", "").strip()
-        current_day = start_date
-        saved = 0
-        while current_day <= end_date:
-            target_sessions = absence_target_sessions(coach_name, current_day)
-            if target_sessions:
-                for session in target_sessions:
-                    upsert_coach_absence(coach_name, current_day, status, replacement, notes, session=session)
-                    saved += 1
-            else:
-                pass
-            current_day += timedelta(days=1)
+        saved = upsert_coach_absences_for_period(coach_name, start_date, end_date, replacement, notes)
         db.session.commit()
         if saved == 0:
             flash("Aucune absence créée : aucun cours n'existe pour cette coach sur la période sélectionnée.")
             return redirect(url_for("admin_coach_planning", view_mode=view_mode, start_date=start.isoformat(), end_date=end.isoformat(), year=year, month=month))
-        member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, status, replacement, notes)
+        member_sent = notify_members_of_coach_absence(coach_name, start_date, end_date, "absent", replacement, notes)
         flash(f"Planning coach mis à jour sur {saved} jour(s). Email envoyé à {member_sent} adhérent(s) inscrit(s)." if member_sent else f"Planning coach mis à jour sur {saved} jour(s).")
         return redirect(url_for("admin_coach_planning", view_mode=view_mode, start_date=start.isoformat(), end_date=end.isoformat(), year=year, month=month))
     sessions = CourseSession.query.filter(CourseSession.course_date >= start, CourseSession.course_date <= end).order_by(CourseSession.course_date, CourseSession.start_time).all()

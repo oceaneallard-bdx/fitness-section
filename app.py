@@ -2026,14 +2026,11 @@ def preference_stats():
 def section_admin_stats():
     users = active_member_query().all()
     annual = {}
-    subscriptions = {}
     profiles = {}
     status_counts = {}
     for user in users:
         year = user.subscription_year or (user.created_at.year if user.created_at else date.today().year)
         annual[year] = annual.get(year, 0) + 1
-        if user.subscription_type:
-            subscriptions[user.subscription_type] = subscriptions.get(user.subscription_type, 0) + 1
         profile = member_profile_label(user.member_profile)
         profiles[profile] = profiles.get(profile, 0) + 1
         status_counts[user.status or "autre"] = status_counts.get(user.status or "autre", 0) + 1
@@ -2046,6 +2043,17 @@ def section_admin_stats():
         annual_rows.append({"year": year, "count": count, "evolution": evolution})
         previous = count
 
+    period_rows = db.session.query(MembershipPeriod.subscription_type, db.func.count(MembershipPeriod.id)).join(User).filter(
+        User.role.in_(["adherent", "admin"]),
+        User.account_status != "archived",
+    ).group_by(MembershipPeriod.subscription_type).all()
+    subscriptions = {normalize_subscription_type(label): count for label, count in period_rows if label}
+    if not subscriptions:
+        for user in users:
+            if user.subscription_type:
+                label = normalize_subscription_type(user.subscription_type)
+                subscriptions[label] = subscriptions.get(label, 0) + 1
+
     return {
         "annual": annual_rows,
         "subscriptions": sorted(subscriptions.items(), key=lambda item: (-item[1], item[0])),
@@ -2054,14 +2062,31 @@ def section_admin_stats():
     }
 
 
-def course_booking_stats(start, end, course_filter=""):
+def selected_course_filters(args):
+    return [value.strip() for value in args.getlist("course_filter") if value and value.strip()]
+
+
+def normalize_course_filters(course_filter):
+    if not course_filter:
+        return []
+    if isinstance(course_filter, str):
+        return [course_filter.strip()] if course_filter.strip() else []
+    return [str(value).strip() for value in course_filter if str(value).strip()]
+
+
+def filtered_sessions_query(start, end, course_filter=None):
     query = db.session.query(CourseSession).filter(
         CourseSession.course_date >= start,
         CourseSession.course_date <= end,
     )
-    if course_filter:
-        query = query.filter(CourseSession.course_name == course_filter)
-    sessions = query.order_by(CourseSession.course_date, CourseSession.start_time).all()
+    course_filters = normalize_course_filters(course_filter)
+    if course_filters:
+        query = query.filter(CourseSession.course_name.in_(course_filters))
+    return query
+
+
+def course_booking_stats(start, end, course_filter=""):
+    sessions = filtered_sessions_query(start, end, course_filter).order_by(CourseSession.course_date, CourseSession.start_time).all()
     rows = []
     monthly = {}
     for session in sessions:
@@ -2101,6 +2126,32 @@ def course_booking_stats(start, end, course_filter=""):
         item["ratio_mensuel"] = (item["mensuels"] / item["booked"] * 100) if item["booked"] else 0
         monthly_rows.append(item)
     return rows, monthly_rows
+
+
+def statistics_period_summary(start, end, course_filter=None):
+    sessions = filtered_sessions_query(start, end, course_filter).all()
+    session_ids = [session.id for session in sessions]
+    bookings = Booking.query.filter(Booking.session_id.in_(session_ids)).all() if session_ids else []
+    confirmed = [b for b in bookings if b.status in ["booked", "absent_unexcused"]]
+    waiting = [b for b in bookings if b.status == "waiting_list"]
+    cancelled = [b for b in bookings if b.status == "cancelled"]
+    last_minute_cancelled = [b for b in cancelled if is_last_minute_cancellation(b)]
+    promoted = [b for b in bookings if b.promoted_from_waitlist_at]
+    absent = [b for b in bookings if b.status == "absent_unexcused" or b.attendance_status == "absent"]
+    waitlist_total = len(waiting) + len(promoted)
+    member_ids = {b.user_id for b in bookings if b.status in ["booked", "waiting_list", "absent_unexcused", "cancelled"]}
+    return {
+        "members": len(member_ids),
+        "sessions": len(sessions),
+        "reservable_sessions": len([s for s in sessions if s.is_reservable]),
+        "bookings": len(confirmed),
+        "last_minute_cancelled": len(last_minute_cancelled),
+        "waiting": len(waiting),
+        "promoted": len(promoted),
+        "promoted_rate": (len(promoted) / waitlist_total * 100) if waitlist_total else 0,
+        "absent": len(absent),
+        "absent_rate": (len(absent) / len(confirmed) * 100) if confirmed else 0,
+    }
 
 
 def course_name_options():
@@ -2459,8 +2510,9 @@ def admin_statistics():
     stats_end = parse_iso_date(request.args.get("end_date", ""), default_end)
     if stats_end < stats_start:
         stats_end = stats_start
-    course_filter = request.args.get("course_filter", "").strip()
+    course_filter = selected_course_filters(request.args)
     course_rows, course_monthly_rows = course_booking_stats(stats_start, stats_end, course_filter)
+    period_stats = statistics_period_summary(stats_start, stats_end, course_filter)
     stats = {
         "today_sessions": CourseSession.query.filter_by(course_date=date.today()).count(),
         "bookings": Booking.query.filter(Booking.status.in_(["booked", "waiting_list"])).count(),
@@ -2468,7 +2520,7 @@ def admin_statistics():
         "blocked": User.query.filter(User.blocked_until >= date.today()).count()
     }
     filter_values = {"start_date": stats_start.isoformat(), "end_date": stats_end.isoformat(), "course_filter": course_filter}
-    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values)
+    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), period_stats=period_stats, course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values)
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -3721,7 +3773,7 @@ def export_statistics_excel():
     end = parse_iso_date(request.args.get("end_date", ""), date(today.year, today.month, monthrange(today.year, today.month)[1]))
     if end < start:
         end = start
-    course_filter = request.args.get("course_filter", "").strip()
+    course_filter = selected_course_filters(request.args)
     rows, monthly_rows = course_booking_stats(start, end, course_filter)
     wb = Workbook()
     ws = wb.active
@@ -4208,6 +4260,70 @@ TEMPLATE_STATISTICS = """
 {% set content %}<div class="card"><h1>Statistiques</h1><p class="muted">Données utiles pour piloter la section Fitness.</p><div class="grid"><div class="card"><span class="muted">Séances aujourd'hui</span><div class="stat">{{ stats.today_sessions }}</div></div><div class="card"><span class="muted">Réservations</span><div class="stat">{{ stats.bookings }}</div></div><div class="card"><span class="muted">Adhérents</span><div class="stat">{{ stats.members }}</div></div><div class="card"><span class="muted">Bloqués</span><div class="stat">{{ stats.blocked }}</div></div></div><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Statistiques réservations par cours</h2><form method="get"><div class="form-grid"><div class="field"><label>Début</label><input type="date" name="start_date" value="{{ filter_values.start_date }}"></div><div class="field"><label>Fin</label><input type="date" name="end_date" value="{{ filter_values.end_date }}"></div><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in course_options %}<option value="{{ name }}" {% if filter_values.course_filter == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn secondary" type="submit">Filtrer</button> <a class="btn" href="{{ url_for('export_statistics_excel', start_date=filter_values.start_date, end_date=filter_values.end_date, course_filter=filter_values.course_filter) }}">Exporter Excel</a></form><br><h3>Résumé mensuel</h3><table class="table"><tr><th>Mois</th><th>Séances</th><th>Réservations</th><th>Mensuels</th><th>Liste attente</th><th>Ratio mensuels</th></tr>{% for row in course_monthly_rows %}<tr><td>{{ row.month }}</td><td>{{ row.sessions }}</td><td>{{ row.booked }}</td><td>{{ row.mensuels }}</td><td>{{ row.waiting }}</td><td>{{ '%.1f'|format(row.ratio_mensuel) }} %</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table><br><h3>Détail par cours</h3><table class="table"><tr><th>Date</th><th>Cours</th><th>Coach</th><th>Horaire</th><th>Jauge</th><th>Réservés</th><th>Attente</th><th>Absents</th><th>Mensuels</th><th>Cadres/autres</th><th>Ratio mensuels</th><th>Remplissage</th></tr>{% for row in course_rows %}<tr><td>{{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.course }}</td><td>{{ row.coach }}</td><td>{{ row.time }}</td><td>{{ row.capacity }}</td><td><strong>{{ row.booked }}</strong></td><td>{{ row.waiting }}</td><td>{{ row.absent }}</td><td>{{ row.mensuels }}</td><td>{{ row.cadres_autres }}</td><td>{{ '%.1f'|format(row.ratio_mensuel) }} %</td><td>{{ '%.1f'|format(row.fill_rate) }} %</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun cours sur cette période.</td></tr>{% endfor %}</table></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Préférences adhérents</h2><div class="grid"><div><h3>Cours</h3><table class="table">{% for label, count in preference_stats.course %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Coachs</h3><table class="table">{% for label, count in preference_stats.coach %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Créneaux</h3><table class="table">{% for label, count in preference_stats.slot %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div></div></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Statistiques section</h2><div class="grid"><div><h3>Adhérents par année</h3><table class="table"><tr><th>Année</th><th>Adhérents</th><th>Évolution</th></tr>{% for row in section_stats.annual %}<tr><td>{{ row.year }}</td><td><strong>{{ row.count }}</strong></td><td>{% if row.evolution is none %}<span class="muted">-</span>{% else %}{{ '%+.1f'|format(row.evolution) }} %{% endif %}</td></tr>{% else %}<tr><td class="muted" colspan="3">Aucune donnée</td></tr>{% endfor %}</table></div><div><h3>Abonnements</h3><table class="table">{% for label, count in section_stats.subscriptions %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Profils</h3><table class="table">{% for label, count in section_stats.profiles %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div><div><h3>Statuts</h3><table class="table">{% for label, count in section_stats.statuses %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div></div></div></div>{% endset %}{{ shell(content, 'statistics')|safe }}
 """
 
+TEMPLATE_STATISTICS = """
+{% set content %}
+<div class="card">
+    <h1>Statistiques</h1>
+    <p class="muted">Données utiles pour piloter la section Fitness.</p>
+    <div class="grid">
+        <div class="card"><span class="muted">Séances aujourd'hui</span><div class="stat">{{ stats.today_sessions }}</div></div>
+        <div class="card"><span class="muted">Réservations</span><div class="stat">{{ stats.bookings }}</div></div>
+        <div class="card"><span class="muted">Adhérents</span><div class="stat">{{ stats.members }}</div></div>
+        <div class="card"><span class="muted">Bloqués</span><div class="stat">{{ stats.blocked }}</div></div>
+    </div>
+    <div class="card" style="box-shadow:none;background:#f9fafb">
+        <h2>Statistiques section</h2>
+        <div class="grid">
+            <div><h3>Adhérents par année</h3><table class="table"><tr><th>Année</th><th>Adhérents</th><th>Évolution</th></tr>{% for row in section_stats.annual %}<tr><td>{{ row.year }}</td><td><strong>{{ row.count }}</strong></td><td>{% if row.evolution is none %}<span class="muted">-</span>{% else %}{{ '%+.1f'|format(row.evolution) }} %{% endif %}</td></tr>{% else %}<tr><td class="muted" colspan="3">Aucune donnée</td></tr>{% endfor %}</table></div>
+            <div><h3>Abonnements</h3><table class="table">{% for label, count in section_stats.subscriptions %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div>
+            <div><h3>Profils</h3><table class="table">{% for label, count in section_stats.profiles %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div>
+            <div><h3>Statuts</h3><table class="table">{% for label, count in section_stats.statuses %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div>
+        </div>
+    </div>
+    <br>
+    <div class="card" style="box-shadow:none;background:#f9fafb">
+        <h2>Préférences adhérents</h2>
+        <div class="grid">
+            <div><h3>Cours</h3><table class="table">{% for label, count in preference_stats.course %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div>
+            <div><h3>Coachs</h3><table class="table">{% for label, count in preference_stats.coach %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div>
+            <div><h3>Créneaux</h3><table class="table">{% for label, count in preference_stats.slot %}<tr><td>{{ label }}</td><td><strong>{{ count }}</strong></td></tr>{% else %}<tr><td class="muted">Aucune donnée</td><td></td></tr>{% endfor %}</table></div>
+        </div>
+    </div>
+    <br>
+    <div class="card" style="box-shadow:none;background:#f9fafb">
+        <h2>Statistiques période filtrée</h2>
+        <form method="get">
+            <div class="form-grid">
+                <div class="field"><label>Début</label><input type="date" name="start_date" value="{{ filter_values.start_date }}"></div>
+                <div class="field"><label>Fin</label><input type="date" name="end_date" value="{{ filter_values.end_date }}"></div>
+                <div class="field"><label>Cours</label><select name="course_filter" multiple size="6"><option value="" {% if not filter_values.course_filter %}selected{% endif %}>Tous les cours</option>{% for name in course_options %}<option value="{{ name }}" {% if name in filter_values.course_filter %}selected{% endif %}>{{ name }}</option>{% endfor %}</select><small class="muted">Laisser vide ou choisir “Tous les cours” pour tout afficher.</small></div>
+            </div>
+            <br><button class="btn secondary" type="submit">Filtrer</button> <button class="btn" type="submit" formaction="{{ url_for('export_statistics_excel') }}" formmethod="get">Exporter Excel</button>
+        </form>
+        <br>
+        <div class="grid">
+            <div class="card"><span class="muted">Adhérents avec réservation</span><div class="stat">{{ period_stats.members }}</div></div>
+            <div class="card"><span class="muted">Cours</span><div class="stat">{{ period_stats.sessions }}</div><small class="muted">dont {{ period_stats.reservable_sessions }} avec réservation</small></div>
+            <div class="card"><span class="muted">Réservations confirmées</span><div class="stat">{{ period_stats.bookings }}</div></div>
+            <div class="card"><span class="muted">Annulations < 24h</span><div class="stat">{{ period_stats.last_minute_cancelled }}</div></div>
+            <div class="card"><span class="muted">Liste d'attente</span><div class="stat">{{ period_stats.waiting }}</div></div>
+            <div class="card"><span class="muted">Promotions liste d'attente</span><div class="stat">{{ period_stats.promoted }}</div><small class="muted">{{ '%.1f'|format(period_stats.promoted_rate) }} % promus</small></div>
+            <div class="card"><span class="muted">Absents non excusés</span><div class="stat">{{ period_stats.absent }}</div><small class="muted">{{ '%.1f'|format(period_stats.absent_rate) }} % des réservations confirmées</small></div>
+        </div>
+    </div>
+    <br>
+    <div class="card" style="box-shadow:none;background:#f9fafb">
+        <h2>Statistiques réservations par cours</h2>
+        <h3>Résumé mensuel</h3>
+        <table class="table"><tr><th>Mois</th><th>Séances</th><th>Réservations</th><th>Mensuels</th><th>Liste attente</th><th>Ratio mensuels</th></tr>{% for row in course_monthly_rows %}<tr><td>{{ row.month }}</td><td>{{ row.sessions }}</td><td>{{ row.booked }}</td><td>{{ row.mensuels }}</td><td>{{ row.waiting }}</td><td>{{ '%.1f'|format(row.ratio_mensuel) }} %</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune donnée sur cette période.</td></tr>{% endfor %}</table>
+        <br>
+        <h3>Détail par cours</h3>
+        <table class="table"><tr><th>Date</th><th>Cours</th><th>Coach</th><th>Horaire</th><th>Jauge</th><th>Réservés</th><th>Attente</th><th>Absents</th><th>Mensuels</th><th>Cadres/autres</th><th>Ratio mensuels</th><th>Remplissage</th></tr>{% for row in course_rows %}<tr><td>{{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.course }}</td><td>{{ row.coach }}</td><td>{{ row.time }}</td><td>{{ row.capacity }}</td><td><strong>{{ row.booked }}</strong></td><td>{{ row.waiting }}</td><td>{{ row.absent }}</td><td>{{ row.mensuels }}</td><td>{{ row.cadres_autres }}</td><td>{{ '%.1f'|format(row.ratio_mensuel) }} %</td><td>{{ '%.1f'|format(row.fill_rate) }} %</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun cours sur cette période.</td></tr>{% endfor %}</table>
+    </div>
+</div>
+{% endset %}{{ shell(content, 'statistics')|safe }}
+"""
+
 TEMPLATE_ARCHIVES = """
 {% set content %}<div class="card"><div class="top"><div><h1>Archives des cours</h1><p class="muted">Listes de réservation des cours passés, absences, annulations et suivi de liste d'attente.</p></div><div><a class="btn secondary" href="{{ url_for('archived_members') }}">Archives adhérents</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" class="card" style="box-shadow:none;background:#f9fafb"><h3>Filtres</h3><div class="form-grid"><div class="field"><label>Début</label><input name="start_date" type="date" value="{{ filter_values.start_date }}"></div><div class="field"><label>Fin</label><input name="end_date" type="date" value="{{ filter_values.end_date }}"></div><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in course_options %}<option value="{{ name }}" {% if filter_values.course_filter == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn secondary" type="submit">Afficher</button> <a class="btn" href="{{ url_for('export_archived_reservations', start_date=filter_values.start_date, end_date=filter_values.end_date, course_filter=filter_values.course_filter) }}">Exporter Excel</a></form><br><div class="grid"><div class="card"><span class="muted">Cours passés</span><div class="stat">{{ totals.sessions }}</div></div><div class="card"><span class="muted">Réservations archivées</span><div class="stat">{{ totals.reservations }}</div></div><div class="card"><span class="muted">% absents</span><div class="stat">{{ '%.1f'|format(totals.absent_rate) }} %</div><small class="muted">{{ totals.absent }} absence(s) non excusée(s)</small></div><div class="card"><span class="muted">Annulations dernière minute</span><div class="stat">{{ totals.last_minute_cancelled }}</div><small class="muted">Dans les 24h avant le cours, sur les annulations datées</small></div></div><div class="grid"><div class="card"><span class="muted">Annulations</span><div class="stat">{{ totals.cancelled }}</div></div><div class="card"><span class="muted">Promotions liste d'attente</span><div class="stat">{{ totals.promoted }}</div><small class="muted">Passages liste d'attente vers réservation confirmée</small></div><div class="card"><span class="muted">Liste attente non appelée</span><div class="stat">{{ totals.waiting_not_promoted }}</div></div><div class="card"><span class="muted">% annulations dernière minute</span><div class="stat">{{ '%.1f'|format(totals.last_minute_cancel_rate) }} %</div></div></div><h2>Listes par cours passé</h2>{% for row in rows %}{% set s = row.session %}<details class="card" style="box-shadow:none;background:#f9fafb;margin:14px 0" {% if loop.first %}open{% endif %}><summary style="cursor:pointer;font-weight:800">{{ s.course_date.strftime('%d/%m/%Y') }} · {{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }} · {{ s.course_name }}{% if s.coach_name %} · {{ s.coach_name }}{% endif %}</summary><br><div class="grid"><div><span class="badge">{{ row.booked_count }} réservé(s) / présent(s)</span></div><div><span class="badge full">{{ row.absent_count }} absent(s)</span></div><div><span class="badge wait">{{ row.cancelled_count }} annulation(s)</span></div><div><span class="badge">{{ '%.1f'|format(row.absent_rate) }} % absents</span></div></div><table class="table"><tr><th>Adhérent</th><th>Email</th><th>Statut</th><th>Inscription</th><th>Annulation</th><th>Liste d'attente</th></tr>{% for b in row.bookings %}<tr><td>{{ b.user.display_name() }}</td><td>{{ b.user.email }}</td><td>{% set label = booking_archive_status_label(b) %}<span class="badge {% if b.status == 'absent_unexcused' or b.attendance_status == 'absent' %}full{% elif b.status in ['waiting_list','cancelled'] %}wait{% endif %}">{{ label }}</span>{% if is_last_minute_cancellation(b) %}<br><small class="muted">Annulation dernière minute</small>{% endif %}</td><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td><td>{{ b.cancelled_at.strftime('%d/%m/%Y %H:%M') if b.cancelled_at else '-' }}</td><td>{% if b.promoted_from_waitlist_at %}<span class="badge">Promu le {{ b.promoted_from_waitlist_at.strftime('%d/%m/%Y %H:%M') }}</span>{% elif b.status == 'waiting_list' %}<span class="badge wait">Non appelé</span>{% else %}<span class="muted">-</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucune réservation enregistrée pour ce cours.</td></tr>{% endfor %}</table></details>{% else %}<p class="muted">Aucun cours passé sur cette période.</p>{% endfor %}</div>{% endset %}{{ shell(content, 'archives')|safe }}
 """
@@ -4533,6 +4649,11 @@ TEMPLATE_ARCHIVED_MEMBERS = """
 TEMPLATE_ARCHIVES = TEMPLATE_ARCHIVES.replace(
     """<div><a class="btn secondary" href="{{ url_for('archived_members') }}">Archives adhérents</a></div>""",
     "",
+    1,
+)
+TEMPLATE_ARCHIVES = TEMPLATE_ARCHIVES.replace(
+    """</form><br><div class="grid"><div class="card"><span class="muted">Cours passés</span><div class="stat">{{ totals.sessions }}</div></div><div class="card"><span class="muted">Réservations archivées</span><div class="stat">{{ totals.reservations }}</div></div><div class="card"><span class="muted">% absents</span><div class="stat">{{ '%.1f'|format(totals.absent_rate) }} %</div><small class="muted">{{ totals.absent }} absence(s) non excusée(s)</small></div><div class="card"><span class="muted">Annulations dernière minute</span><div class="stat">{{ totals.last_minute_cancelled }}</div><small class="muted">Dans les 24h avant le cours, sur les annulations datées</small></div></div><div class="grid"><div class="card"><span class="muted">Annulations</span><div class="stat">{{ totals.cancelled }}</div></div><div class="card"><span class="muted">Promotions liste d'attente</span><div class="stat">{{ totals.promoted }}</div><small class="muted">Passages liste d'attente vers réservation confirmée</small></div><div class="card"><span class="muted">Liste attente non appelée</span><div class="stat">{{ totals.waiting_not_promoted }}</div></div><div class="card"><span class="muted">% annulations dernière minute</span><div class="stat">{{ '%.1f'|format(totals.last_minute_cancel_rate) }} %</div></div></div><h2>Listes par cours passé</h2>""",
+    """</form><br><h2>Listes par cours passé</h2>""",
     1,
 )
 TEMPLATE_ARCHIVED_MEMBERS = TEMPLATE_ARCHIVED_MEMBERS.replace(

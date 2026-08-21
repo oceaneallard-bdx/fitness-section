@@ -18,7 +18,7 @@ import certifi
 from email.utils import formataddr, parseaddr
 from email.message import EmailMessage
 
-from flask import Flask, render_template_string, redirect, url_for, request, flash, send_file
+from flask import Flask, render_template_string, redirect, url_for, request, flash, send_file, session as flask_session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -1044,7 +1044,7 @@ def send_member_campaign_async(user_ids, subject, signed_body, signed_html):
             excluded_emails = campaign_excluded_emails()
             users = User.query.filter(User.id.in_(user_ids), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
             for user in users:
-                if (user.email or "").strip().lower() in excluded_emails:
+                if user.role != "admin" and (user.email or "").strip().lower() in excluded_emails:
                     continue
                 if send_email(user.email, subject, signed_body, html_body=signed_html):
                     sent_count += 1
@@ -1061,6 +1061,56 @@ def campaign_excluded_emails():
     if sender_email:
         excluded_emails.add(sender_email.lower())
     return excluded_emails
+
+
+def campaign_role_label(role):
+    return {
+        "adherent": "adhérents",
+        "admin": "admins",
+        "coach": "coachs",
+    }.get(role, role)
+
+
+def campaign_target_summary(target_roles, selected_ids):
+    labels = [campaign_role_label(role) for role in target_roles]
+    summary = ", ".join(labels) if labels else "aucun groupe"
+    if selected_ids and "adherent" in target_roles:
+        summary = f"adhérents sélectionnés" + (", admins" if "admin" in target_roles else "")
+        extra_roles = [role for role in target_roles if role not in {"adherent", "admin"}]
+        if extra_roles:
+            summary += ", " + ", ".join(campaign_role_label(role) for role in extra_roles)
+    if "adherent" in target_roles and "admin" in target_roles:
+        summary += " (les admins reçoivent aussi les campagnes adhérents)"
+    return summary
+
+
+def campaign_target_users(selected_ids, target_roles):
+    selected_member_ids = [int(i) for i in selected_ids if str(i).isdigit()]
+    filters = [User.account_status != "archived"]
+    role_filters = []
+    if selected_member_ids and "adherent" in target_roles:
+        role_filters.append(db.and_(User.id.in_(selected_member_ids), User.role.in_(["adherent", "admin"])))
+    elif "adherent" in target_roles:
+        role_filters.append(User.role == "adherent")
+    non_adherent_roles = [role for role in target_roles if role != "adherent"]
+    if non_adherent_roles:
+        role_filters.append(User.role.in_(non_adherent_roles))
+    if "adherent" in target_roles:
+        role_filters.append(User.role == "admin")
+    if not role_filters:
+        return []
+    users = User.query.filter(*filters, db.or_(*role_filters)).order_by(User.role, User.full_name, User.email).all()
+    excluded_emails = campaign_excluded_emails()
+    unique_users = []
+    seen = set()
+    for user in users:
+        if user.id in seen:
+            continue
+        if user.role != "admin" and (user.email or "").strip().lower() in excluded_emails:
+            continue
+        seen.add(user.id)
+        unique_users.append(user)
+    return unique_users
 
 
 def notify_admins_of_coach_absence(coach_name, start_date, end_date, status, replacement_name="", notes=""):
@@ -2574,6 +2624,46 @@ def login():
     return render_template_string(TEMPLATE_LOGIN)
 
 
+@app.route("/admin/demo-view/<role>")
+@login_required
+def admin_demo_view(role):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    demo_email_by_role = {
+        "adherent": DEMO_ADHERENT_EMAIL,
+        "coach": DEMO_COACH_EMAIL,
+    }
+    demo_email = demo_email_by_role.get(role)
+    if not demo_email:
+        flash("Vue démo inconnue.")
+        return redirect(url_for("index"))
+    demo_user = User.query.filter_by(email=demo_email).first()
+    if not demo_user:
+        flash("Compte démo introuvable.")
+        return redirect(url_for("index"))
+    flask_session["admin_impersonator_id"] = current_user.id
+    login_user(demo_user)
+    flash("Vue démo activée.")
+    return redirect(url_for("index"))
+
+
+@app.route("/admin/demo-view/stop")
+@login_required
+def stop_demo_view():
+    admin_id = flask_session.pop("admin_impersonator_id", None)
+    if not admin_id:
+        flash("Aucune vue démo active.")
+        return redirect(url_for("index"))
+    admin_user = db.session.get(User, admin_id)
+    if not admin_user or admin_user.role != "admin":
+        flash("Compte admin d'origine introuvable.")
+        return redirect(url_for("logout"))
+    login_user(admin_user)
+    flash("Retour au profil admin.")
+    return redirect(url_for("index"))
+
+
 @app.route("/coach", methods=["GET", "POST"])
 def coach_login():
     flash("Les coachs se connectent maintenant depuis la page de connexion principale.")
@@ -3481,27 +3571,24 @@ def admin_email_members():
     target_roles = request.values.getlist("target_roles") or ["adherent"]
     valid_roles = {"adherent", "admin", "coach"}
     target_roles = [role for role in target_roles if role in valid_roles] or ["adherent"]
-    if selected_ids:
-        selected_member_ids = [int(i) for i in selected_ids if str(i).isdigit()]
-        users = User.query.filter(User.id.in_(selected_member_ids), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all() if selected_member_ids else []
-    else:
-        users = User.query.filter(User.role.in_(target_roles), User.account_status != "archived").order_by(User.role, User.full_name, User.email).all()
-    excluded_emails = campaign_excluded_emails()
-    users = [u for u in users if (u.email or "").strip().lower() not in excluded_emails]
+    if "adherent" in target_roles and "admin" not in target_roles:
+        target_roles.append("admin")
+    users = campaign_target_users(selected_ids, target_roles)
+    target_summary = campaign_target_summary(target_roles, selected_ids)
     if request.method == "POST":
         subject = request.form["subject"].strip()
         body = request.form["body"].strip()
         if not subject or not body:
             flash("Merci de renseigner un objet et un message.")
-            return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles)
+            return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles, target_summary=target_summary)
         signed_body = admin_email_signature_body(body)
         logo_url = url_for("static", filename="logo.png", _external=True) if LOGO_PATH.exists() else ""
         signed_html = admin_email_signature_html(body, logo_url=logo_url)
         user_ids = [u.id for u in users]
         send_member_campaign_async(user_ids, subject, signed_body, signed_html)
-        flash(f"Campagne email lancée pour {len(user_ids)} destinataire(s). L'envoi continue en arrière-plan pour éviter une erreur serveur.")
+        flash(f"Campagne email lancée pour {len(user_ids)} destinataire(s) : {target_summary}. L'envoi continue en arrière-plan pour éviter une erreur serveur.")
         return redirect(url_for("admin_members"))
-    return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles)
+    return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles, target_summary=target_summary)
 
 
 @app.route("/admin/blocked")
@@ -3712,6 +3799,13 @@ BASE_TEMPLATE_STYLE = """
 
 def shell(content, active=""):
     logo = url_for('static', filename='logo.png') if LOGO_PATH.exists() else ''
+    demo_banner = ""
+    if current_user.is_authenticated and flask_session.get("admin_impersonator_id"):
+        demo_banner = (
+            '<div class="flash">Vue démo active. '
+            f'<a class="btn secondary" href="{url_for("stop_demo_view")}">Retour admin</a>'
+            '</div>'
+        )
     admin_links = ""
     if current_user.is_authenticated and current_user.role == "admin":
         admin_links = (
@@ -3749,7 +3843,27 @@ def shell(content, active=""):
 {member_links}
 {coach_links}
 <a class="logout" href="{url_for('logout')}">Déconnexion</a>
-</div></aside><main class="main">{content}</main></div></body></html>
+</div></aside><main class="main">{demo_banner}{content}</main></div><script>
+const fitnessScrollKey = 'fitness-scroll:' + window.location.pathname;
+function rememberFitnessScroll() {{
+  sessionStorage.setItem(fitnessScrollKey, String(window.scrollY || window.pageYOffset || 0));
+}}
+window.addEventListener('DOMContentLoaded', () => {{
+  const y = sessionStorage.getItem(fitnessScrollKey);
+  if (y !== null) {{
+    sessionStorage.removeItem(fitnessScrollKey);
+    setTimeout(() => window.scrollTo(0, Number(y)), 0);
+  }}
+}});
+document.addEventListener('submit', event => {{
+  if (event.target && event.target.matches('form')) rememberFitnessScroll();
+}}, true);
+document.addEventListener('click', event => {{
+  const link = event.target.closest('a');
+  if (!link || link.target || link.href.startsWith('mailto:') || link.href.startsWith('javascript:')) return;
+  if (link.origin === window.location.origin) rememberFitnessScroll();
+}}, true);
+</script></body></html>
 """
 
 
@@ -3802,6 +3916,17 @@ TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
     """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
     """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Les cours sont créés automatiquement 28 jours avant leur date.</p><p>Pour les créneaux réservables, les adhérents mensuels disposent d'une priorité de réservation pendant les 7 premiers jours.</p><p>Après ces 7 jours, les places restantes sont ouvertes à tous les statuts : cadres et autres peuvent alors réserver jusqu'à 21 jours avant la date du cours, selon les places disponibles.</p><p>Chaque adhérent est autonome pour réserver et annuler ses créneaux depuis son profil. Les membres du Bureau Fitness n'ont pas la main pour annuler une réservation à la place d'un adhérent.</p><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
     1,
+)
+TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
+    """{% if current_user.role in ['admin','coach'] %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}""",
+    """{% if current_user.role in ['admin','coach'] and s.is_reservable %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}""",
+)
+TEMPLATE_INDEX = re.sub(
+    r"""\{% if current_user.role == 'admin' %\}<section class="card"><h2>Dernières actions adhérents</h2>.*?\{% else %\}<section class="card"><h2>Mes réservations à venir</h2>""",
+    """{% if current_user.role == 'admin' %}<section class="card"><h2>Vues démo</h2><div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:14px"><h2>Vue adhérent démo</h2><p class="muted">Ouvrir l'affichage exact d'un profil adhérent de test.</p><a class="btn" href="{{ url_for('admin_demo_view', role='adherent') }}">Voir la vue adhérent</a></div><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Vue coach démo</h2><p class="muted">Ouvrir l'affichage exact d'un profil coach de test.</p><a class="btn" href="{{ url_for('admin_demo_view', role='coach') }}">Voir la vue coach</a></div></section>{% else %}<section class="card"><h2>Mes réservations à venir</h2>""",
+    TEMPLATE_INDEX,
+    count=1,
+    flags=re.S,
 )
 
 TEMPLATE_MEMBER_PROFILE = """
@@ -3881,6 +4006,10 @@ TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
     """<br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}""",
     """<br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a><script>const attendanceScrollKey='attendance-scroll-'+window.location.pathname;function rememberAttendanceScroll(){sessionStorage.setItem(attendanceScrollKey,String(window.scrollY));}window.addEventListener('DOMContentLoaded',()=>{const y=sessionStorage.getItem(attendanceScrollKey);if(y!==null){sessionStorage.removeItem(attendanceScrollKey);setTimeout(()=>window.scrollTo(0,Number(y)),0);}});</script></div>{% endset %}""",
     1,
+)
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    "Appel mobile : marquez uniquement les absents. Si une personne arrive après l'appel, utilisez “Retard” pour retirer la pénalité.",
+    "Marquez uniquement les absents. Si une personne arrive après l'appel, utilisez “Retard” pour retirer la pénalité.",
 )
 
 TEMPLATE_MEMBERS = """
@@ -4059,7 +4188,7 @@ TEMPLATE_ARCHIVES = """
 """
 
 TEMPLATE_EMAIL_MEMBERS = """
-{% set content %}<div class="card form-wrap"><h1>Campagne email</h1><p class="muted">Choisissez les groupes destinataires. La signature du Bureau Fitness et le logo sont ajoutés automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post">{% for u in users %}<input type="hidden" name="user_ids" value="{{ u.id }}">{% endfor %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Destinataires</strong><div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px"><label><input type="checkbox" name="target_roles" value="adherent" {% if 'adherent' in target_roles %}checked{% endif %}> Adhérents</label><label><input type="checkbox" name="target_roles" value="admin" {% if 'admin' in target_roles %}checked{% endif %}> Admins</label><label><input type="checkbox" name="target_roles" value="coach" {% if 'coach' in target_roles %}checked{% endif %}> Coachs</label></div><p class="muted">{{ users|length }} destinataire(s) actuellement listé(s). Si des adhérents ont été sélectionnés depuis l'onglet Adhérents, seuls ces adhérents sont repris.</p><p class="muted">{% for u in users %}{{ u.display_name() }} &lt;{{ u.email }}&gt;{% if not loop.last %}, {% endif %}{% else %}Aucun destinataire pour cette sélection.{% endfor %}</p></div><br><div class="field"><label>Objet</label><input name="subject" required placeholder="Ex. Informations Section Fitness"></div><br><div class="field"><label>Message</label><textarea name="body" required rows="10" style="width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px"></textarea></div><br><button class="btn" type="submit">Envoyer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'members')|safe }}
+{% set content %}<div class="card form-wrap"><h1>Campagne email</h1><p class="muted">Choisissez les groupes destinataires. La signature du Bureau Fitness et le logo sont ajoutés automatiquement.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post">{% for u in users %}<input type="hidden" name="user_ids" value="{{ u.id }}">{% endfor %}<div class="card" style="box-shadow:none;background:#f9fafb"><strong>Destinataires</strong><div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px"><label><input type="checkbox" name="target_roles" value="adherent" {% if 'adherent' in target_roles %}checked{% endif %}> Adhérents</label><label><input type="checkbox" name="target_roles" value="admin" {% if 'admin' in target_roles %}checked{% endif %}> Admins</label><label><input type="checkbox" name="target_roles" value="coach" {% if 'coach' in target_roles %}checked{% endif %}> Coachs</label></div><p class="muted">{{ users|length }} destinataire(s) actuellement listé(s) : {{ target_summary }}.</p><p class="muted">Quand les adhérents sont cochés, les admins sont inclus automatiquement pour contrôler que le message est bien parti. Si des adhérents ont été sélectionnés depuis l'onglet Adhérents, seuls ces adhérents sont repris côté adhérents.</p><p class="muted">{% for u in users %}{{ u.display_name() }} &lt;{{ u.email }}&gt;{% if not loop.last %}, {% endif %}{% else %}Aucun destinataire pour cette sélection.{% endfor %}</p></div><br><div class="field"><label>Objet</label><input name="subject" required placeholder="Ex. Informations Section Fitness"></div><br><div class="field"><label>Message</label><textarea name="body" required rows="10" style="width:100%;padding:13px;border:1px solid #d1d5db;border-radius:10px;font-size:15px"></textarea></div><br><button class="btn" type="submit">Envoyer</button> <a class="btn secondary" href="{{ url_for('admin_members') }}">Retour</a></form></div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 
 TEMPLATE_BLOCKED = """

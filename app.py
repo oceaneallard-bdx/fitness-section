@@ -357,8 +357,7 @@ SUBSCRIPTION_ALIASES = {
     "Trimestre 3": "T3",
     "Trimestre 4": "T4",
 }
-TEMPORARY_BOOKING_GRACE_START = date(2026, 7, 1)
-TEMPORARY_BOOKING_GRACE_END = date(2026, 7, 15)
+BOOKING_GRACE_PERIODS_KEY = "booking_grace_periods"
 DEMO_ADHERENT_EMAIL = "adherent@fitness.local"
 DEMO_COACH_EMAIL = "coach@fitness.local"
 DEFAULT_ANNUAL_MEMBERSHIP_FEE = 10.0
@@ -416,6 +415,51 @@ def parse_iso_date(value, default):
         return datetime.strptime(value or "", "%Y-%m-%d").date()
     except ValueError:
         return default
+
+
+def get_booking_grace_periods():
+    try:
+        raw_periods = json.loads(setting_value(BOOKING_GRACE_PERIODS_KEY, "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_periods = []
+    periods = []
+    for item in raw_periods if isinstance(raw_periods, list) else []:
+        start = parse_iso_date(item.get("start_date"), None)
+        end = parse_iso_date(item.get("end_date"), None)
+        if not start or not end:
+            continue
+        if end < start:
+            start, end = end, start
+        periods.append({
+            "id": item.get("id") or secrets.token_hex(6),
+            "name": (item.get("name") or "Période de reprise").strip(),
+            "start_date": start,
+            "end_date": end,
+            "notes": (item.get("notes") or "").strip(),
+        })
+    return sorted(periods, key=lambda item: (item["start_date"], item["end_date"], item["name"]))
+
+
+def save_booking_grace_periods(periods):
+    payload = []
+    for item in periods:
+        payload.append({
+            "id": item.get("id") or secrets.token_hex(6),
+            "name": item.get("name") or "Période de reprise",
+            "start_date": item["start_date"].isoformat() if hasattr(item.get("start_date"), "isoformat") else item.get("start_date"),
+            "end_date": item["end_date"].isoformat() if hasattr(item.get("end_date"), "isoformat") else item.get("end_date"),
+            "notes": item.get("notes") or "",
+        })
+    set_setting_value(BOOKING_GRACE_PERIODS_KEY, json.dumps(payload, ensure_ascii=False))
+
+
+def booking_grace_period_for_date(target_date):
+    if not target_date:
+        return None
+    for period in get_booking_grace_periods():
+        if period["start_date"] <= target_date <= period["end_date"]:
+            return period
+    return None
 
 
 def coach_planning_period(args):
@@ -747,7 +791,7 @@ def subscription_range(subscription_type, year):
 def user_can_book_session(user, session):
     if user.role not in ["adherent", "admin"]:
         return False, "Seuls les adhérents peuvent réserver."
-    if TEMPORARY_BOOKING_GRACE_START <= session.course_date <= TEMPORARY_BOOKING_GRACE_END:
+    if booking_grace_period_for_date(session.course_date):
         return True, ""
     if not user.subscription_type or not user.subscription_year:
         return False, "Votre abonnement n'est pas renseigné. Contactez la Section Fitness."
@@ -943,7 +987,7 @@ def send_password_reset_email(user):
 
 def archive_expired_memberships():
     today = date.today()
-    if today <= TEMPORARY_BOOKING_GRACE_END:
+    if booking_grace_period_for_date(today):
         return 0
     users = User.query.filter(User.role == "adherent", User.email != DEMO_ADHERENT_EMAIL, User.account_status != "archived", User.subscription_end_date.isnot(None), User.subscription_end_date < today).all()
     for user in users:
@@ -2545,7 +2589,7 @@ def index():
     latest_bookings = Booking.query.join(CourseSession).join(Booking.user).filter(
         User.role.in_(["adherent", "admin"])
     ).order_by(Booking.created_at.desc(), Booking.id.desc()).limit(12).all() if is_admin() else []
-    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, attendance_counts=attendance_counts, attendance_count_label=attendance_count_label, temporary_booking_grace_start=TEMPORARY_BOOKING_GRACE_START, temporary_booking_grace_end=TEMPORARY_BOOKING_GRACE_END)
+    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, attendance_counts=attendance_counts, attendance_count_label=attendance_count_label)
 
 
 @app.route("/admin/statistics")
@@ -2747,7 +2791,7 @@ def login():
             if (
                 user.role == "adherent"
                 and user.account_status == "archived"
-                and date.today() <= TEMPORARY_BOOKING_GRACE_END
+                and booking_grace_period_for_date(date.today())
                 and user.subscription_type
                 and user.subscription_year
             ):
@@ -4098,7 +4142,6 @@ TEMPLATE_INDEX = """
 <div class="top"><div><h1>Bienvenue, {{ current_user.display_name() }} 👋</h1><p class="muted">Voici le planning de la Section Fitness.</p></div>{% if current_user.role == 'adherent' %}<a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Ma carte adhérent</a>{% endif %}</div>
 {% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
 {% if current_user.is_blocked() %}<div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Votre compte est bloqué jusqu'au {{ current_user.blocked_until }}.</div>{% endif %}
-{% if current_user.role == 'adherent' %}<div class="flash">Période de reprise : les réservations du {{ temporary_booking_grace_start.strftime('%d/%m/%Y') }} au {{ temporary_booking_grace_end.strftime('%d/%m/%Y') }} restent ouvertes pendant la mise à jour des adhésions.</div>{% endif %}
 <div class="content-grid"><section class="card"><h2>Prochaines séances</h2>{% if current_user.role not in ['admin','coach'] %}<form method="get" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin:12px 0 18px"><h3 style="margin-top:0">Filtres</h3><div class="form-grid"><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if selected_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach</label><select name="coach_filter"><option value="">Tous</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if selected_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau</label><select name="slot_filter"><option value="">Tous</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if selected_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('index') }}">Réinitialiser</a></form>{% endif %}{% for s in sessions %}{% set a = absence_for_session(abs_by_key, s) %}{% set booking = active_booking_by_session.get(s.id) %}<div class="session"><div><div class="muted">{{ s.course_date.strftime('%A %d/%m/%Y') }} · {{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</div><strong>{{ s.course_name }}</strong>{% if a %}<br><span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% endif %}{% if s.is_reservable %}<div class="muted">{{ booked_count(s) }} / {{ s.capacity }} inscrits</div>{% else %}<div class="muted">Pas de réservation</div>{% endif %}</div><div>{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif booking %}{% if booking.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(booking) }}</span>{% else %}<span class="badge">Déjà réservé</span>{% endif %}{% elif booked_count(s) >= s.capacity %}<span class="badge full">Complet</span>{% else %}<span class="badge">{{ s.capacity - booked_count(s) }} places</span>{% endif %}<br><br>{% if current_user.role == 'adherent' and s.is_reservable %}{% set can_book, reason = user_can_book_session(current_user, s) %}{% if booking %}<a class="btn danger" href="{{ url_for('cancel', booking_id=booking.id, next=request.full_path) }}">Annuler</a>{% elif a and absence_blocks_booking(a) %}<span class="badge full">Indisponible</span>{% elif not can_book %}<span class="badge wait">{{ reason }}</span>{% else %}<a class="btn" href="{{ url_for('book', session_id=s.id, next=request.full_path) }}">Réserver</a>{% endif %}{% endif %}{% if current_user.role in ['admin','coach'] %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}</div></div>{% else %}<p class="muted">Aucune séance à venir.</p>{% endfor %}</section>
 {% if current_user.role == 'admin' %}<section class="card"><h2>Dernières actions adhérents</h2><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Cours</th><th>Statut</th><th>Actions</th></tr>{% for b in latest_bookings %}<tr><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td><td>{{ b.user.display_name() }}<br><small class="muted">{{ b.user.email }}</small></td><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% elif b.status == 'booked' %}<span class="badge">Réservé</span>{% else %}<span class="badge full">{{ b.status }}</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Modifier</a>{% if b.status in ['booked','waiting_list'] %} <a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}" onclick="return confirm('Annuler cette réservation ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune réservation récente.</td></tr>{% endfor %}</table></section>{% else %}<section class="card"><h2>Mes réservations à venir</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th></th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div></section>{% endif %}</div>
 {% endset %}{{ shell(content, 'home')|safe }}
@@ -4109,8 +4152,8 @@ TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
     1,
 )
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
-    """{% if current_user.role == 'adherent' %}<div class="flash">Période de reprise : les réservations du {{ temporary_booking_grace_start.strftime('%d/%m/%Y') }} au {{ temporary_booking_grace_end.strftime('%d/%m/%Y') }} restent ouvertes pendant la mise à jour des adhésions.</div>{% endif %}""",
-    """{% if current_user.role == 'adherent' %}<div class="flash">Période de reprise : les réservations du {{ temporary_booking_grace_start.strftime('%d/%m/%Y') }} au {{ temporary_booking_grace_end.strftime('%d/%m/%Y') }} restent ouvertes pendant la mise à jour des adhésions.</div><section class="card"><h2>Mes cours réservés</h2><p class="muted">Vos prochaines réservations, pour vous les remémorer ou annuler rapidement.</p><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th>Action</th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}<br><small class="muted">{{ b.session.coach_name or '-' }}</small></td><td>{% set a = absence_for_session(abs_by_key, b.session) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span><br>{% endif %}{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d'attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td><a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a></td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table></section><br>{% endif %}""",
+    """{% if current_user.role == 'adherent' %}<section class="card"><h2>Mes cours réservés</h2><p class="muted">Vos prochaines réservations, pour vous les remémorer ou annuler rapidement.</p><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th>Action</th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}<br><small class="muted">{{ b.session.coach_name or '-' }}</small></td><td>{% set a = absence_for_session(abs_by_key, b.session) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span><br>{% endif %}{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d'attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td><a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a></td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table></section><br>{% endif %}""",
+    """{% if current_user.role == 'adherent' %}<section class="card"><h2>Mes cours réservés</h2><p class="muted">Vos prochaines réservations, pour vous les remémorer ou annuler rapidement.</p><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th>Action</th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}<br><small class="muted">{{ b.session.coach_name or '-' }}</small></td><td>{% set a = absence_for_session(abs_by_key, b.session) %}{% if a %}<span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span><br>{% endif %}{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d'attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td><a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a></td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table></section><br>{% endif %}""",
     1,
 )
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
@@ -4661,6 +4704,11 @@ TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
     """</form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3>""",
     """</form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><input type="hidden" name="settings_section" value="coach_planning_display"><h3>Affichage du planning coach</h3><p class="muted">Choisir les jours visibles dans l'agenda visuel des coachs.</p><div class="form-grid">{% for label in weekday_labels %}<label style="font-weight:600"><input type="checkbox" name="planning_weekdays" value="{{ loop.index0 }}" {% if loop.index0 in planning_weekdays %}checked{% endif %} style="width:auto"> {{ label }}</label>{% endfor %}</div><br><button class="btn" type="submit">Enregistrer l'affichage</button></form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3>""",
+    1,
+)
+TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
+    """</form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3>""",
+    """</form><br><section class="card" style="box-shadow:none;background:#f9fafb"><h3>Périodes de reprise des réservations</h3><p class="muted">À utiliser lors d'une période chargée de renouvellements : les adhérents dont l'ancien profil existe encore peuvent réserver sur les dates couvertes, même si l'abonnement n'a pas encore été remis à jour.</p><form method="post"><input type="hidden" name="settings_section" value="booking_grace_period"><div class="form-grid"><div class="field"><label>Nom</label><input name="grace_name" placeholder="Ex. Reprise inscriptions juillet"></div><div class="field"><label>Début</label><input name="grace_start_date" type="date" required></div><div class="field"><label>Fin</label><input name="grace_end_date" type="date" required></div><div class="field"><label>Note interne</label><input name="grace_notes" placeholder="Optionnel"></div></div><br><button class="btn" type="submit">Créer la période</button></form><br><table class="table"><tr><th>Période</th><th>Dates</th><th>Note</th><th>Action</th></tr>{% for period in booking_grace_periods %}<tr><td>{{ period.name }}</td><td>{{ period.start_date.strftime('%d/%m/%Y') }} - {{ period.end_date.strftime('%d/%m/%Y') }}</td><td>{{ period.notes or '-' }}</td><td><a class="btn danger" href="{{ url_for('delete_booking_grace_period', period_id=period.id) }}" onclick="return confirm('Supprimer cette période de reprise ?')">Supprimer</a></td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune période de reprise paramétrée.</td></tr>{% endfor %}</table></section><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3>""",
     1,
 )
 TEMPLATE_SETTINGS = TEMPLATE_SETTINGS.replace(
@@ -5298,6 +5346,26 @@ def admin_settings():
             db.session.commit()
             flash("Affichage du planning coach mis à jour.")
             return redirect(url_for("admin_settings"))
+        if request.form.get("settings_section") == "booking_grace_period":
+            start_date = parse_iso_date(request.form.get("grace_start_date"), None)
+            end_date = parse_iso_date(request.form.get("grace_end_date"), None)
+            if not start_date or not end_date:
+                flash("Merci d'indiquer une date de début et une date de fin.")
+                return redirect(url_for("admin_settings"))
+            if end_date < start_date:
+                start_date, end_date = end_date, start_date
+            periods = get_booking_grace_periods()
+            periods.append({
+                "id": secrets.token_hex(6),
+                "name": request.form.get("grace_name", "").strip() or "Période de reprise",
+                "start_date": start_date,
+                "end_date": end_date,
+                "notes": request.form.get("grace_notes", "").strip(),
+            })
+            save_booking_grace_periods(periods)
+            db.session.commit()
+            flash("Période de reprise créée.")
+            return redirect(url_for("admin_settings"))
         if request.form.get("settings_section") == "pricing":
             set_setting_value("annual_membership_fee", parse_amount(request.form.get("annual_membership_fee"), DEFAULT_ANNUAL_MEMBERSHIP_FEE))
             for name in SUBSCRIPTION_PRICES:
@@ -5380,7 +5448,20 @@ def admin_settings():
         flash("Cours créé ou mis à jour. Il apparaît dans le planning coach et sera généré automatiquement sur le planning glissant.")
         return redirect(url_for("admin_settings"))
     templates = CourseTemplate.query.order_by(CourseTemplate.weekday, CourseTemplate.start_time).all()
-    return render_template_string(TEMPLATE_SETTINGS, templates=templates, single_sessions=single_course_sessions(), coaches=configured_coach_rows(), coach_options=configured_coach_names(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), current_year=date.today().year, subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)
+    return render_template_string(TEMPLATE_SETTINGS, templates=templates, single_sessions=single_course_sessions(), coaches=configured_coach_rows(), coach_options=configured_coach_names(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), booking_grace_periods=get_booking_grace_periods(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), current_year=date.today().year, subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)
+
+
+@app.route("/admin/settings/booking-grace/<period_id>/delete")
+@login_required
+def delete_booking_grace_period(period_id):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    periods = [period for period in get_booking_grace_periods() if period["id"] != period_id]
+    save_booking_grace_periods(periods)
+    db.session.commit()
+    flash("Période de reprise supprimée.")
+    return redirect(url_for("admin_settings"))
 
 
 @app.route("/admin/settings/template/<int:template_id>/edit", methods=["POST"])

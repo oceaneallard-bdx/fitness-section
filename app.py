@@ -1988,6 +1988,17 @@ def create_booking_for_user(user, session, by_admin=False):
     return booking, "waiting_list"
 
 
+def promote_next_waiting_for_session(session):
+    next_waiting = Booking.query.filter_by(session_id=session.id, status="waiting_list").order_by(Booking.created_at, Booking.id).first()
+    if next_waiting and booked_count(session) < session.capacity:
+        next_waiting.status = "booked"
+        next_waiting.promoted_from_waitlist_at = datetime.utcnow()
+        db.session.commit()
+        send_email(next_waiting.user.email, "Réservation confirmée - place libérée", f"Bonjour {next_waiting.user.display_name()},\n\nUne place s'est libérée pour {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} à {session.start_time.strftime('%H:%M')}.\n\nVotre réservation est maintenant confirmée.\n\nSection Fitness")
+        return next_waiting
+    return None
+
+
 def cancel_booking_and_promote(booking, cancelled_by_admin=False):
     session = booking.session
     booking.status = "cancelled"
@@ -1997,15 +2008,7 @@ def cancel_booking_and_promote(booking, cancelled_by_admin=False):
         send_email(booking.user.email, "Réservation annulée par la Section Fitness", f"Bonjour {booking.user.display_name()},\n\nVotre réservation au cours {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} a été annulée par l'administration.\n\nSection Fitness")
     else:
         send_email(booking.user.email, "Annulation confirmée", f"Bonjour {booking.user.display_name()},\n\nVotre réservation au cours {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} est annulée.\n\nSection Fitness")
-
-    next_waiting = Booking.query.filter_by(session_id=session.id, status="waiting_list").order_by(Booking.created_at, Booking.id).first()
-    if next_waiting and booked_count(session) < session.capacity:
-        next_waiting.status = "booked"
-        next_waiting.promoted_from_waitlist_at = datetime.utcnow()
-        db.session.commit()
-        send_email(next_waiting.user.email, "Réservation confirmée - place libérée", f"Bonjour {next_waiting.user.display_name()},\n\nUne place s'est libérée pour {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} à {session.start_time.strftime('%H:%M')}.\n\nVotre réservation est maintenant confirmée.\n\nSection Fitness")
-        return next_waiting
-    return None
+    return promote_next_waiting_for_session(session)
 
 
 def absence_count(user):
@@ -3009,12 +3012,18 @@ def delete_trial_participant(booking_id):
         flash("Cette action concerne uniquement les personnes à l'essai.")
         return redirect(url_for("session_detail", session_id=session_id) + f"#booking-{booking.id}")
     name = user.display_name()
+    session = booking.session
     db.session.delete(booking)
+    db.session.flush()
+    promoted = promote_next_waiting_for_session(session)
     remaining_trial_bookings = Booking.query.filter_by(user_id=user.id).count()
     if remaining_trial_bookings <= 1:
         db.session.delete(user)
     db.session.commit()
-    flash(f"{name} retiré de la liste du cours.")
+    if promoted:
+        flash(f"{name} retiré de la liste du cours. {promoted.user.display_name()} a été promu depuis la liste d’attente.")
+    else:
+        flash(f"{name} retiré de la liste du cours.")
     return redirect(url_for("session_detail", session_id=session_id))
 
 

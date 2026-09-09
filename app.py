@@ -161,6 +161,16 @@ class Booking(db.Model):
     session = db.relationship("CourseSession", backref="bookings")
 
 
+class NonReservableAttendance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("course_session.id"), nullable=False)
+    count_range = db.Column(db.String(30), nullable=False)
+    notes = db.Column(db.String(500), nullable=True)
+    recorded_at = db.Column(db.DateTime, default=datetime.utcnow)
+    recorded_by = db.Column(db.String(150), nullable=True)
+    session = db.relationship("CourseSession", backref="attendance_counts")
+
+
 class MembershipPeriod(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
@@ -1034,6 +1044,28 @@ def user_contact_label(user):
     if user.role == "trial":
         return "Personne à l'essai"
     return user.email
+
+
+def attendance_count_label(record):
+    return record.count_range if record else "Non renseigné"
+
+
+def refresh_user_current_membership_from_history(user):
+    latest = MembershipPeriod.query.filter_by(user_id=user.id).order_by(
+        MembershipPeriod.subscription_year.desc(),
+        MembershipPeriod.end_date.desc(),
+        MembershipPeriod.start_date.desc(),
+        MembershipPeriod.id.desc(),
+    ).first()
+    if latest:
+        user.subscription_type = latest.subscription_type
+        user.subscription_year = latest.subscription_year
+        user.subscription_end_date = latest.end_date
+    else:
+        user.subscription_type = None
+        user.subscription_year = None
+        user.subscription_end_date = None
+    return latest
 
 
 def send_member_campaign_async(user_ids, subject, signed_body, signed_html):
@@ -2471,6 +2503,13 @@ def index():
     sessions = query.order_by(CourseSession.course_date, CourseSession.start_time).all()
     if current_user.role in ["adherent", "admin"] and selected_slot:
         sessions = [session for session in sessions if session_slot_label(session) == selected_slot]
+    session_ids = [session.id for session in sessions]
+    attendance_counts = {}
+    if session_ids:
+        attendance_counts = {
+            record.session_id: record
+            for record in NonReservableAttendance.query.filter(NonReservableAttendance.session_id.in_(session_ids)).all()
+        }
     absences = CoachAbsence.query.filter(
         CoachAbsence.absence_date >= today,
         CoachAbsence.absence_date <= end_date,
@@ -2494,7 +2533,7 @@ def index():
     latest_bookings = Booking.query.join(CourseSession).join(Booking.user).filter(
         User.role.in_(["adherent", "admin"])
     ).order_by(Booking.created_at.desc(), Booking.id.desc()).limit(12).all() if is_admin() else []
-    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, temporary_booking_grace_start=TEMPORARY_BOOKING_GRACE_START, temporary_booking_grace_end=TEMPORARY_BOOKING_GRACE_END)
+    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, attendance_counts=attendance_counts, attendance_count_label=attendance_count_label, temporary_booking_grace_start=TEMPORARY_BOOKING_GRACE_START, temporary_booking_grace_end=TEMPORARY_BOOKING_GRACE_END)
 
 
 @app.route("/admin/statistics")
@@ -2957,6 +2996,56 @@ def add_trial_participant(session_id):
     return redirect(url_for("session_detail", session_id=session.id) + f"#booking-{booking.id}")
 
 
+@app.route("/session/trial/delete/<int:booking_id>", methods=["POST"])
+@login_required
+def delete_trial_participant(booking_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé au coach ou à l’admin.")
+        return redirect(url_for("index"))
+    booking = Booking.query.get_or_404(booking_id)
+    session_id = booking.session_id
+    user = booking.user
+    if user.role != "trial":
+        flash("Cette action concerne uniquement les personnes à l'essai.")
+        return redirect(url_for("session_detail", session_id=session_id) + f"#booking-{booking.id}")
+    name = user.display_name()
+    db.session.delete(booking)
+    remaining_trial_bookings = Booking.query.filter_by(user_id=user.id).count()
+    if remaining_trial_bookings <= 1:
+        db.session.delete(user)
+    db.session.commit()
+    flash(f"{name} retiré de la liste du cours.")
+    return redirect(url_for("session_detail", session_id=session_id))
+
+
+@app.route("/session/<int:session_id>/presence-sans-reservation", methods=["GET", "POST"])
+@login_required
+def non_reservable_attendance(session_id):
+    if not is_coach_or_admin():
+        flash("Accès réservé au coach ou à l’admin.")
+        return redirect(url_for("index"))
+    session = CourseSession.query.get_or_404(session_id)
+    if session.is_reservable:
+        return redirect(url_for("session_detail", session_id=session.id))
+    record = NonReservableAttendance.query.filter_by(session_id=session.id).first()
+    if request.method == "POST":
+        count_range = request.form.get("count_range", "").strip()
+        if count_range not in ["0-5", "5-10", "10-15", "+15"]:
+            flash("Merci de choisir une tranche de présence.")
+            return redirect(url_for("non_reservable_attendance", session_id=session.id))
+        if not record:
+            record = NonReservableAttendance(session_id=session.id)
+            db.session.add(record)
+        record.count_range = count_range
+        record.notes = request.form.get("notes", "").strip()
+        record.recorded_at = datetime.utcnow()
+        record.recorded_by = current_user.display_name()
+        db.session.commit()
+        flash(f"Présence enregistrée : {count_range} personnes.")
+        return redirect(url_for("index"))
+    return render_template_string(TEMPLATE_NON_RESERVABLE_ATTENDANCE, session=session, record=record, attendance_count_label=attendance_count_label)
+
+
 @app.route("/presence/present/<int:booking_id>")
 @login_required
 def mark_present(booking_id):
@@ -3131,6 +3220,23 @@ def admin_renew_member(user_id):
     db.session.commit()
     fee_label = "avec cotisation annuelle" if annual_fee_applies else "sans nouvelle cotisation annuelle"
     flash(f"Adhésion renouvelée ({fee_label}).")
+    return redirect(url_for("admin_edit_member", user_id=user.id))
+
+
+@app.route("/admin/members/<int:user_id>/membership-period/<int:period_id>/delete", methods=["POST"])
+@login_required
+def admin_delete_membership_period(user_id, period_id):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    user = User.query.get_or_404(user_id)
+    period = MembershipPeriod.query.filter_by(id=period_id, user_id=user.id).first_or_404()
+    label = f"{period.subscription_type} {period.subscription_year}"
+    db.session.delete(period)
+    db.session.flush()
+    refresh_user_current_membership_from_history(user)
+    db.session.commit()
+    flash(f"Adhésion supprimée de l'historique : {label}. Le budget est recalculé sans cette ligne.")
     return redirect(url_for("admin_edit_member", user_id=user.id))
 
 
@@ -4005,6 +4111,11 @@ TEMPLATE_INDEX = re.sub(
     count=1,
     flags=re.S,
 )
+TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
+    """{% if current_user.role in ['admin','coach'] and s.is_reservable %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}""",
+    """{% if current_user.role in ['admin','coach'] and s.is_reservable %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% elif current_user.role in ['admin','coach'] and not s.is_reservable %}<small class="muted">{{ attendance_count_label(attendance_counts.get(s.id)) }}</small><br><a class="btn secondary" href="{{ url_for('non_reservable_attendance', session_id=s.id) }}">Saisir présence</a>{% endif %}""",
+    1,
+)
 
 TEMPLATE_MEMBER_PROFILE = """
 {% set content %}<div class="card form-wrap"><h1>Mon profil</h1><p class="muted">Modifier votre statut adhérent, vos préférences ou votre photo de profil.</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if current_user.profile_photo or current_user.profile_photo_data %}<img class="photo-preview" src="{{ url_for('profile_photo_file', user_id=current_user.id) }}" alt="Photo profil"><br><br>{% endif %}<form method="post" enctype="multipart/form-data"><div class="form-grid"><div class="field"><label>Nom complet</label><input value="{{ current_user.display_name() }}" disabled></div><div class="field"><label>Email</label><input value="{{ current_user.email }}" disabled></div><div class="field"><label>Statut prioritaire</label><select name="status"><option value="mensuel" {% if current_user.status == 'mensuel' %}selected{% endif %}>Mensuel</option><option value="cadre" {% if current_user.status == 'cadre' %}selected{% endif %}>Cadre</option><option value="autre" {% if current_user.status == 'autre' %}selected{% endif %}>Autre</option></select></div><div class="field"><label>Profil adhérent</label><select name="member_profile"><option value="ouvrant_droit" {% if current_user.member_profile == 'ouvrant_droit' or not current_user.member_profile %}selected{% endif %}>Ouvrant droit - personnel Thales, alternant, stagiaire, CDD</option><option value="ayant_droit" {% if current_user.member_profile == 'ayant_droit' %}selected{% endif %}>Ayant droit - proche d'un ouvrant droit</option><option value="exterieur" {% if current_user.member_profile == 'exterieur' %}selected{% endif %}>Extérieur - prestataire sur site Thales</option><option value="retraite" {% if current_user.member_profile == 'retraite' %}selected{% endif %}>Retraité</option></select></div><div class="field" style="grid-column:1/-1"><label>Nom et prénom de l'ouvrant droit, si ayant droit</label><input name="rights_holder_name" value="{{ current_user.rights_holder_name or '' }}"></div><div class="field"><label>Cours préféré</label><select name="preferred_course"><option value="">-</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if current_user.preferred_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach préféré</label><select name="preferred_coach"><option value="">-</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if current_user.preferred_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau préféré</label><select name="preferred_slot"><option value="">-</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if current_user.preferred_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field" style="grid-column:1/-1"><label>Nouvelle photo de profil JPG/PNG, facultative</label><input name="profile_photo" type="file" accept="image/png,image/jpeg"></div></div><br><button class="btn" type="submit">Enregistrer</button> <a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Télécharger ma carte</a></form></div>{% endset %}{{ shell(content, 'member_profile')|safe }}
@@ -4088,6 +4199,15 @@ TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
     "Appel mobile : marquez uniquement les absents. Si une personne arrive après l'appel, utilisez “Retard” pour retirer la pénalité.",
     "Marquez uniquement les absents. Si une personne arrive après l'appel, utilisez “Retard” pour retirer la pénalité.",
 )
+TEMPLATE_SESSION_DETAIL = TEMPLATE_SESSION_DETAIL.replace(
+    """{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div>""",
+    """{% endif %}{% if b.user.role == 'trial' %}<form method="post" action="{{ url_for('delete_trial_participant', booking_id=b.id) }}" onsubmit="rememberAttendanceScroll(); return confirm('Supprimer cette personne à l\\'essai de ce cours ?');"><button class="btn secondary" type="submit">Supprimer essai</button></form>{% endif %}</div></div>{% else %}<p class="muted">Aucune réservation confirmée.</p>{% endfor %}</div>""",
+    1,
+)
+
+TEMPLATE_NON_RESERVABLE_ATTENDANCE = """
+{% set content %}<style>.range-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.range-grid .btn{padding:22px 10px;text-align:center;font-size:20px}.range-grid .selected{outline:4px solid rgba(52,168,83,.25)}@media(max-width:700px){.range-grid{grid-template-columns:1fr 1fr}.range-grid .btn{font-size:18px}}</style><div class="card"><h1>{{ session.course_name }}</h1><p class="muted">{{ session.course_date.strftime('%d/%m/%Y') }} · {{ session.start_time.strftime('%H:%M') }} - {{ session.end_time.strftime('%H:%M') }} · Sans réservation</p>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Nombre d'adhérents présents</h2><p class="muted">Sélection rapide par tranche. Valeur actuelle : <strong>{{ attendance_count_label(record) }}</strong>{% if record and record.recorded_by %}, saisie par {{ record.recorded_by }}{% endif %}.</p><form method="post"><div class="range-grid">{% for value in ['0-5','5-10','10-15','+15'] %}<button class="btn {% if record and record.count_range == value %}selected{% endif %}" type="submit" name="count_range" value="{{ value }}">{{ value }} pers.</button>{% endfor %}</div><br><div class="field"><label>Note facultative</label><input name="notes" value="{{ record.notes if record else '' }}" placeholder="Ex. cours calme, essai collectif, etc."></div></form></div><br><a class="btn secondary" href="{{ url_for('index') }}">Retour</a></div>{% endset %}{{ shell(content, 'home')|safe }}
+"""
 
 TEMPLATE_MEMBERS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Adhérents</h1><p class="muted">Annuaire des adhérents pour suivi, modification, réservations et campagnes d'emailing.</p></div><div><a class="btn" href="{{ url_for('admin_create_member') }}">Créer un adhérent</a> <a class="btn secondary" href="{{ url_for('admin_import_members') }}">Import Excel</a> <a class="btn secondary" href="{{ url_for('export_members_excel') }}">Export adhérents</a> <a class="btn" href="{{ url_for('admin_email_members') }}">Campagne email</a></div></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="get" action="{{ url_for('admin_email_members') }}"><table class="table"><tr><th><input type="checkbox" onclick="document.querySelectorAll('.member-check').forEach(c=>c.checked=this.checked)"></th><th>Photo</th><th>Nom</th><th>Email</th><th>Statut</th><th>Profil</th><th>Abonnement</th><th>ID</th><th>Absences 90j</th><th>Compte</th><th>Blocage</th><th>Actions</th></tr>{% for u in users %}<tr><td><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td><td>{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}<span class="muted">-</span>{% endif %}</td><td>{{ u.display_name() }}</td><td><a href="mailto:{{ u.email }}">{{ u.email }}</a></td><td>{{ u.status }}</td><td>{{ u.member_profile or '-' }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td>{{ u.subscription_type or '-' }} {{ u.subscription_year or '' }}</td><td>{{ u.member_number or '-' }}</td><td>{{ absence_count(u) }}</td><td>{% if u.account_status == 'pending' %}<span class="badge wait">activation à faire</span>{% else %}<span class="badge">{{ u.account_status }}</span>{% endif %}</td><td>{% if u.is_blocked() %}<span class="badge full">bloqué jusqu'au {{ u.blocked_until }}</span>{% else %}<span class="badge">non bloqué</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Modifier</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Réservations</a> <a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Générer carte</a> {% if u.role == 'adherent' %}<a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent et ses réservations ?')">Supprimer</a>{% else %}<span class="badge wait">Admin adhérent</span>{% endif %}</td></tr>{% else %}<tr><td colspan="12" class="muted">Aucun adhérent.</td></tr>{% endfor %}</table><br><button class="btn" type="submit">Écrire aux adhérents sélectionnés</button></form></div>{% endset %}{{ shell(content, 'members')|safe }}
@@ -4229,6 +4349,16 @@ TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
 TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}""",
     """{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}{% if user.account_status == 'archived' %}<div class="flash">Ce dossier est archivé. Utilisez le bloc “Renouveler l'adhésion” pour le réactiver et le faire réapparaître dans l'onglet Adhérents.</div>{% endif %}""",
+    1,
+)
+TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
+    """<tr><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th></tr>""",
+    """<tr><th>Abonnement</th><th>Période</th><th>Tarif abo</th><th>Cotisation</th><th>Total</th><th>Créé par</th><th>Note</th><th>Action</th></tr>""",
+    1,
+)
+TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
+    """<td>{{ p.notes or '' }}</td></tr>{% else %}<tr><td colspan="7" class="muted">Aucun historique d'adhésion.</td></tr>""",
+    """<td>{{ p.notes or '' }}</td><td><form method="post" action="{{ url_for('admin_delete_membership_period', user_id=user.id, period_id=p.id) }}" onsubmit="return confirm('Supprimer cette adhésion de l\\'historique ? Cette action retire aussi cette ligne du budget.');"><button class="btn danger" type="submit">Supprimer</button></form></td></tr>{% else %}<tr><td colspan="8" class="muted">Aucun historique d'adhésion.</td></tr>""",
     1,
 )
 

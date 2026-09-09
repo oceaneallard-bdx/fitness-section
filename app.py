@@ -2266,6 +2266,15 @@ def create_session_if_missing(day, course_name, start, end, capacity, booking_op
     ).first()
 
     if existing:
+        if not existing.bookings:
+            existing.capacity = capacity
+            existing.coach_name = coach_name
+            existing.is_reservable = is_reservable
+            existing.waitlist_capacity = waitlist_capacity_value
+            if not existing.booking_open_date:
+                existing.booking_open_date = booking_open_date
+            if not existing.priority_until:
+                existing.priority_until = booking_open_date + timedelta(days=6)
         return False
 
     db.session.add(CourseSession(
@@ -4638,6 +4647,8 @@ TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace(
     """</table><details style="margin-top:16px"><summary style="cursor:pointer;font-weight:800">Détail facturation</summary><p class="muted">Règle de facturation : un créneau isolé ou un bloc continu de cours d'1h ou moins est compté 1h30. Deux cours accolés d'1h sont donc comptés 2h.</p><br><table class="table"><tr><th>Date</th><th>Horaire</th><th>Durée réelle</th><th>Durée facturée</th><th>Cours</th><th>Statut</th><th>Coach initial</th><th>Remplaçant</th><th>Suivi admin</th><th>Notes admin</th></tr>{% for row in invoice_detail_rows %}<tr><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.horaire }}</td><td>{{ row.duration_label }}</td><td><strong>{{ row.billed_label }}</strong></td><td>{{ row.cours }}</td><td>{{ row.statut }}</td><td>{{ row.coach_initial }}</td><td>{{ row.remplacant or '-' }}</td><td>{{ row.suivi_admin or '-' }}</td><td>{{ row.notes_admin or '' }}</td></tr>{% else %}<tr><td colspan="10" class="muted">Aucun détail sur ce mois.</td></tr>{% endfor %}</table></details></div><br><h2>Cours prévus</h2>""",
     1,
 )
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace("Sans résa", "Sans réservation")
+TEMPLATE_COACH_SCHEDULE = TEMPLATE_COACH_SCHEDULE.replace("Sans résa", "Sans réservation")
 
 TEMPLATE_SETTINGS = """
 {% set content %}<div class="card"><h1>Paramètres</h1>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<form method="post" class="card" style="box-shadow:none;background:#f9fafb"><input type="hidden" name="settings_section" value="pricing"><h3>Tarifs des abonnements par statut</h3><p class="muted">Renseigner le montant attendu pour chaque combinaison abonnement / statut. Ces montants alimentent automatiquement l'onglet Budget.</p><div class="field" style="max-width:360px"><label>Cotisation annuelle première inscription (€)</label><input name="annual_membership_fee" value="{{ '%.2f'|format(annual_membership_fee) }}"></div><br><table class="table"><tr><th>Abonnement</th>{% for profile_key, profile_label in member_profile_labels.items() %}<th>{{ profile_label }}</th>{% endfor %}</tr>{% for name in subscription_prices %}<tr><td><strong>{{ name }}</strong></td>{% for profile_key, profile_label in member_profile_labels.items() %}<td><input name="{{ subscription_profile_price_key(name, profile_key) }}" value="{{ '%.2f'|format(subscription_price_matrix[name][profile_key]) }}" style="width:110px;padding:10px;border:1px solid #d1d5db;border-radius:10px"> €</td>{% endfor %}</tr>{% endfor %}</table><br><button class="btn" type="submit">Enregistrer les tarifs</button></form><br><form method="post" class="card" style="box-shadow:none;background:#f9fafb"><h3>Créer un cours</h3><div class="form-grid"><div class="field"><label>Nom du coach</label><input name="coach_name" required></div><div class="field"><label>Intitulé cours</label><input name="course_name" required></div><div class="field"><label>Jour</label><select name="weekday">{% for label in weekday_labels %}<option value="{{ loop.index0 }}">{{ label }}</option>{% endfor %}</select></div><div class="field"><label>Semaine odd/even</label><select name="week_parity"><option value="all">Toutes</option><option value="even">Even / paire</option><option value="odd">Odd / impaire</option></select></div><div class="field"><label>Début</label><input name="start_time" type="time" required></div><div class="field"><label>Fin</label><input name="end_time" type="time" required></div><div class="field"><label>Jauge</label><input name="capacity" type="number" value="35" min="1" required></div><div class="field"><label>Réservation</label><label style="font-weight:600"><input name="is_reservable" type="checkbox" checked style="width:auto"> Créneau à réserver</label></div></div><br><button class="btn" type="submit">Créer le cours</button></form><br><table class="table"><tr><th>Jour</th><th>Semaine</th><th>Cours</th><th>Horaire</th><th>Jauge</th><th>Coach</th><th>Réservation</th><th>Statut</th><th>Actions</th></tr>{% for t in templates %}<tr><form method="post" action="{{ url_for('edit_template', template_id=t.id) }}"><td><select name="weekday">{% for label in weekday_labels %}<option value="{{ loop.index0 }}" {% if t.weekday == loop.index0 %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></td><td><select name="week_parity"><option value="all" {% if t.week_parity == 'all' %}selected{% endif %}>Toutes</option><option value="even" {% if t.week_parity == 'even' %}selected{% endif %}>Even</option><option value="odd" {% if t.week_parity == 'odd' %}selected{% endif %}>Odd</option></select></td><td><input name="course_name" value="{{ t.course_name }}" required></td><td><input name="start_time" type="time" value="{{ t.start_time.strftime('%H:%M') }}" required><br><input name="end_time" type="time" value="{{ t.end_time.strftime('%H:%M') }}" required></td><td><input name="capacity" type="number" min="1" value="{{ t.capacity }}" required style="width:80px"></td><td><input name="coach_name" value="{{ t.coach_name or '' }}" required></td><td><label style="font-weight:600"><input name="is_reservable" type="checkbox" {% if t.is_reservable %}checked{% endif %} style="width:auto"> Oui</label></td><td>{% if t.active %}<span class="badge">Actif</span>{% else %}<span class="badge full">Inactif</span>{% endif %}</td><td><button class="btn secondary" type="submit">Modifier</button> <a class="btn secondary" href="{{ url_for('toggle_template', template_id=t.id) }}">Activer / désactiver</a> <a class="btn danger" href="{{ url_for('delete_template', template_id=t.id) }}" onclick="return confirm('Supprimer ce cours ? Les séances futures sans réservation seront supprimées.')">Supprimer</a></td></form></tr>{% else %}<tr><td colspan="9" class="muted">Aucun cours.</td></tr>{% endfor %}</table><br><h3>Profs</h3><table class="table"><tr><th>Prof</th><th>Action</th></tr>{% for coach in coaches %}<tr><td>{{ coach }}</td><td><a class="btn danger" href="{{ url_for('delete_settings_coach', coach_name=coach) }}" onclick="return confirm('Supprimer ce prof des cours paramétrés et des futurs cours sans réservation ?')">Supprimer ce prof des cours</a></td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun prof.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'settings')|safe }}
@@ -4813,22 +4824,30 @@ DEFAULT_COURSE_TEMPLATES = [
     (0, "even", "Pilates", time(12, 45), time(13, 45), 35, "Hayate"),
     (0, "odd", "Body Barres", time(11, 45), time(12, 45), 18, "Hayate"),
     (0, "odd", "Body Zen", time(12, 45), time(13, 45), 35, "Hayate"),
+    (1, "all", "Step", time(17, 30), time(18, 0), 35, "Hayate", False),
     (1, "all", "Pilates", time(18, 0), time(18, 45), 35, "Hayate"),
     (1, "all", "Biking", time(18, 45), time(19, 30), 16, "Hayate"),
 ]
 
-REMOVED_DEFAULT_COURSE_TEMPLATES = [
-    (1, "all", "Step", time(17, 30), time(18, 0), "Hayate"),
-    (2, "all", "Body Sculpt", time(12, 45), time(13, 45), "Hayate"),
-]
+REMOVED_DEFAULT_COURSE_TEMPLATES = []
 
 
 def seed_default_course_templates():
     cleanup_removed_default_course_templates()
-    for weekday, parity, name, start, end, capacity, coach in DEFAULT_COURSE_TEMPLATES:
+    for item in DEFAULT_COURSE_TEMPLATES:
+        if len(item) == 8:
+            weekday, parity, name, start, end, capacity, coach, is_reservable = item
+        else:
+            weekday, parity, name, start, end, capacity, coach = item
+            is_reservable = True
         existing = CourseTemplate.query.filter_by(weekday=weekday, week_parity=parity, course_name=name, start_time=start, end_time=end).first()
         if not existing:
-            db.session.add(CourseTemplate(weekday=weekday, week_parity=parity, course_name=name, start_time=start, end_time=end, capacity=capacity, coach_name=coach, active=True, is_reservable=True))
+            db.session.add(CourseTemplate(weekday=weekday, week_parity=parity, course_name=name, start_time=start, end_time=end, capacity=capacity, coach_name=coach, active=True, is_reservable=is_reservable))
+        else:
+            existing.capacity = capacity
+            existing.coach_name = coach
+            existing.active = True
+            existing.is_reservable = is_reservable
     db.session.commit()
 
 
@@ -5340,10 +5359,25 @@ def admin_settings():
         waitlist_capacity_value = int(request.form.get("waitlist_capacity", 5))
         coach_name = request.form.get("coach_name", "").strip()
         is_reservable = request.form.get("is_reservable") == "on"
-        db.session.add(CourseTemplate(weekday=weekday, week_parity=parity, course_name=course_name, start_time=start, end_time=end, capacity=capacity, waitlist_capacity=waitlist_capacity_value, coach_name=coach_name, active=True, is_reservable=is_reservable))
+        existing_template = CourseTemplate.query.filter_by(
+            weekday=weekday,
+            week_parity=parity,
+            course_name=course_name,
+            start_time=start,
+            end_time=end,
+            coach_name=coach_name,
+        ).first()
+        if existing_template:
+            existing_template.end_time = end
+            existing_template.capacity = capacity
+            existing_template.waitlist_capacity = waitlist_capacity_value
+            existing_template.is_reservable = is_reservable
+            existing_template.active = True
+        else:
+            db.session.add(CourseTemplate(weekday=weekday, week_parity=parity, course_name=course_name, start_time=start, end_time=end, capacity=capacity, waitlist_capacity=waitlist_capacity_value, coach_name=coach_name, active=True, is_reservable=is_reservable))
         db.session.commit()
         generate_rolling_sessions(days_ahead=28)
-        flash("Cours créé. Il apparaît dans le planning coach et sera généré automatiquement sur le planning glissant.")
+        flash("Cours créé ou mis à jour. Il apparaît dans le planning coach et sera généré automatiquement sur le planning glissant.")
         return redirect(url_for("admin_settings"))
     templates = CourseTemplate.query.order_by(CourseTemplate.weekday, CourseTemplate.start_time).all()
     return render_template_string(TEMPLATE_SETTINGS, templates=templates, single_sessions=single_course_sessions(), coaches=configured_coach_rows(), coach_options=configured_coach_names(), replacement_coaches=get_replacement_coaches(), planning_weekdays=get_coach_planning_weekdays(), weekday_labels=WEEKDAY_LABELS, subscription_prices=get_subscription_prices(), subscription_price_matrix=get_subscription_price_matrix(), member_profile_labels=MEMBER_PROFILE_LABELS, annual_membership_fee=get_annual_membership_fee(), current_year=date.today().year, subscription_price_key=subscription_price_key, subscription_profile_price_key=subscription_profile_price_key)

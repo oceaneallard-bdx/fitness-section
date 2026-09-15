@@ -13,6 +13,7 @@ import smtplib
 import ssl
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import certifi
 from email.utils import formataddr, parseaddr
@@ -156,6 +157,7 @@ class Booking(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     cancelled_at = db.Column(db.DateTime, nullable=True)
     promoted_from_waitlist_at = db.Column(db.DateTime, nullable=True)
+    promotion_email_sent_at = db.Column(db.DateTime, nullable=True)
     archived = db.Column(db.Boolean, nullable=False, default=False)
     user = db.relationship("User", backref="bookings")
     session = db.relationship("CourseSession", backref="bookings")
@@ -1361,6 +1363,84 @@ def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
         return 200 <= response.status < 300
 
 
+def brevo_api_get(path, params=None):
+    if not BREVO_API_KEY:
+        return None, "BREVO_API_KEY non configurée."
+    query = urllib.parse.urlencode(params or {})
+    url = f"https://api.brevo.com/v3{path}"
+    if query:
+        url = f"{url}?{query}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "accept": "application/json",
+            "api-key": BREVO_API_KEY,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=SMTP_TIMEOUT, context=ssl.create_default_context(cafile=certifi.where())) as response:
+            return json.loads(response.read().decode("utf-8") or "{}"), ""
+    except Exception as exc:
+        detail = str(exc)
+        if isinstance(exc, urllib.error.HTTPError):
+            detail = exc.read().decode("utf-8", errors="replace") or detail
+        print("\n--- ERREUR API BREVO ---")
+        print(detail)
+        print("-----------------------\n")
+        return None, detail
+
+
+def brevo_transactional_events_for_email(email, limit=30):
+    data, error = brevo_api_get("/smtp/statistics/events", {
+        "email": email,
+        "limit": limit,
+        "offset": 0,
+        "sort": "desc",
+    })
+    if error:
+        return [], error
+    events = (data or {}).get("events", [])
+    return events if isinstance(events, list) else [], ""
+
+
+def brevo_email_uuid_from_message_id(message_id):
+    if not message_id:
+        return "", "Identifiant Brevo absent."
+    for key in ["messageId", "message_id"]:
+        data, error = brevo_api_get("/smtp/emails", {key: message_id})
+        if error:
+            continue
+        if isinstance(data, str):
+            return data, ""
+        if isinstance(data, dict):
+            for candidate_key in ["uuid", "messageUuid", "id"]:
+                if data.get(candidate_key):
+                    return str(data[candidate_key]), ""
+            emails = data.get("emails") or data.get("items") or []
+            if emails and isinstance(emails, list):
+                first = emails[0]
+                if isinstance(first, str):
+                    return first, ""
+                if isinstance(first, dict):
+                    for candidate_key in ["uuid", "messageUuid", "id"]:
+                        if first.get(candidate_key):
+                            return str(first[candidate_key]), ""
+    return "", "Impossible de retrouver l'UUID Brevo depuis ce message-id."
+
+
+def brevo_transactional_email_content(message_id="", uuid=""):
+    uuid = (uuid or "").strip()
+    if not uuid:
+        uuid, error = brevo_email_uuid_from_message_id(message_id)
+        if error:
+            return None, error
+    data, error = brevo_api_get(f"/smtp/emails/{urllib.parse.quote(uuid)}")
+    if error:
+        return None, error
+    return data, ""
+
+
 def send_email(to, subject, body, attachments=None, html_body=None, inline_images=None):
     try:
         attachments = attachments or []
@@ -2032,15 +2112,51 @@ def create_booking_for_user(user, session, by_admin=False):
     return booking, "waiting_list"
 
 
+def send_waitlist_promotion_email(booking):
+    session = booking.session
+    return send_email(
+        booking.user.email,
+        "Réservation confirmée - place libérée",
+        (
+            f"Bonjour {booking.user.display_name()},\n\n"
+            f"Une place s'est libérée pour {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} "
+            f"à {session.start_time.strftime('%H:%M')}.\n\n"
+            "Votre réservation est maintenant confirmée : vous pouvez participer au cours.\n\n"
+            "Pensez à annuler depuis votre profil si vous n'êtes finalement pas disponible.\n\n"
+            "Section Fitness"
+        ),
+    )
+
+
 def promote_next_waiting_for_session(session):
     next_waiting = Booking.query.filter_by(session_id=session.id, status="waiting_list").order_by(Booking.created_at, Booking.id).first()
     if next_waiting and booked_count(session) < session.capacity:
         next_waiting.status = "booked"
         next_waiting.promoted_from_waitlist_at = datetime.utcnow()
+        next_waiting.promotion_email_sent_at = None
         db.session.commit()
-        send_email(next_waiting.user.email, "Réservation confirmée - place libérée", f"Bonjour {next_waiting.user.display_name()},\n\nUne place s'est libérée pour {session.course_name} du {session.course_date.strftime('%d/%m/%Y')} à {session.start_time.strftime('%H:%M')}.\n\nVotre réservation est maintenant confirmée.\n\nSection Fitness")
+        email_sent = send_waitlist_promotion_email(next_waiting)
+        next_waiting.promotion_email_sent_at = datetime.utcnow() if email_sent else None
+        db.session.commit()
+        next_waiting.promotion_email_sent = email_sent
+        if not email_sent:
+            print(
+                "\n--- ALERTE PROMOTION LISTE ATTENTE SANS EMAIL ---\n"
+                f"Adhérent: {next_waiting.user.display_name()} <{next_waiting.user.email}>\n"
+                f"Cours: {session.course_name} {session.course_date.strftime('%d/%m/%Y')} {session.start_time.strftime('%H:%M')}\n"
+                "La réservation est confirmée mais l'email de promotion n'a pas été envoyé.\n"
+                "-------------------------------------------------\n"
+            )
         return next_waiting
     return None
+
+
+def promotion_flash_message(promoted):
+    if not promoted:
+        return ""
+    if getattr(promoted, "promotion_email_sent", False) or promoted.promotion_email_sent_at:
+        return f"{promoted.user.display_name()} a été promu depuis la liste d’attente et l’email de confirmation a été envoyé."
+    return f"{promoted.user.display_name()} a été promu depuis la liste d’attente, mais l’email automatique n’a pas pu être envoyé : merci de prévenir l’adhérent manuellement."
 
 
 def cancel_booking_and_promote(booking, cancelled_by_admin=False):
@@ -2964,7 +3080,7 @@ def cancel(booking_id):
         return redirect(redirect_target)
     promoted = cancel_booking_and_promote(booking, cancelled_by_admin=is_admin() and booking.user_id != current_user.id)
     if promoted:
-        flash(f"Réservation annulée. {promoted.user.display_name()} a été promu depuis la liste d’attente.")
+        flash(f"Réservation annulée. {promotion_flash_message(promoted)}")
     else:
         flash("Réservation annulée.")
     return redirect(redirect_target)
@@ -3074,7 +3190,7 @@ def delete_trial_participant(booking_id):
         db.session.delete(user)
     db.session.commit()
     if promoted:
-        flash(f"{name} retiré de la liste du cours. {promoted.user.display_name()} a été promu depuis la liste d’attente.")
+        flash(f"{name} retiré de la liste du cours. {promotion_flash_message(promoted)}")
     else:
         flash(f"{name} retiré de la liste du cours.")
     return redirect(url_for("session_detail", session_id=session_id))
@@ -3150,6 +3266,9 @@ def mark_absent(booking_id):
     booking = Booking.query.get_or_404(booking_id)
     if booking.status != "booked":
         flash("Seules les réservations confirmées peuvent être marquées absentes.")
+        return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
+    if booking.promoted_from_waitlist_at and not booking.promotion_email_sent_at:
+        flash("Absence non enregistrée : cet adhérent a été promu depuis la liste d’attente mais l’email de confirmation n’a pas été envoyé. Merci de le traiter sans pénalité.")
         return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "absent_unexcused"
     booking.attendance_status = "absent"
@@ -3241,7 +3360,24 @@ def admin_edit_member(user_id):
     if repair_missing_prior_membership_periods(user):
         db.session.commit()
     membership_periods = membership_period_rows(MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year.desc(), MembershipPeriod.start_date.desc()).all())
-    return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys(), split_name=split_name)
+    brevo_events, brevo_error = brevo_transactional_events_for_email(user.email)
+    return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys(), split_name=split_name, brevo_events=brevo_events, brevo_error=brevo_error)
+
+
+@app.route("/admin/members/<int:user_id>/brevo-email")
+@login_required
+def admin_member_brevo_email_content(user_id):
+    if not is_admin():
+        flash("Accès réservé à l’admin.")
+        return redirect(url_for("index"))
+    user = User.query.get_or_404(user_id)
+    if not is_member_account(user):
+        flash("Seuls les comptes ayant un profil adhérent peuvent être consultés depuis cet écran.")
+        return redirect(url_for("admin_members"))
+    message_id = request.args.get("message_id", "").strip()
+    uuid = request.args.get("uuid", "").strip()
+    email_data, error = brevo_transactional_email_content(message_id=message_id, uuid=uuid)
+    return render_template_string(TEMPLATE_BREVO_EMAIL_CONTENT, user=user, email_data=email_data, error=error)
 
 
 @app.route("/admin/members/<int:user_id>/renew", methods=["POST"])
@@ -3366,7 +3502,7 @@ def admin_cancel_member_booking(user_id, booking_id):
         return redirect(url_for("admin_member_reservations", user_id=user.id))
     promoted = cancel_booking_and_promote(booking, cancelled_by_admin=True)
     if promoted:
-        flash(f"Réservation annulée pour l’adhérent. {promoted.user.display_name()} a été promu depuis la liste d’attente.")
+        flash(f"Réservation annulée pour l’adhérent. {promotion_flash_message(promoted)}")
     else:
         flash("Réservation annulée pour l’adhérent.")
     return redirect(url_for("admin_member_reservations", user_id=user.id))
@@ -4422,6 +4558,15 @@ TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
     """<td>{{ p.notes or '' }}</td><td><form method="post" action="{{ url_for('admin_delete_membership_period', user_id=user.id, period_id=p.id) }}" onsubmit="return confirm('Supprimer cette adhésion de l\\'historique ? Cette action retire aussi cette ligne du budget.');"><button class="btn danger" type="submit">Supprimer</button></form></td></tr>{% else %}<tr><td colspan="8" class="muted">Aucun historique d'adhésion.</td></tr>""",
     1,
 )
+TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
+    """</table></div></div>{% endset %}""",
+    """</table></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Emails transactionnels Brevo</h2><p class="muted">Logs lus automatiquement depuis Brevo Transactionnel pour {{ user.email }}.</p></div><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=user.id) }}">Rafraîchir</a></div>{% if brevo_error %}<div class="flash" style="background:#fff7ed;border-color:#fed7aa;color:#9a3412">{{ brevo_error }}</div>{% endif %}<table class="table"><tr><th>Date</th><th>Événement</th><th>Objet</th><th>Expéditeur</th><th>Message ID</th><th>Action</th></tr>{% for event in brevo_events %}{% set message_id = event.get('messageId') or event.get('message-id') or event.get('message_id') or '' %}<tr><td>{{ event.get('date') or event.get('ts') or '-' }}</td><td><span class="badge {% if event.get('event') in ['hardBounces','hard_bounce','blocked','error','invalid','spam'] %}full{% elif event.get('event') in ['deferred','soft_bounce'] %}wait{% endif %}">{{ event.get('event') or '-' }}</span>{% if event.get('reason') %}<br><small class="muted">{{ event.get('reason') }}</small>{% endif %}</td><td>{{ event.get('subject') or event.get('sub') or '-' }}</td><td>{{ event.get('from') or event.get('frm') or '-' }}</td><td><small>{{ message_id or '-' }}</small></td><td>{% if message_id %}<a class="btn secondary" href="{{ url_for('admin_member_brevo_email_content', user_id=user.id, message_id=message_id) }}">Voir contenu</a>{% else %}<span class="muted">-</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun log Brevo trouvé pour cet email.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
+    1,
+)
+
+TEMPLATE_BREVO_EMAIL_CONTENT = """
+{% set content %}<div class="card"><div class="top"><div><h1>Email Brevo</h1><p class="muted">{{ user.display_name() }} · {{ user.email }}</p></div><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=user.id) }}">Retour fiche</a></div>{% if error %}<div class="flash" style="background:#fff7ed;border-color:#fed7aa;color:#9a3412">{{ error }}</div>{% endif %}{% if email_data %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>{{ email_data.get('subject') or 'Email transactionnel' }}</h2><p class="muted">Envoyé le {{ email_data.get('date') or '-' }} à {{ email_data.get('email') or user.email }}</p><h3>Historique Brevo</h3><table class="table"><tr><th>Événement</th><th>Date</th></tr>{% for event in email_data.get('events', []) %}<tr><td>{{ event.get('name') or event.get('event') or '-' }}</td><td>{{ event.get('time') or event.get('date') or '-' }}</td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun événement détaillé.</td></tr>{% endfor %}</table></div><br><div class="card" style="box-shadow:none;background:white"><h3>Contenu</h3>{% if email_data.get('body') %}<iframe srcdoc="{{ email_data.get('body')|e }}" style="width:100%;min-height:520px;border:1px solid #e5e7eb;border-radius:12px;background:white"></iframe>{% else %}<p class="muted">Aucun aperçu de contenu retourné par Brevo pour cet email.</p>{% endif %}</div>{% endif %}</div>{% endset %}{{ shell(content, 'members')|safe }}
+"""
 
 TEMPLATE_ADMIN_MEMBER_RESERVATIONS = """
 {% set content %}<div class="card"><div class="top"><div><h1>Réservations - {{ user.display_name() }}</h1><p class="muted">Réserver ou annuler des créneaux pour cet adhérent depuis le profil admin.</p></div><a class="btn secondary" href="{{ url_for('admin_members') }}">Retour adhérents</a></div>{% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}<h2>Réservations de l'adhérent</h2><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Statut</th><th>Action</th></tr>{% for b in bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge {% if b.status == 'absent_unexcused' %}full{% endif %}">{{ b.status }}</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('admin_cancel_member_booking', user_id=user.id, booking_id=b.id) }}" onclick="return confirm('Annuler cette réservation ?')">Annuler</a>{% else %}<span class="muted">-</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune réservation.</td></tr>{% endfor %}</table><br><h2>Créneaux ouverts</h2><table class="table"><tr><th>Date</th><th>Horaire</th><th>Cours</th><th>Jauge</th><th>Priorité</th><th>Action</th></tr>{% for s in sessions %}<tr><td>{{ s.course_date.strftime('%d/%m/%Y') }}</td><td>{{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</td><td>{{ s.course_name }}</td><td>{{ booked_count(s) }} / {{ s.capacity }}</td><td>{% if monday_midday_priority_applies(s) %}<span class="badge wait">priorité mensuels jusqu'au {{ s.priority_until.strftime('%d/%m/%Y') }}</span>{% else %}<span class="muted">ouverte</span>{% endif %}</td><td>{% if s.id in active_session_ids %}<span class="muted">Déjà inscrit</span>{% else %}<a class="btn" href="{{ url_for('admin_book_for_member', user_id=user.id, session_id=s.id) }}">Réserver</a>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun créneau à venir.</td></tr>{% endfor %}</table></div>{% endset %}{{ shell(content, 'members')|safe }}
@@ -6102,6 +6247,7 @@ def ensure_schema():
             "attendance_status": "ALTER TABLE booking ADD COLUMN attendance_status VARCHAR(30)",
             "cancelled_at": "ALTER TABLE booking ADD COLUMN cancelled_at TIMESTAMP",
             "promoted_from_waitlist_at": "ALTER TABLE booking ADD COLUMN promoted_from_waitlist_at TIMESTAMP",
+            "promotion_email_sent_at": "ALTER TABLE booking ADD COLUMN promotion_email_sent_at TIMESTAMP",
         }
         for col, sql in booking_additions.items():
             if col not in booking_columns:
@@ -6173,6 +6319,8 @@ def ensure_schema():
         db.session.execute(db.text("ALTER TABLE booking ADD COLUMN cancelled_at DATETIME"))
     if "promoted_from_waitlist_at" not in booking_columns:
         db.session.execute(db.text("ALTER TABLE booking ADD COLUMN promoted_from_waitlist_at DATETIME"))
+    if "promotion_email_sent_at" not in booking_columns:
+        db.session.execute(db.text("ALTER TABLE booking ADD COLUMN promotion_email_sent_at DATETIME"))
 
     ensure_coach_absence_schema()
     ensure_inventory_schema()

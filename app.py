@@ -1391,6 +1391,46 @@ def brevo_api_get(path, params=None):
         return None, detail
 
 
+def brevo_message_id_variants(message_id):
+    raw = (message_id or "").strip()
+    variants = []
+    for value in [raw, raw.strip("<>")]:
+        if value and value not in variants:
+            variants.append(value)
+    return variants
+
+
+def brevo_extract_uuid(data):
+    if isinstance(data, str):
+        return data
+    if isinstance(data, dict):
+        for candidate_key in ["uuid", "messageUuid", "messageUUID", "id"]:
+            if data.get(candidate_key):
+                return str(data[candidate_key])
+        for list_key in ["transactionalEmails", "emails", "items"]:
+            items = data.get(list_key)
+            if isinstance(items, list) and items:
+                found = brevo_extract_uuid(items[0])
+                if found:
+                    return found
+    if isinstance(data, list) and data:
+        return brevo_extract_uuid(data[0])
+    return ""
+
+
+def brevo_transactional_email_rows_for_email(email, limit=100):
+    data, error = brevo_api_get("/smtp/emails", {
+        "email": email,
+        "limit": limit,
+        "offset": 0,
+        "sort": "desc",
+    })
+    if error:
+        return []
+    rows = (data or {}).get("transactionalEmails") or (data or {}).get("emails") or []
+    return rows if isinstance(rows, list) else []
+
+
 def brevo_transactional_events_for_email(email, limit=30):
     data, error = brevo_api_get("/smtp/statistics/events", {
         "email": email,
@@ -1401,31 +1441,35 @@ def brevo_transactional_events_for_email(email, limit=30):
     if error:
         return [], error
     events = (data or {}).get("events", [])
-    return events if isinstance(events, list) else [], ""
+    if not isinstance(events, list):
+        return [], ""
+    uuid_by_message_id = {}
+    for row in brevo_transactional_email_rows_for_email(email):
+        message_id = row.get("messageId") or row.get("message-id") or row.get("message_id") or ""
+        uuid = brevo_extract_uuid(row)
+        if message_id and uuid:
+            for variant in brevo_message_id_variants(message_id):
+                uuid_by_message_id[variant] = uuid
+    for event in events:
+        message_id = event.get("messageId") or event.get("message-id") or event.get("message_id") or ""
+        if not event.get("uuid") and message_id:
+            for variant in brevo_message_id_variants(message_id):
+                if uuid_by_message_id.get(variant):
+                    event["uuid"] = uuid_by_message_id[variant]
+                    break
+    return events, ""
 
 
 def brevo_email_uuid_from_message_id(message_id):
     if not message_id:
         return "", "Identifiant Brevo absent."
-    for key in ["messageId", "message_id"]:
-        data, error = brevo_api_get("/smtp/emails", {key: message_id})
+    for variant in brevo_message_id_variants(message_id):
+        data, error = brevo_api_get("/smtp/emails", {"messageId": variant})
         if error:
             continue
-        if isinstance(data, str):
-            return data, ""
-        if isinstance(data, dict):
-            for candidate_key in ["uuid", "messageUuid", "id"]:
-                if data.get(candidate_key):
-                    return str(data[candidate_key]), ""
-            emails = data.get("emails") or data.get("items") or []
-            if emails and isinstance(emails, list):
-                first = emails[0]
-                if isinstance(first, str):
-                    return first, ""
-                if isinstance(first, dict):
-                    for candidate_key in ["uuid", "messageUuid", "id"]:
-                        if first.get(candidate_key):
-                            return str(first[candidate_key]), ""
+        uuid = brevo_extract_uuid(data)
+        if uuid:
+            return uuid, ""
     return "", "Impossible de retrouver l'UUID Brevo depuis ce message-id."
 
 
@@ -3377,7 +3421,7 @@ def admin_member_brevo_email_content(user_id):
     message_id = request.args.get("message_id", "").strip()
     uuid = request.args.get("uuid", "").strip()
     email_data, error = brevo_transactional_email_content(message_id=message_id, uuid=uuid)
-    return render_template_string(TEMPLATE_BREVO_EMAIL_CONTENT, user=user, email_data=email_data, error=error)
+    return render_template_string(TEMPLATE_BREVO_EMAIL_CONTENT, user=user, email_data=email_data, error=error, message_id=message_id, uuid=uuid)
 
 
 @app.route("/admin/members/<int:user_id>/renew", methods=["POST"])
@@ -4560,12 +4604,12 @@ TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
 )
 TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace(
     """</table></div></div>{% endset %}""",
-    """</table></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Emails transactionnels Brevo</h2><p class="muted">Logs lus automatiquement depuis Brevo Transactionnel pour {{ user.email }}.</p></div><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=user.id) }}">Rafraîchir</a></div>{% if brevo_error %}<div class="flash" style="background:#fff7ed;border-color:#fed7aa;color:#9a3412">{{ brevo_error }}</div>{% endif %}<table class="table"><tr><th>Date</th><th>Événement</th><th>Objet</th><th>Expéditeur</th><th>Message ID</th><th>Action</th></tr>{% for event in brevo_events %}{% set message_id = event.get('messageId') or event.get('message-id') or event.get('message_id') or '' %}<tr><td>{{ event.get('date') or event.get('ts') or '-' }}</td><td><span class="badge {% if event.get('event') in ['hardBounces','hard_bounce','blocked','error','invalid','spam'] %}full{% elif event.get('event') in ['deferred','soft_bounce'] %}wait{% endif %}">{{ event.get('event') or '-' }}</span>{% if event.get('reason') %}<br><small class="muted">{{ event.get('reason') }}</small>{% endif %}</td><td>{{ event.get('subject') or event.get('sub') or '-' }}</td><td>{{ event.get('from') or event.get('frm') or '-' }}</td><td><small>{{ message_id or '-' }}</small></td><td>{% if message_id %}<a class="btn secondary" href="{{ url_for('admin_member_brevo_email_content', user_id=user.id, message_id=message_id) }}">Voir contenu</a>{% else %}<span class="muted">-</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun log Brevo trouvé pour cet email.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
+    """</table></div><br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Emails transactionnels Brevo</h2><p class="muted">Logs lus automatiquement depuis Brevo Transactionnel pour {{ user.email }}.</p></div><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=user.id) }}">Rafraîchir</a></div>{% if brevo_error %}<div class="flash" style="background:#fff7ed;border-color:#fed7aa;color:#9a3412">{{ brevo_error }}</div>{% endif %}<table class="table"><tr><th>Date</th><th>Événement</th><th>Objet</th><th>Expéditeur</th><th>Message ID</th><th>Action</th></tr>{% for event in brevo_events %}{% set message_id = event.get('messageId') or event.get('message-id') or event.get('message_id') or '' %}{% set uuid = event.get('uuid') or event.get('messageUuid') or '' %}<tr><td>{{ event.get('date') or event.get('ts') or '-' }}</td><td><span class="badge {% if event.get('event') in ['hardBounces','hard_bounce','blocked','error','invalid','spam'] %}full{% elif event.get('event') in ['deferred','soft_bounce'] %}wait{% endif %}">{{ event.get('event') or '-' }}</span>{% if event.get('reason') %}<br><small class="muted">{{ event.get('reason') }}</small>{% endif %}</td><td>{{ event.get('subject') or event.get('sub') or '-' }}</td><td>{{ event.get('from') or event.get('frm') or '-' }}</td><td><small>{{ message_id or uuid or '-' }}</small></td><td>{% if uuid %}<a class="btn secondary" href="{{ url_for('admin_member_brevo_email_content', user_id=user.id, uuid=uuid) }}">Voir contenu</a>{% elif message_id %}<a class="btn secondary" href="{{ url_for('admin_member_brevo_email_content', user_id=user.id, message_id=message_id) }}">Voir contenu</a>{% else %}<span class="muted">-</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">Aucun log Brevo trouvé pour cet email.</td></tr>{% endfor %}</table></div></div>{% endset %}""",
     1,
 )
 
 TEMPLATE_BREVO_EMAIL_CONTENT = """
-{% set content %}<div class="card"><div class="top"><div><h1>Email Brevo</h1><p class="muted">{{ user.display_name() }} · {{ user.email }}</p></div><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=user.id) }}">Retour fiche</a></div>{% if error %}<div class="flash" style="background:#fff7ed;border-color:#fed7aa;color:#9a3412">{{ error }}</div>{% endif %}{% if email_data %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>{{ email_data.get('subject') or 'Email transactionnel' }}</h2><p class="muted">Envoyé le {{ email_data.get('date') or '-' }} à {{ email_data.get('email') or user.email }}</p><h3>Historique Brevo</h3><table class="table"><tr><th>Événement</th><th>Date</th></tr>{% for event in email_data.get('events', []) %}<tr><td>{{ event.get('name') or event.get('event') or '-' }}</td><td>{{ event.get('time') or event.get('date') or '-' }}</td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun événement détaillé.</td></tr>{% endfor %}</table></div><br><div class="card" style="box-shadow:none;background:white"><h3>Contenu</h3>{% if email_data.get('body') %}<iframe srcdoc="{{ email_data.get('body')|e }}" style="width:100%;min-height:520px;border:1px solid #e5e7eb;border-radius:12px;background:white"></iframe>{% else %}<p class="muted">Aucun aperçu de contenu retourné par Brevo pour cet email.</p>{% endif %}</div>{% endif %}</div>{% endset %}{{ shell(content, 'members')|safe }}
+{% set content %}<div class="card"><div class="top"><div><h1>Email Brevo</h1><p class="muted">{{ user.display_name() }} · {{ user.email }}</p></div><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=user.id) }}">Retour fiche</a></div>{% if error %}<div class="flash" style="background:#fff7ed;border-color:#fed7aa;color:#9a3412"><strong>Contenu Brevo indisponible.</strong><br>{{ error }}<br><small>Message ID : {{ message_id or '-' }} · UUID : {{ uuid or '-' }}</small></div>{% endif %}{% if email_data %}<div class="card" style="box-shadow:none;background:#f9fafb"><h2>{{ email_data.get('subject') or 'Email transactionnel' }}</h2><p class="muted">Envoyé le {{ email_data.get('date') or '-' }} à {{ email_data.get('email') or user.email }}</p><h3>Historique Brevo</h3><table class="table"><tr><th>Événement</th><th>Date</th></tr>{% for event in email_data.get('events', []) %}<tr><td>{{ event.get('name') or event.get('event') or '-' }}</td><td>{{ event.get('time') or event.get('date') or '-' }}</td></tr>{% else %}<tr><td colspan="2" class="muted">Aucun événement détaillé.</td></tr>{% endfor %}</table></div><br><div class="card" style="box-shadow:none;background:white"><h3>Contenu</h3>{% if email_data.get('body') %}<iframe srcdoc="{{ email_data.get('body')|e }}" style="width:100%;min-height:520px;border:1px solid #e5e7eb;border-radius:12px;background:white"></iframe>{% else %}<p class="muted">Aucun aperçu de contenu retourné par Brevo pour cet email.</p>{% endif %}</div>{% endif %}</div>{% endset %}{{ shell(content, 'members')|safe }}
 """
 
 TEMPLATE_ADMIN_MEMBER_RESERVATIONS = """

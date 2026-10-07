@@ -2277,6 +2277,75 @@ def absence_count(user):
     ).count()
 
 
+def unexcused_absence_bookings(user, since=None):
+    query = Booking.query.join(CourseSession).filter(
+        Booking.user_id == user.id,
+        Booking.status == "absent_unexcused",
+    )
+    if since:
+        query = query.filter(CourseSession.course_date >= since)
+    return query.order_by(CourseSession.course_date, CourseSession.start_time, Booking.id).all()
+
+
+def absence_block_status(user, reference_date=None):
+    reference_date = reference_date or date.today()
+    absences = unexcused_absence_bookings(user)
+    absence_dates = [booking.session.course_date for booking in absences if booking.session and booking.session.course_date]
+    trigger_date = None
+    trigger_window_dates = []
+    for current_absence_date in absence_dates:
+        window_start = current_absence_date - timedelta(days=90)
+        window_dates = [item for item in absence_dates if window_start <= item <= current_absence_date]
+        if len(window_dates) >= 2:
+            trigger_date = current_absence_date
+            trigger_window_dates = window_dates
+
+    if not trigger_date:
+        return {
+            "is_blocked": False,
+            "blocked_from": None,
+            "blocked_until": None,
+            "trigger_date": None,
+            "trigger_window_dates": [],
+            "recent_absences": [booking for booking in absences if booking.session and booking.session.course_date >= reference_date - timedelta(days=90)],
+            "all_absences": absences,
+        }
+
+    blocked_until = trigger_date + timedelta(days=14)
+    return {
+        "is_blocked": trigger_date <= reference_date <= blocked_until,
+        "blocked_from": trigger_date,
+        "blocked_until": blocked_until,
+        "trigger_date": trigger_date,
+        "trigger_window_dates": trigger_window_dates,
+        "recent_absences": [booking for booking in absences if booking.session and booking.session.course_date >= reference_date - timedelta(days=90)],
+        "all_absences": absences,
+    }
+
+
+def sync_absence_block_status(user, send_notification=False):
+    status = absence_block_status(user)
+    if status["is_blocked"]:
+        old_until = user.blocked_until
+        user.blocked_until = status["blocked_until"]
+        user.blocked_at = status["blocked_from"]
+        user.blocked_reason = (
+            "Blocage automatique : 2 absences non excusées sur 90 jours. "
+            f"Déclenché le {status['trigger_date'].strftime('%d/%m/%Y')}."
+        )
+        if send_notification and old_until != user.blocked_until:
+            send_email(
+                user.email,
+                "Blocage temporaire de votre compte Fitness",
+                f"Bonjour {user.display_name()},\n\nVotre compte est temporairement bloqué pour réserver des cours jusqu'au {user.blocked_until.strftime('%d/%m/%Y')} inclus.\n\nCe blocage est déclenché car vous avez eu 2 absences non excusées sur une période de 90 jours. La deuxième absence prise en compte date du {status['trigger_date'].strftime('%d/%m/%Y')}.\n\nSection Fitness"
+            )
+    elif user.blocked_reason and user.blocked_reason.startswith("Blocage automatique"):
+        user.blocked_until = None
+        user.blocked_at = None
+        user.blocked_reason = None
+    return status
+
+
 def session_slot_label(session):
     day = WEEKDAY_LABELS[session.course_date.weekday()]
     hour = session.start_time.hour
@@ -2451,25 +2520,13 @@ def course_name_options():
 
 
 def apply_absence_sanction(user):
-    absences = absence_count(user)
-    if absences >= 2:
-        user.blocked_until = date.today() + timedelta(days=30)
-        user.blocked_at = date.today()
-        user.blocked_reason = f"Blocage automatique : {absences} absences non excusées sur 90 jours."
-        db.session.commit()
-        send_email(
-            user.email,
-            "Blocage temporaire de votre compte Fitness",
-            f"Bonjour {user.display_name()},\n\nVotre compte est temporairement bloqué jusqu'au {user.blocked_until} en raison de {absences} absences non excusées sur les 90 derniers jours.\n\nSection Fitness"
-        )
+    status = sync_absence_block_status(user, send_notification=True)
+    db.session.commit()
+    return status
 
 
 def refresh_absence_block_status(user):
-    absences = absence_count(user)
-    if absences < 2 and user.blocked_reason and user.blocked_reason.startswith("Blocage automatique"):
-        user.blocked_until = None
-        user.blocked_at = None
-        user.blocked_reason = None
+    return sync_absence_block_status(user)
 
 
 def planned_sessions_for_day(day):
@@ -2756,6 +2813,10 @@ def before_each_request():
 @login_required
 def index():
     today = date.today()
+    absence_block = {"recent_absences": [], "all_absences": [], "is_blocked": False, "blocked_until": None, "trigger_date": None}
+    if current_user.role in ["adherent", "admin"]:
+        absence_block = refresh_absence_block_status(current_user)
+        db.session.commit()
     end_date = today + timedelta(days=28)
     query = CourseSession.query.filter(
         CourseSession.course_date >= today,
@@ -2802,7 +2863,7 @@ def index():
     latest_bookings = Booking.query.join(CourseSession).join(Booking.user).filter(
         User.role.in_(["adherent", "admin"])
     ).order_by(Booking.created_at.desc(), Booking.id.desc()).limit(12).all() if is_admin() else []
-    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, attendance_counts=attendance_counts, attendance_count_label=attendance_count_label)
+    return render_template_string(TEMPLATE_INDEX, sessions=sessions, booked_count=booked_count, waitlist_rank=waitlist_rank, stats=stats, latest_bookings=latest_bookings, preference_options=preference_options(), preference_stats=preference_stats(), section_stats=section_admin_stats(), selected_course=selected_course, selected_coach=selected_coach, selected_slot=selected_slot, abs_by_key=abs_by_key, current_bookings=current_bookings, active_booking_by_session=active_booking_by_session, attendance_counts=attendance_counts, attendance_count_label=attendance_count_label, absence_block=absence_block)
 
 
 @app.route("/admin/statistics")
@@ -3133,8 +3194,10 @@ def book(session_id):
     if not session.is_reservable:
         flash("Ce cours ne nécessite pas de réservation.")
         return redirect(redirect_target)
+    refresh_absence_block_status(current_user)
+    db.session.commit()
     if current_user.is_blocked():
-        flash(f"Vous êtes bloqué jusqu'au {current_user.blocked_until}.")
+        flash(f"Vous êtes bloqué jusqu'au {current_user.blocked_until.strftime('%d/%m/%Y')} inclus.")
         return redirect(redirect_target)
     can_book, reason = user_can_book_session(current_user, session)
     if not can_book:
@@ -3707,6 +3770,9 @@ def admin_members():
     if account_status:
         query = query.filter(User.account_status == account_status)
     users = query.order_by(User.full_name, User.email).all()
+    for user in users:
+        refresh_absence_block_status(user)
+    db.session.commit()
     filter_values = {
         "search": search,
         "member_profile": profile,
@@ -4076,6 +4142,9 @@ def blocked_members():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
+    for user in active_member_query().all():
+        refresh_absence_block_status(user)
+    db.session.commit()
     users = User.query.filter(User.blocked_until >= date.today()).order_by(User.blocked_until.desc()).all()
     recent_absences = Booking.query.join(CourseSession).join(Booking.user).filter(
         Booking.status == "absent_unexcused",
@@ -4374,7 +4443,8 @@ TEMPLATE_INDEX = """
 {% set content %}
 <div class="top"><div><h1>Bienvenue, {{ current_user.display_name() }} 👋</h1><p class="muted">Voici le planning de la Section Fitness.</p></div>{% if current_user.role == 'adherent' %}<a class="btn secondary" href="{{ url_for('download_card', user_id=current_user.id) }}">Ma carte adhérent</a>{% endif %}</div>
 {% with messages = get_flashed_messages() %}{% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
-{% if current_user.is_blocked() %}<div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Votre compte est bloqué jusqu'au {{ current_user.blocked_until }}.</div>{% endif %}
+{% if current_user.is_blocked() %}<div class="flash" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">Votre compte est bloqué jusqu'au {{ current_user.blocked_until.strftime('%d/%m/%Y') }} inclus.</div>{% endif %}
+{% if current_user.role in ['adherent','admin'] %}<div class="card" style="box-shadow:none;background:#f9fafb;margin-bottom:18px"><h2>Suivi absences injustifiées</h2><p class="muted">Règle : 2 absences injustifiées sur 90 jours roulants déclenchent un blocage de réservation de 2 semaines à partir de la 2e absence.</p><div class="grid"><div class="card" style="box-shadow:none"><span class="muted">Absences sur les 90 derniers jours</span><div class="stat">{{ absence_block.recent_absences|length }}</div></div><div class="card" style="box-shadow:none"><span class="muted">Statut réservation</span><div class="stat">{% if current_user.is_blocked() %}Bloqué{% else %}Ouvert{% endif %}</div>{% if absence_block.blocked_until %}<small class="muted">Fin du blocage : {{ absence_block.blocked_until.strftime('%d/%m/%Y') }}</small>{% endif %}</div></div><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th></tr>{% for b in absence_block.recent_absences %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}</td><td>{{ b.session.course_name }}<br><small class="muted">{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td><span class="badge full">Absence injustifiée</span></td></tr>{% else %}<tr><td colspan="3" class="muted">Aucune absence injustifiée sur les 90 derniers jours.</td></tr>{% endfor %}</table>{% if absence_block.trigger_date %}<p class="muted">Dernier déclenchement identifié : 2e absence le {{ absence_block.trigger_date.strftime('%d/%m/%Y') }}. Blocage calculé jusqu'au {{ absence_block.blocked_until.strftime('%d/%m/%Y') }} inclus.</p>{% endif %}</div>{% endif %}
 <div class="content-grid"><section class="card"><h2>Prochaines séances</h2>{% if current_user.role not in ['admin','coach'] %}<form method="get" style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin:12px 0 18px"><h3 style="margin-top:0">Filtres</h3><div class="form-grid"><div class="field"><label>Cours</label><select name="course_filter"><option value="">Tous</option>{% for name in preference_options.courses %}<option value="{{ name }}" {% if selected_course == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Coach</label><select name="coach_filter"><option value="">Tous</option>{% for name in preference_options.coaches %}<option value="{{ name }}" {% if selected_coach == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div><div class="field"><label>Créneau</label><select name="slot_filter"><option value="">Tous</option>{% for name in preference_options.slots %}<option value="{{ name }}" {% if selected_slot == name %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><br><button class="btn" type="submit">Filtrer</button> <a class="btn secondary" href="{{ url_for('index') }}">Réinitialiser</a></form>{% endif %}{% for s in sessions %}{% set a = absence_for_session(abs_by_key, s) %}{% set booking = active_booking_by_session.get(s.id) %}<div class="session"><div><div class="muted">{{ s.course_date.strftime('%A %d/%m/%Y') }} · {{ s.start_time.strftime('%H:%M') }} - {{ s.end_time.strftime('%H:%M') }}</div><strong>{{ s.course_name }}</strong>{% if a %}<br><span class="badge {{ absence_badge_class(a) }}">{{ absence_display_label(a) }}</span>{% if a.replacement_name %}<br><small>Remplaçant : {{ a.replacement_name }}</small>{% endif %}{% endif %}{% if s.is_reservable %}<div class="muted">{{ booked_count(s) }} / {{ s.capacity }} inscrits</div>{% else %}<div class="muted">Pas de réservation</div>{% endif %}</div><div>{% if not s.is_reservable %}<span class="badge wait">Sans réservation</span>{% elif booking %}{% if booking.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(booking) }}</span>{% else %}<span class="badge">Déjà réservé</span>{% endif %}{% elif booked_count(s) >= s.capacity %}<span class="badge full">Complet</span>{% else %}<span class="badge">{{ s.capacity - booked_count(s) }} places</span>{% endif %}<br><br>{% if current_user.role == 'adherent' and s.is_reservable %}{% set can_book, reason = user_can_book_session(current_user, s) %}{% if booking %}<a class="btn danger" href="{{ url_for('cancel', booking_id=booking.id, next=request.full_path) }}">Annuler</a>{% elif a and absence_blocks_booking(a) %}<span class="badge full">Indisponible</span>{% elif not can_book %}<span class="badge wait">{{ reason }}</span>{% else %}<a class="btn" href="{{ url_for('book', session_id=s.id, next=request.full_path) }}">Réserver</a>{% endif %}{% endif %}{% if current_user.role in ['admin','coach'] %}<a class="btn secondary" href="{{ url_for('session_detail', session_id=s.id) }}">Voir liste</a>{% endif %}</div></div>{% else %}<p class="muted">Aucune séance à venir.</p>{% endfor %}</section>
 {% if current_user.role == 'admin' %}<section class="card"><h2>Dernières actions adhérents</h2><table class="table"><tr><th>Date action</th><th>Adhérent</th><th>Cours</th><th>Statut</th><th>Actions</th></tr>{% for b in latest_bookings %}<tr><td>{{ b.created_at.strftime('%d/%m/%Y %H:%M') if b.created_at else '-' }}</td><td>{{ b.user.display_name() }}<br><small class="muted">{{ b.user.email }}</small></td><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% elif b.status == 'booked' %}<span class="badge">Réservé</span>{% else %}<span class="badge full">{{ b.status }}</span>{% endif %}</td><td><a class="btn secondary" href="{{ url_for('session_detail', session_id=b.session_id) }}">Modifier</a>{% if b.status in ['booked','waiting_list'] %} <a class="btn danger" href="{{ url_for('cancel', booking_id=b.id) }}" onclick="return confirm('Annuler cette réservation ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">Aucune réservation récente.</td></tr>{% endfor %}</table></section>{% else %}<section class="card"><h2>Mes réservations à venir</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th></th></tr>{% for b in current_bookings %}<tr><td>{{ b.session.course_date.strftime('%d/%m/%Y') }}<br><small>{{ b.session.start_time.strftime('%H:%M') }} - {{ b.session.end_time.strftime('%H:%M') }}</small></td><td>{{ b.session.course_name }}</td><td>{% if b.status == 'waiting_list' %}<span class="badge wait">Liste d’attente — rang {{ waitlist_rank(b) }}</span>{% else %}<span class="badge">Réservé</span>{% endif %}</td><td>{% if b.status in ['booked','waiting_list'] %}<a class="btn danger" href="{{ url_for('cancel', booking_id=b.id, next=request.full_path) }}">Annuler</a>{% endif %}</td></tr>{% else %}<tr><td colspan="4" class="muted">Aucune réservation à venir.</td></tr>{% endfor %}</table><br><div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div></section>{% endif %}</div>
 {% endset %}{{ shell(content, 'home')|safe }}
@@ -4391,7 +4461,7 @@ TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
 )
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(
     """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
-    """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Les cours sont créés automatiquement 28 jours avant leur date.</p><p>Pour les créneaux réservables, les adhérents mensuels disposent d'une priorité de réservation pendant les 7 premiers jours.</p><p>Après ces 7 jours, les places restantes sont ouvertes à tous les statuts : cadres et autres peuvent alors réserver jusqu'à 21 jours avant la date du cours, selon les places disponibles.</p><p>Chaque adhérent est autonome pour réserver et annuler ses créneaux depuis son profil. Les membres du Bureau Fitness n'ont pas la main pour annuler une réservation à la place d'un adhérent.</p><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours entraînent un blocage temporaire des réservations.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
+    """<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Règles de réservation</h2><p>Les cours sont créés automatiquement 28 jours avant leur date.</p><p>Pour les créneaux réservables, les adhérents mensuels disposent d'une priorité de réservation pendant les 7 premiers jours.</p><p>Après ces 7 jours, les places restantes sont ouvertes à tous les statuts : cadres et autres peuvent alors réserver jusqu'à 21 jours avant la date du cours, selon les places disponibles.</p><p>Chaque adhérent est autonome pour réserver et annuler ses créneaux depuis son profil. Les membres du Bureau Fitness n'ont pas la main pour annuler une réservation à la place d'un adhérent.</p><p>Annulation possible jusqu'à 2h avant le cours.</p><p>Deux absences injustifiées sur 90 jours roulants entraînent un blocage de réservation de 2 semaines à partir de la 2e absence.</p><p>Si vous arrivez en retard, la coach peut corriger l'appel : le retard n'entraîne pas de pénalité.</p></div>""",
     1,
 )
 TEMPLATE_INDEX = TEMPLATE_INDEX.replace(

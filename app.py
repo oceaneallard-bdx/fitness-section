@@ -2799,6 +2799,8 @@ def run_daily_automation(force=False):
 
 @app.before_request
 def before_each_request():
+    if request.method == "HEAD":
+        return
     if request.endpoint not in {"static"}:
         global SCHEMA_READY
         if not SCHEMA_READY:

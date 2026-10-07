@@ -8,3 +8,4 @@ apscheduler
 certifi
 gunicorn
 psycopg2-binary
+psycopg[binary]

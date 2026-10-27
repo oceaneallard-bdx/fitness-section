@@ -204,6 +204,13 @@ class CampaignDelivery(db.Model):
     __table_args__ = (db.UniqueConstraint("campaign_id", "email"),)
 
 
+class CampaignEmailReceipt(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    delivery_id = db.Column(db.Integer, unique=True, nullable=False)
+    message_id = db.Column(db.String(500), nullable=True)
+    transport = db.Column(db.String(20), nullable=False)
+
+
 class MembershipPeriod(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
@@ -1357,7 +1364,7 @@ def mail_from_header():
     return formataddr((sender.get("name") or "NoReply Section Fitness", sender["email"]))
 
 
-def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
+def send_email_brevo_api(to, subject, body, attachments=None, html_body=None, receipt=None):
     attachments = attachments or []
     payload = {
         "sender": mail_sender_payload(),
@@ -1391,6 +1398,9 @@ def send_email_brevo_api(to, subject, body, attachments=None, html_body=None):
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=SMTP_TIMEOUT, context=ssl.create_default_context(cafile=certifi.where())) as response:
+        result = json.loads(response.read().decode("utf-8") or "{}")
+        if receipt is not None:
+            receipt.update(transport="brevo", message_id=result.get("messageId", ""))
         return 200 <= response.status < 300
 
 
@@ -1569,12 +1579,12 @@ def brevo_transactional_email_content(message_id="", uuid=""):
     return data, ""
 
 
-def send_email(to, subject, body, attachments=None, html_body=None, inline_images=None):
+def send_email(to, subject, body, attachments=None, html_body=None, inline_images=None, receipt=None):
     try:
         attachments = attachments or []
         inline_images = inline_images or {}
         if BREVO_API_KEY:
-            return send_email_brevo_api(to, subject, body, attachments=attachments, html_body=html_body)
+            return send_email_brevo_api(to, subject, body, attachments=attachments, html_body=html_body, receipt=receipt)
 
         if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
             print("\n--- EMAIL NON ENVOYÉ : SMTP NON CONFIGURÉ ---")
@@ -1594,6 +1604,8 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
         msg["From"] = mail_from_header()
         msg["Bcc"] = to
         msg["Subject"] = subject
+        from email.utils import make_msgid
+        msg["Message-ID"] = make_msgid()
         msg.set_content(body)
         if html_body:
             msg.add_alternative(html_body, subtype="html")
@@ -1616,12 +1628,18 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
         if SMTP_PORT == 465:
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT, context=context) as server:
                 server.login(SMTP_USER, SMTP_PASSWORD)
-                server.send_message(msg)
+                refused = server.send_message(msg)
         else:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
                 server.starttls(context=context)
                 server.login(SMTP_USER, SMTP_PASSWORD)
-                server.send_message(msg)
+                refused = server.send_message(msg)
+
+        if refused:
+            print("Envoi SMTP refusé pour le destinataire.")
+            return False
+        if receipt is not None:
+            receipt.update(transport="smtp", message_id=msg["Message-ID"])
 
         return True
 
@@ -4400,15 +4418,16 @@ def shell(content, active=""):
     if current_user.is_authenticated and current_user.role == "admin":
         admin_links = (
             f'<a class="{"active" if active=="members" else ""}" href="{url_for("admin_members")}">Adhérents</a>'
-            f'<a class="{"active" if active=="office" else ""}" href="{url_for("admin_office")}">Bureau / Admins</a>'
-            f'<a class="{"active" if active=="coach_planning" else ""}" href="{url_for("admin_coach_planning")}">Planning coachs</a>'
-            f'<a class="{"active" if active=="statistics" else ""}" href="{url_for("admin_statistics")}">Statistiques</a>'
+            f'<a class="{"active" if active=="campaigns" else ""}" href="{url_for("campaign_editor")}">Campagne email</a>'
+            f'<a class="{"active" if active=="coach_planning" else ""}" href="{url_for("admin_coach_planning")}">Planning coach</a>'
             f'<a class="{"active" if active=="budget" else ""}" href="{url_for("admin_budget")}">Budget</a>'
             f'<a class="{"active" if active=="inventory" else ""}" href="{url_for("admin_inventory")}">Inventaire</a>'
-            f'<a class="{"active" if active=="settings" else ""}" href="{url_for("admin_settings")}">Paramètres</a>'
             f'<a class="{"active" if active=="useful_info" else ""}" href="{url_for("useful_info")}">Infos utiles</a>'
+            f'<a class="{"active" if active=="office" else ""}" href="{url_for("admin_office")}">Bureau / Admins</a>'
+            f'<a class="{"active" if active=="statistics" else ""}" href="{url_for("admin_statistics")}">Statistiques</a>'
+            f'<a class="{"active" if active=="settings" else ""}" href="{url_for("admin_settings")}">Paramètres</a>'
             f'<a class="{"active" if active=="archives" else ""}" href="{url_for("admin_archives")}">Archives</a>'
-            f'<a class="{"active" if active=="member_profile" else ""}" href="{url_for("member_profile")}">Mon profil adhérent</a>'
+            f'<a class="{"active" if active=="member_profile" else ""}" href="{url_for("member_profile")}">Profil adhérent</a>'
             f'<a class="{"active" if active=="member_coach_planning" else ""}" href="{url_for("member_coach_planning")}">Réserver mes cours</a>'
         )
     member_links = ""
@@ -6646,6 +6665,7 @@ TEMPLATE_CAMPAIGN_EDITOR = """
 {% if campaign %}<input type="hidden" name="edit" value="{{ campaign.id }}">{% endif %}
 {% for id in settings.selected %}<input type="hidden" name="user_ids" value="{{ id }}">{% endfor %}
 <fieldset><legend>Destinataires</legend>{% for key, label in [('adherent','Adhérents'),('admin','Administrateurs'),('coach','Coachs')] %}<label style="display:block"><input type="checkbox" name="target_roles" value="{{ key }}" {% if key in settings.roles %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
+<div class="field"><label>Adresses email manuelles (virgule, point-virgule ou une adresse par ligne)</label><textarea name="manual_emails" rows="3" maxlength="26000" placeholder="prenom.nom@exemple.fr">{{ request.form.get('manual_emails', settings.get('manual_emails', [])|join('\n')) }}</textarea></div>
 <fieldset><legend>Catégories adhérents (toutes si aucune cochée)</legend>{% for key, label in categories.items() %}<label style="display:block"><input type="checkbox" name="categories" value="{{ key }}" {% if key in settings.categories %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
 <p class="muted">Les catégories cochées sont réunies. Les administrateurs reçoivent aussi les campagnes adhérents. Destinataires en copie cachée.</p>
 <div class="field"><label>Objet</label><input name="subject" maxlength="250" required value="{{ request.form.get('subject', campaign.subject if campaign else '') }}"></div>
@@ -6655,8 +6675,8 @@ TEMPLATE_CAMPAIGN_EDITOR = """
 <div class="field"><label>Programmer l'envoi (heure de Paris ; vide : dès que possible)</label><input type="datetime-local" name="scheduled_at" value="{{ campaign.scheduled_at.strftime('%Y-%m-%dT%H:%M') if campaign else '' }}"></div><br>
 <button class="btn" type="submit">{{ 'Enregistrer les modifications' if campaign else "Enregistrer l'envoi" }}</button> <a class="btn secondary" href="{{ url_for('campaign_editor') }}">Nouvelle campagne</a>
 </form></section>
-<section><h2>Envois programmés et historique</h2>{% for item in campaigns %}{% set counts = delivery_counts(item) %}<article style="border-bottom:1px solid #ddd;padding:12px 0"><strong>{{ item.subject }}</strong><p>{{ item.scheduled_at.strftime('%d/%m/%Y %H:%M') }} (Paris) · {{ {'pending':'Programmé', 'sending':'En cours', 'sent':'Terminé', 'failed':'Échec partiel ou total'}.get(item.state, item.state) }}</p><p>{{ counts.sent }} accepté(s) par le service email · {{ counts.failed }} échec(s) · {{ counts.pending }} en attente</p>{% if item.state == 'pending' %}<a class="btn secondary" href="{{ url_for('campaign_editor', edit=item.id) }}">Modifier</a>{% endif %}</article>{% else %}<p>Aucune campagne enregistrée.</p>{% endfor %}</section></div>
-{% endset %}{{ shell(content, 'members')|safe }}
+<section><h2>Envois programmés et historique</h2><p class="muted">L'acceptation par le serveur d'envoi ne confirme pas la réception. Consultez le suivi par destinataire pour vérifier les événements Brevo.</p>{% for item in campaigns %}{% set counts = delivery_counts(item) %}<article style="border-bottom:1px solid #ddd;padding:12px 0"><strong>{{ item.subject }}</strong><p>{{ item.scheduled_at.strftime('%d/%m/%Y %H:%M') }} (Paris) · {{ {'pending':'Programmé', 'sending':'En cours', 'sent':'Transmis au serveur (réception non vérifiée)', 'failed':'Échec partiel ou total'}.get(item.state, item.state) }}</p><p>{{ counts.sent }} accepté(s) par le serveur d'envoi · {{ counts.failed }} échec(s) · {{ counts.pending }} en attente · {{ counts.sending }} en cours / résultat incertain</p><a class="btn secondary" href="{{ url_for('campaign_delivery_detail', campaign_id=item.id) }}">Suivi des destinataires</a> {% if item.state == 'pending' %}<a class="btn secondary" href="{{ url_for('campaign_editor', edit=item.id) }}">Modifier</a>{% endif %}</article>{% else %}<p>Aucune campagne enregistrée.</p>{% endfor %}</section></div>
+{% endset %}{{ shell(content, 'campaigns')|safe }}
 """
 
 TEMPLATE_MEMBER_COMMUNICATION = """
@@ -6678,6 +6698,7 @@ TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace("{% set 
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(">Modifier</a>", ">Gérer le profil</a>").replace(">Réservations</a>", ">Gérer les réservations</a>")
 _MEMBER_ACCOUNT_LINKS = """<a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a>"""
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(_MEMBER_ACCOUNT_LINKS, """<a class="btn secondary" href="{{ url_for('member_communication', user_id=u.id) }}">Communication</a>""")
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace("""<a class="btn" id="member-campaign-link" href="{{ url_for('admin_email_members') }}">Campagne email</a> """, "")
 TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace("<h1>Modifier l'adhérent</h1>", """<h1>Gérer le profil</h1><p><a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=user.id) }}">Lien d'activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=user.id) }}">Réinitialisation du mot de passe</a></p>""")
 TEMPLATE_ADMIN_EDIT_MEMBER = re.sub(r'<br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Emails transactionnels Brevo</h2>.*?</table></div>', '', TEMPLATE_ADMIN_EDIT_MEMBER, count=1, flags=re.S)
 
@@ -6803,8 +6824,11 @@ def process_deferred_emails():
                 if not claimed:
                     continue
                 public_url = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+                receipt = {}
                 ok = send_email(delivery.email, campaign.subject, admin_email_signature_body(campaign.body),
-                    attachments=paths, html_body=admin_email_signature_html(campaign.body, logo_url=public_url + "/static/logo.png" if public_url else ""))
+                    attachments=paths, html_body=admin_email_signature_html(campaign.body, logo_url=public_url + "/static/logo.png" if public_url else ""), receipt=receipt)
+                if ok and receipt:
+                    db.session.add(CampaignEmailReceipt(delivery_id=delivery.id, transport=receipt["transport"], message_id=receipt.get("message_id")))
                 delivery.state = "sent" if ok else "failed"
                 db.session.commit()
         if CampaignDelivery.query.filter(CampaignDelivery.campaign_id == campaign.id, CampaignDelivery.state.in_(["sending", "pending"])).count():
@@ -6856,6 +6880,63 @@ def member_communication(user_id):
     return render_template_string(TEMPLATE_MEMBER_COMMUNICATION, user=user, emails=emails, error=error)
 
 
+@app.route("/admin/campaigns/<int:campaign_id>/deliveries")
+@login_required
+def campaign_delivery_detail(campaign_id):
+    if not is_admin():
+        return redirect(url_for("index"))
+    campaign = EmailCampaign.query.get_or_404(campaign_id)
+    deliveries = CampaignDelivery.query.filter_by(campaign_id=campaign.id).order_by(CampaignDelivery.email).all()
+    selected = None
+    events, error, exact = [], "", False
+    if request.args.get("delivery_id"):
+        selected = CampaignDelivery.query.filter_by(id=request.args.get("delivery_id", type=int), campaign_id=campaign.id).first_or_404()
+        receipt = CampaignEmailReceipt.query.filter_by(delivery_id=selected.id).first()
+        params = {"email": selected.email, "limit": 100, "sort": "desc"}
+        if receipt and receipt.message_id and receipt.transport == "brevo":
+            params["messageId"] = receipt.message_id
+            exact = True
+        else:
+            # Older sends have no retained provider ID: never claim exact correlation.
+            params.update(startDate=campaign.scheduled_at.date().isoformat(), endDate=campaign.scheduled_at.date().isoformat())
+        data, error = brevo_api_get("/smtp/statistics/events", params)
+        events = (data or {}).get("events", [])
+    labels = {"requests": "Pris en charge", "request": "Pris en charge", "sent": "Envoyé", "delivered": "Remis au serveur destinataire", "deferred": "Différé", "blocked": "Bloqué", "hardBounce": "Rejet définitif", "hard_bounce": "Rejet définitif", "softBounce": "Rejet temporaire", "soft_bounce": "Rejet temporaire", "error": "Erreur", "invalid": "Adresse invalide", "opened": "Ouvert", "uniqueOpened": "Ouvert", "unsubscribed": "Désinscrit"}
+    return render_template_string(TEMPLATE_CAMPAIGN_DELIVERIES, campaign=campaign, deliveries=deliveries, selected=selected, events=events, error=error, exact=exact, labels=labels)
+
+
+TEMPLATE_CAMPAIGN_DELIVERIES = """
+{% set content %}<h1>Suivi de campagne</h1><h2>{{ campaign.subject }}</h2><a class="btn secondary" href="{{ url_for('campaign_editor') }}">Retour aux campagnes</a>
+<p>Programmé le {{ campaign.scheduled_at.strftime('%d/%m/%Y à %H:%M') }} (Paris).</p>
+<table class="table"><tr><th>Destinataire (copie cachée)</th><th>État de transmission</th><th>Réception</th></tr>{% for delivery in deliveries %}<tr><td>{{ delivery.email }}</td><td>{{ {'sent': 'Accepté par le serveur, réception non vérifiée', 'failed': "Échec d'envoi", 'pending': 'En attente', 'sending': 'En cours / résultat incertain'}.get(delivery.state, delivery.state) }}</td><td><a class="btn secondary" href="{{ url_for('campaign_delivery_detail', campaign_id=campaign.id, delivery_id=delivery.id) }}">Vérifier dans Brevo</a></td></tr>{% endfor %}</table>
+{% if selected %}<h2>Événements Brevo · {{ selected.email }}</h2>{% if error %}<div class="flash">{{ error }}</div>{% endif %}
+{% if not exact %}<p class="muted">Ancien envoi ou envoi SMTP sans identifiant Brevo conservé : événements de cette adresse sur la journée programmée, sans garantie qu'ils correspondent à cette campagne. Les nouveaux envois par API conservent leur identifiant exact.</p>{% endif %}
+<table class="table"><tr><th>Date</th><th>Événement</th><th>Motif retourné par Brevo</th></tr>{% for event in events %}<tr><td>{{ event.get('date', '-') }}</td><td>{{ labels.get(event.get('event'), event.get('event', '-')) }}</td><td>{{ event.get('reason') or '-' }}</td></tr>{% else %}<tr><td colspan="3">Aucun événement disponible. La réception n'est pas confirmée.</td></tr>{% endfor %}</table><p class="muted">Une remise au serveur destinataire ne garantit pas le classement dans la boîte principale : vérifier également les indésirables et la quarantaine professionnelle.</p>{% endif %}
+{% endset %}{{ shell(content, 'campaigns')|safe }}
+"""
+
+
+def parse_campaign_manual_emails(raw):
+    addresses = set()
+    if len(raw) > 26000:
+        raise ValueError("La liste d'adresses email est trop longue.")
+    for address in re.split(r"[\s,;]+", raw.strip()):
+        if not address:
+            continue
+        address = address.lower()
+        local, separator, domain = address.rpartition("@")
+        labels = domain.split(".")
+        if (not separator or len(address) > 254 or not local or len(local) > 64
+                or not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+", local)
+                or local.startswith(".") or local.endswith(".") or ".." in local
+                or len(labels) < 2 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)):
+            raise ValueError(f"Adresse email invalide : {address[:254]}")
+        addresses.add(address)
+    if len(addresses) > 100:
+        raise ValueError("Maximum 100 adresses email manuelles par campagne.")
+    return sorted(addresses)
+
+
 @app.route("/admin/campaigns", methods=["GET", "POST"])
 @login_required
 def campaign_editor():
@@ -6872,15 +6953,16 @@ def campaign_editor():
     if request.method == "POST":
         try:
             roles = [role for role in request.form.getlist("target_roles") if role in {"admin", "adherent", "coach"}]
-            if not roles:
-                raise ValueError("Sélectionnez au moins un groupe destinataire.")
+            manual_emails = parse_campaign_manual_emails(request.form.get("manual_emails", ""))
+            if not roles and not manual_emails:
+                raise ValueError("Sélectionnez un groupe ou renseignez au moins une adresse email.")
             selected = request.form.getlist("user_ids")
             categories = request.form.getlist("categories")
             users = campaign_target_users(selected, roles)
             users = [user for user in users if user.role != "adherent" or not categories or
                      user.member_profile in categories or user.status in categories]
             subject, body = request.form.get("subject", "").strip(), request.form.get("body", "").strip()
-            if not subject or not body or len(subject) > 250 or not users:
+            if not subject or not body or len(subject) > 250 or not (users or manual_emails):
                 raise ValueError("Objet (250 caractères maximum), message et destinataires sont obligatoires.")
             scheduled = datetime.fromisoformat(request.form["scheduled_at"]) if request.form.get("scheduled_at") else local_now()
             if scheduled.tzinfo:
@@ -6913,19 +6995,25 @@ def campaign_editor():
                 db.session.add(campaign)
             campaign.subject, campaign.body = subject, body
             campaign.scheduled_at, campaign.state = scheduled, "pending"
-            campaign.recipients_json = json.dumps({"roles": roles, "categories": categories, "selected": selected})
+            campaign.recipients_json = json.dumps({"roles": roles, "categories": categories, "selected": selected, "manual_emails": manual_emails})
             campaign.attachments_json = json.dumps(attachments)
             db.session.flush()
             addresses = {(user.email or "").strip().lower() for user in users if user.email}
+            addresses.update(manual_emails)
             for address in addresses:
                 db.session.add(CampaignDelivery(campaign_id=campaign.id, email=address))
             db.session.commit()
-            flash(f"Campagne enregistrée pour {len(addresses)} destinataires : {campaign_target_summary(roles, selected)}. Traitement à partir du {scheduled:%d/%m/%Y %H:%M} (Paris).")
+            summary = campaign_target_summary(roles, selected) if roles else "adresses manuelles uniquement"
+            if roles and manual_emails:
+                summary += " et adresses manuelles"
+            flash(f"Campagne enregistrée pour {len(addresses)} destinataires : {summary}. Traitement à partir du {scheduled:%d/%m/%Y %H:%M} (Paris).")
             return redirect(url_for("campaign_editor"))
         except (ValueError, TypeError) as error:
             db.session.rollback()
             flash(str(error))
     settings = json.loads(campaign.recipients_json) if campaign else {"roles": ["adherent"], "categories": [], "selected": request.args.getlist("user_ids")}
+    if request.method == "POST":
+        settings.update(roles=request.form.getlist("target_roles"), categories=request.form.getlist("categories"), selected=request.form.getlist("user_ids"))
     return render_template_string(TEMPLATE_CAMPAIGN_EDITOR, campaign=campaign, settings=settings,
         campaigns=EmailCampaign.query.order_by(EmailCampaign.created_at.desc()).limit(50).all(),
         categories={"ouvrant_droit": "Ouvrant droit", "ayant_droit": "Ayant droit", "cadre": "Cadre", "mensuel": "Mensuel", "retraite": "Retraité", "exterieur": "Extérieur"},

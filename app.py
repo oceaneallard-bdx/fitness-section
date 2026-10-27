@@ -1188,13 +1188,10 @@ def campaign_role_label(role):
 
 
 def campaign_target_summary(target_roles, selected_ids):
+    if selected_ids:
+        return "adhérents sélectionnés uniquement (sans copie automatique aux admins)"
     labels = [campaign_role_label(role) for role in target_roles]
     summary = ", ".join(labels) if labels else "aucun groupe"
-    if selected_ids and "adherent" in target_roles:
-        summary = f"adhérents sélectionnés" + (", admins" if "admin" in target_roles else "")
-        extra_roles = [role for role in target_roles if role not in {"adherent", "admin"}]
-        if extra_roles:
-            summary += ", " + ", ".join(campaign_role_label(role) for role in extra_roles)
     if "adherent" in target_roles and "admin" in target_roles:
         summary += " (les admins reçoivent aussi les campagnes adhérents)"
     return summary
@@ -1202,11 +1199,15 @@ def campaign_target_summary(target_roles, selected_ids):
 
 def campaign_target_users(selected_ids, target_roles):
     selected_member_ids = [int(i) for i in selected_ids if str(i).isdigit()]
+    if selected_ids:
+        # An explicit selection must never expand into an entire group.
+        return User.query.filter(
+            User.id.in_(selected_member_ids), User.role.in_(["adherent", "admin"]),
+            User.account_status != "archived",
+        ).order_by(User.full_name, User.email).all()
     filters = [User.account_status != "archived"]
     role_filters = []
-    if selected_member_ids and "adherent" in target_roles:
-        role_filters.append(db.and_(User.id.in_(selected_member_ids), User.role.in_(["adherent", "admin"])))
-    elif "adherent" in target_roles:
+    if "adherent" in target_roles:
         role_filters.append(User.role == "adherent")
     non_adherent_roles = [role for role in target_roles if role != "adherent"]
     if non_adherent_roles:
@@ -6658,14 +6659,19 @@ TEMPLATE_CAMPAIGN_EDITOR = """
 <h1>Communication</h1>
 {% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:24px;align-items:start">
-<section><h2>{{ 'Modifier la campagne' if campaign else 'Nouvelle campagne' }}</h2>
+<section><h2>{{ 'Modifier le message' if campaign else 'Écrire aux adhérents sélectionnés' if settings.selected else 'Nouvelle campagne' }}</h2>
 <form method="post" enctype="multipart/form-data">
 {% if campaign %}<input type="hidden" name="edit" value="{{ campaign.id }}">{% endif %}
 {% for id in settings.selected %}<input type="hidden" name="user_ids" value="{{ id }}">{% endfor %}
-<fieldset><legend>Destinataires</legend>{% for key, label in [('adherent','Adhérents'),('admin','Administrateurs'),('coach','Coachs')] %}<label style="display:block"><input type="checkbox" name="target_roles" value="{{ key }}" {% if key in settings.roles %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
+{% if settings.selected %}
+<input type="hidden" name="target_roles" value="adherent">
+<h3>Adhérents sélectionnés · {{ selected_recipients|length }}</h3>
+<table class="table"><tr><th>Nom et prénom</th><th>Adresse email</th></tr>{% for user in selected_recipients %}<tr><td>{{ user.display_name() }}</td><td>{{ user.email }}</td></tr>{% else %}<tr><td colspan="2">Aucun destinataire actif dans cette sélection.</td></tr>{% endfor %}</table>
+<p class="muted">Envoi ciblé, sans copie automatique aux administrateurs. Destinataires en copie cachée.</p>
+{% else %}<fieldset><legend>Destinataires</legend>{% for key, label in [('adherent','Adhérents'),('admin','Administrateurs'),('coach','Coachs')] %}<label style="display:block"><input type="checkbox" name="target_roles" value="{{ key }}" {% if key in settings.roles %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>{% endif %}
 <div class="field"><label>Adresses email manuelles (virgule, point-virgule ou une adresse par ligne)</label><textarea name="manual_emails" rows="3" maxlength="26000" placeholder="prenom.nom@exemple.fr">{{ request.form.get('manual_emails', settings.get('manual_emails', [])|join('\n')) }}</textarea></div>
-<fieldset><legend>Catégories adhérents (toutes si aucune cochée)</legend>{% for key, label in categories.items() %}<label style="display:block"><input type="checkbox" name="categories" value="{{ key }}" {% if key in settings.categories %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
-<p class="muted">Les catégories cochées sont réunies. Les administrateurs reçoivent aussi les campagnes adhérents. Destinataires en copie cachée.</p>
+{% if not settings.selected %}<fieldset><legend>Catégories adhérents (toutes si aucune cochée)</legend>{% for key, label in categories.items() %}<label style="display:block"><input type="checkbox" name="categories" value="{{ key }}" {% if key in settings.categories %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
+<p class="muted">Les catégories cochées sont réunies. Les administrateurs reçoivent aussi les campagnes générales adhérents. Destinataires en copie cachée.</p>{% endif %}
 <div class="field"><label>Objet</label><input name="subject" maxlength="250" required value="{{ request.form.get('subject', campaign.subject if campaign else '') }}"></div>
 <div class="field"><label>Message</label><textarea name="body" rows="12" required style="width:100%">{{ request.form.get('body', campaign.body if campaign else '') }}</textarea></div>
 <div class="field"><label>Format du message</label><select name="message_format"><option value="html" {% if request.form.get('message_format', settings.get('message_format', 'html')) == 'html' %}selected{% endif %}>Standard avec signature et logo</option><option value="text" {% if request.form.get('message_format', settings.get('message_format', 'html')) == 'text' %}selected{% endif %}>Texte seul, sans logo</option></select></div>
@@ -6959,7 +6965,7 @@ def campaign_editor():
             selected = request.form.getlist("user_ids")
             categories = request.form.getlist("categories")
             users = campaign_target_users(selected, roles)
-            users = [user for user in users if user.role != "adherent" or not categories or
+            users = [user for user in users if selected or user.role != "adherent" or not categories or
                      user.member_profile in categories or user.status in categories]
             subject, body = request.form.get("subject", "").strip(), request.form.get("body", "").strip()
             message_format = request.form.get("message_format", "html")
@@ -7018,6 +7024,7 @@ def campaign_editor():
     if request.method == "POST":
         settings.update(roles=request.form.getlist("target_roles"), categories=request.form.getlist("categories"), selected=request.form.getlist("user_ids"))
     return render_template_string(TEMPLATE_CAMPAIGN_EDITOR, campaign=campaign, settings=settings,
+        selected_recipients=campaign_target_users(settings.get("selected", []), ["adherent"]) if settings.get("selected") else [],
         campaigns=EmailCampaign.query.order_by(EmailCampaign.created_at.desc()).limit(50).all(),
         categories={"ouvrant_droit": "Ouvrant droit", "ayant_droit": "Ayant droit", "cadre": "Cadre", "mensuel": "Mensuel", "retraite": "Retraité", "exterieur": "Extérieur"},
         attachments=json.loads(campaign.attachments_json) if campaign else [],

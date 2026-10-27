@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Thread
 import base64
 import json
+import hashlib
 import os
 import re
 import secrets
@@ -146,6 +147,25 @@ class CourseSession(db.Model):
     coach_name = db.Column(db.String(150), nullable=True)
     is_reservable = db.Column(db.Boolean, nullable=False, default=True)
     waitlist_capacity = db.Column(db.Integer, nullable=False, default=5)
+
+
+class PersonalEmailChange(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    old_email = db.Column(db.String(150), nullable=False)
+    new_email = db.Column(db.String(150), nullable=False)
+    token_hash = db.Column(db.String(64), unique=True, nullable=False)
+    password_fingerprint = db.Column(db.String(64), nullable=False)
+    requested_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    confirmed_at = db.Column(db.DateTime, nullable=True)
+    state = db.Column(db.String(20), nullable=False, default="pending")
+
+
+class PersonalEmailAttempt(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 class Booking(db.Model):
@@ -990,6 +1010,8 @@ def delete_member_completely(user):
     """Supprime un adhérent et toutes les données directement rattachées."""
     profile_photo = user.profile_photo
     member_card = user.member_card
+    PersonalEmailChange.query.filter_by(user_id=user.id).delete(synchronize_session=False)
+    PersonalEmailAttempt.query.filter_by(user_id=user.id).delete(synchronize_session=False)
     Booking.query.filter_by(user_id=user.id).delete(synchronize_session=False)
     MembershipPeriod.query.filter_by(user_id=user.id).delete(synchronize_session=False)
     db.session.delete(user)
@@ -1591,9 +1613,7 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
             print("\n--- EMAIL NON ENVOYÉ : SMTP NON CONFIGURÉ ---")
             print("Cci:", to)
             print("Subject:", subject)
-            print(body)
-            if html_body:
-                print("HTML:", html_body)
+            print("Contenu du message masqué dans les logs.")
             for cid, image_path in inline_images.items():
                 print("Inline image:", cid, image_path)
             for attachment_path in attachments:
@@ -3850,6 +3870,10 @@ def admin_members():
     if account_status:
         query = query.filter(User.account_status == account_status)
     users = query.order_by(User.full_name, User.email).all()
+    email_statuses = personal_email_statuses(users)
+    email_transition = request.args.get("email_transition", "").strip()
+    if email_transition in {"work", "todo", "pending", "confirmed"}:
+        users = [user for user in users if (is_thales_email(user.email) if email_transition == "work" else email_statuses[user.id] == email_transition)]
     for user in users:
         refresh_absence_block_status(user)
     db.session.commit()
@@ -3862,12 +3886,13 @@ def admin_members():
         "followup_year": followup_year,
         "followup_start": followup_start,
         "followup_end": followup_end,
+        "email_transition": email_transition,
     }
     start_date = parse_iso_date(followup_start, None) if followup_start else None
     end_date = parse_iso_date(followup_end, None) if followup_end else None
     followup_year_value = int(followup_year) if followup_year.isdigit() else None
     membership_actions = membership_period_rows(membership_actions_query(start_date=start_date, end_date=end_date, year=followup_year_value).limit(25).all())
-    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys(), membership_actions=membership_actions)
+    return render_template_string(TEMPLATE_MEMBERS, users=users, absence_count=absence_count, filter_values=filter_values, member_profile_labels=MEMBER_PROFILE_LABELS, subscription_options=SUBSCRIPTION_PRICES.keys(), membership_actions=membership_actions, email_statuses=email_statuses, email_change_labels=PERSONAL_EMAIL_STATUS_LABELS)
 
 
 @app.route("/admin/members/membership-followup/export")
@@ -4407,8 +4432,11 @@ BASE_TEMPLATE_STYLE = """
 def shell(content, active=""):
     logo = url_for('static', filename='logo.png') if LOGO_PATH.exists() else ''
     demo_banner = ""
+    if current_user.is_authenticated and can_change_personal_email(current_user):
+        demo_banner = ('<div class="flash"><strong>Votre adresse email professionnelle doit être remplacée par une adresse personnelle.</strong> '
+                       f'<a class="btn secondary" href="{url_for("change_personal_email")}">Renseigner mon adresse personnelle</a></div>')
     if current_user.is_authenticated and flask_session.get("admin_impersonator_id"):
-        demo_banner = (
+        demo_banner += (
             '<div class="flash">Vue démo active. '
             f'<a class="btn secondary" href="{url_for("stop_demo_view")}">Retour admin</a>'
             '</div>'
@@ -6571,6 +6599,11 @@ def create_default_admin():
     admin_name = os.getenv("ADMIN_NAME", "Admin Fitness")
     admin = User.query.filter_by(email=admin_email).first()
     if not admin:
+        change = PersonalEmailChange.query.filter_by(old_email=admin_email, state="confirmed").order_by(PersonalEmailChange.id.desc()).first()
+        migrated_admin = db.session.get(User, change.user_id) if change else None
+        if migrated_admin and migrated_admin.role == "admin":
+            admin = migrated_admin
+    if not admin:
         admin = User(email=admin_email, role="admin", status="autre", full_name=admin_name, admin_role="presidente", account_status="active")
         admin.set_password(admin_password)
         db.session.add(admin)
@@ -7029,6 +7062,194 @@ def campaign_editor():
         categories={"ouvrant_droit": "Ouvrant droit", "ayant_droit": "Ayant droit", "cadre": "Cadre", "mensuel": "Mensuel", "retraite": "Retraité", "exterieur": "Extérieur"},
         attachments=json.loads(campaign.attachments_json) if campaign else [],
         delivery_counts=lambda item: {state: CampaignDelivery.query.filter_by(campaign_id=item.id, state=state).count() for state in ["pending", "sent", "failed", "sending"]})
+
+
+PERSONAL_EMAIL_STATUS_LABELS = {
+    "todo": "À faire", "pending": "Confirmation en attente", "confirmed": "Adresse personnelle confirmée", "other": "Non concerné",
+}
+
+
+def is_thales_email(email):
+    domain = (email or "").strip().lower().rpartition("@")[2]
+    return bool(domain and "thalesgroup" in domain)
+
+
+def can_change_personal_email(user):
+    return bool(user and user.account_status == "active" and is_member_account(user) and is_thales_email(user.email))
+
+
+def personal_email_statuses(users):
+    latest = {}
+    ids = [user.id for user in users]
+    if ids:
+        for change in PersonalEmailChange.query.filter(PersonalEmailChange.user_id.in_(ids)).order_by(PersonalEmailChange.id.desc()).all():
+            latest.setdefault(change.user_id, change)
+    result = {}
+    for user in users:
+        change = latest.get(user.id)
+        if change and change.state == "confirmed" and user.email.lower() == change.new_email.lower():
+            result[user.id] = "confirmed"
+        elif is_thales_email(user.email):
+            result[user.id] = "pending" if change and change.state == "pending" and change.old_email.lower() == user.email.lower() and change.expires_at > datetime.utcnow() else "todo"
+        else:
+            result[user.id] = "other"
+    return result
+
+
+def personal_email_csrf():
+    if "personal_email_csrf" not in flask_session:
+        flask_session["personal_email_csrf"] = secrets.token_urlsafe(32)
+    return flask_session["personal_email_csrf"]
+
+
+def personal_email_csrf_valid():
+    expected = flask_session.get("personal_email_csrf", "")
+    provided = request.form.get("csrf_token", "")
+    return bool(expected and provided and secrets.compare_digest(expected, provided))
+
+
+def private_email_page(template, **values):
+    response = app.make_response(render_template_string(template, csrf_token=personal_email_csrf(), **values))
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.route("/mon-email-personnel", methods=["GET", "POST"])
+@login_required
+def change_personal_email():
+    if not can_change_personal_email(current_user):
+        flash("Ce changement exceptionnel est réservé aux profils adhérents actifs utilisant une adresse Thales Group. Contactez le bureau si nécessaire.")
+        return redirect(url_for("member_profile"))
+    if request.method == "POST":
+        if not personal_email_csrf_valid():
+            flash("Le formulaire a expiré. Merci de réessayer.")
+            return redirect(url_for("change_personal_email"))
+        now = datetime.utcnow()
+        user = db.session.execute(db.select(User).where(User.id == current_user.id).with_for_update()).scalar_one()
+        if not can_change_personal_email(user):
+            db.session.rollback()
+            return redirect(url_for("member_profile"))
+        attempts = PersonalEmailAttempt.query.filter(PersonalEmailAttempt.user_id == user.id, PersonalEmailAttempt.created_at >= now - timedelta(minutes=15)).count()
+        if attempts >= 5:
+            db.session.rollback()
+            flash("Trop de tentatives. Réessayez dans 15 minutes ou contactez le bureau.")
+            return redirect(url_for("change_personal_email"))
+        db.session.add(PersonalEmailAttempt(user_id=user.id, created_at=now))
+        # Commit failed attempts too, so password guessing is rate-limited across workers.
+        if not user.check_password(request.form.get("current_password", "")[:1024]):
+            db.session.commit()
+            flash("Mot de passe actuel incorrect.")
+            return redirect(url_for("change_personal_email"))
+        try:
+            new_email = request.form.get("new_email", "").strip().lower()
+            addresses = parse_campaign_manual_emails(new_email)
+            if len(addresses) != 1 or addresses[0] != new_email or len(new_email) > 150:
+                raise ValueError("Renseignez une seule adresse email personnelle valide (150 caractères maximum).")
+            if is_thales_email(new_email) or new_email.rpartition("@")[2].endswith(".local"):
+                raise ValueError("Utilisez une adresse personnelle, et non une adresse professionnelle Thales Group ou une adresse locale.")
+            if User.query.filter(db.func.lower(User.email) == new_email).first():
+                raise ValueError("Cette adresse ne peut pas être utilisée. Choisissez une autre adresse ou contactez le bureau si vous possédez déjà un compte.")
+            recent = PersonalEmailChange.query.filter(PersonalEmailChange.user_id == user.id, PersonalEmailChange.requested_at >= now - timedelta(hours=1)).order_by(PersonalEmailChange.id.desc()).all()
+            if len(recent) >= 3 or (recent and recent[0].requested_at > now - timedelta(seconds=60)):
+                raise ValueError("Veuillez patienter avant de renvoyer un lien. Maximum trois demandes par heure, espacées d'au moins une minute.")
+            PersonalEmailChange.query.filter_by(user_id=user.id, state="pending").update({"state": "revoked"})
+            token = secrets.token_urlsafe(32)
+            change = PersonalEmailChange(user_id=user.id, old_email=user.email, new_email=new_email,
+                token_hash=hashlib.sha256(token.encode()).hexdigest(), password_fingerprint=hashlib.sha256(user.password_hash.encode()).hexdigest(),
+                requested_at=now, expires_at=now + timedelta(hours=24))
+            db.session.add(change)
+            db.session.commit()
+            public_url = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+            endpoint = url_for("confirm_personal_email")
+            base_url = public_url + endpoint if public_url else url_for("confirm_personal_email", _external=True)
+            # The fragment is not sent in HTTP requests or access logs.
+            link = base_url + "#token=" + token
+            body = (f"Bonjour {user.display_name()},\n\nVous avez demandé à utiliser cette adresse personnelle pour votre compte Section Fitness.\n\n"
+                    f"Confirmez la modification en ouvrant ce lien puis en cliquant sur le bouton de confirmation :\n{link}\n\n"
+                    "Ce lien est valable 24 heures et utilisable une seule fois. Seul le dernier lien demandé reste valable.\n"
+                    "Avant confirmation, votre adresse professionnelle reste votre identifiant. Après confirmation, connectez-vous avec cette adresse personnelle et votre mot de passe habituel.\n"
+                    "Votre compte, vos réservations et votre historique sont conservés.\n\nSi vous n'avez pas demandé ce changement, ne confirmez pas et contactez le bureau.\n\nSportivement,\nBureau Fitness")
+            if send_email(new_email, "Confirmez votre adresse personnelle - Section Fitness", body):
+                flash(f"Un lien de confirmation a été envoyé à {new_email}. Votre identifiant reste inchangé jusqu'à confirmation.")
+            else:
+                PersonalEmailChange.query.filter_by(id=change.id, state="pending").update({"state": "failed"})
+                db.session.commit()
+                flash("Le lien n'a pas pu être envoyé. Votre adresse n'a pas changé. Réessayez plus tard ou contactez le bureau.")
+            return redirect(url_for("change_personal_email"))
+        except ValueError as error:
+            db.session.commit()
+            flash(str(error))
+    latest = PersonalEmailChange.query.filter_by(user_id=current_user.id).order_by(PersonalEmailChange.id.desc()).first()
+    return private_email_page(TEMPLATE_CHANGE_PERSONAL_EMAIL, latest=latest, now=datetime.utcnow())
+
+
+@app.route("/confirmer-email-personnel", methods=["GET", "POST"])
+def confirm_personal_email():
+    error, confirmed = "", False
+    if request.method == "POST":
+        if not personal_email_csrf_valid():
+            error = "Le formulaire a expiré. Rouvrez le lien reçu par email."
+        else:
+            token = request.form.get("token", "")
+            change = PersonalEmailChange.query.filter_by(token_hash=hashlib.sha256(token.encode()).hexdigest()).first() if re.fullmatch(r"[A-Za-z0-9_-]{43}", token) else None
+            if not change:
+                error = "Lien invalide, expiré ou déjà utilisé. Demandez un nouveau lien depuis votre compte."
+            else:
+                user = db.session.execute(db.select(User).where(User.id == change.user_id).with_for_update()).scalar_one_or_none()
+                db.session.refresh(change)
+                valid = (user and can_change_personal_email(user) and change.state == "pending" and change.expires_at > datetime.utcnow()
+                         and user.email == change.old_email and hashlib.sha256(user.password_hash.encode()).hexdigest() == change.password_fingerprint)
+                duplicate = User.query.filter(db.func.lower(User.email) == change.new_email).first() if valid else None
+                if not valid or duplicate:
+                    db.session.rollback()
+                    error = "Ce lien n'est plus utilisable ou cette adresse ne peut plus être attribuée. Contactez le bureau ou demandez un nouveau lien."
+                else:
+                    from sqlalchemy.exc import IntegrityError
+                    try:
+                        claimed = PersonalEmailChange.query.filter_by(id=change.id, state="pending").update({"state": "confirmed", "confirmed_at": datetime.utcnow()})
+                        if not claimed:
+                            db.session.rollback()
+                            error = "Ce lien a déjà été utilisé."
+                        else:
+                            user.email = change.new_email
+                            # Invalidate password-reset/activation links issued to the old address.
+                            user.activation_token = None
+                            user.activation_expires_at = None
+                            PersonalEmailChange.query.filter(PersonalEmailChange.user_id == user.id, PersonalEmailChange.id != change.id, PersonalEmailChange.state == "pending").update({"state": "revoked"})
+                            db.session.commit()
+                            confirmed = True
+                    except IntegrityError:
+                        db.session.rollback()
+                        error = "Cette adresse ne peut plus être attribuée. Contactez le bureau."
+    return private_email_page(TEMPLATE_CONFIRM_PERSONAL_EMAIL, error=error, confirmed=confirmed)
+
+
+TEMPLATE_CHANGE_PERSONAL_EMAIL = """
+{% set content %}<section class="form-wrap"><h1>Mon adresse email personnelle</h1>
+{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}
+<p>Identifiant actuel : <strong>{{ current_user.email }}</strong></p>
+<p>Votre adresse personnelle deviendra votre identifiant après confirmation. Votre mot de passe, vos réservations et votre historique seront conservés.</p>
+{% if latest and latest.state == 'pending' and latest.expires_at > now %}<div class="flash">Confirmation en attente pour <strong>{{ latest.new_email }}</strong>. Consultez aussi vos indésirables. Vous pouvez corriger l'adresse ou demander un nouveau lien ci-dessous.</div>{% elif latest and latest.state == 'pending' %}<div class="flash">Votre précédent lien a expiré. Demandez un nouveau lien.</div>{% endif %}
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="field"><label>Adresse email personnelle</label><input type="email" name="new_email" maxlength="150" required autocomplete="email" value="{{ request.form.get('new_email', latest.new_email if latest else '') }}"></div>
+<div class="field"><label>Mot de passe actuel du site Fitness</label><input type="password" name="current_password" maxlength="1024" required autocomplete="current-password"></div><br>
+<button class="btn" type="submit">Envoyer un lien de confirmation</button> <a class="btn secondary" href="{{ url_for('member_profile') }}">Retour au profil</a></form>
+<p class="muted">Lien valable 24 heures. Seul le dernier lien demandé reste valable. En cas de mot de passe oublié, contactez le bureau pour vérifier votre identité.</p></section>{% endset %}{{ shell(content, 'member_profile')|safe }}
+"""
+
+TEMPLATE_CONFIRM_PERSONAL_EMAIL = """
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Confirmation email - Section Fitness</title>""" + BASE_TEMPLATE_STYLE + """</head>
+<body><main class="main" style="max-width:680px;margin:auto"><h1>Confirmation de votre adresse personnelle</h1>
+{% if confirmed %}<div class="flash">Adresse personnelle confirmée. Elle est maintenant votre identifiant de connexion. Votre mot de passe et vos données sont inchangés.</div><a class="btn" href="{{ url_for('login') }}">Se connecter</a>
+{% elif error %}<div class="flash">{{ error }}</div><a class="btn" href="{{ url_for('login') }}">Retour à la connexion</a>
+{% else %}<p>Confirmez l'utilisation de l'adresse personnelle qui a reçu cet email pour votre compte Fitness.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="token" id="email-token"><button class="btn" id="confirm-email" type="submit" disabled>Confirmer mon adresse personnelle</button></form><noscript><p>JavaScript est nécessaire pour utiliser ce lien. Contactez le bureau en cas de difficulté.</p></noscript>
+<script>const token=new URLSearchParams(window.location.hash.slice(1)).get('token')||'';history.replaceState(null,'',window.location.pathname);document.getElementById('email-token').value=token;document.getElementById('confirm-email').disabled=!/^[A-Za-z0-9_-]{43}$/.test(token);</script>{% endif %}</main></body></html>
+"""
+
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('<div class="field"><label>Recherche</label>', """<div class="field"><label>Adresse email personnelle</label><select name="email_transition"><option value="">Tous</option><option value="work" {% if filter_values.email_transition == 'work' %}selected{% endif %}>Adresse Thales Group à remplacer</option>{% for key in ['todo','pending','confirmed'] %}<option value="{{ key }}" {% if filter_values.email_transition == key %}selected{% endif %}>{{ email_change_labels[key] }}</option>{% endfor %}</select></div><div class="field"><label>Recherche</label>""", 1)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('<th>Compte</th>', '<th>Changement email</th><th>Compte</th>', 1)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace("<td>{% if u.account_status == 'pending' %}", "<td>{{ email_change_labels[email_statuses.get(u.id, 'other')] }}</td><td>{% if u.account_status == 'pending' %}", 1)
 
 
 if __name__ == "__main__":

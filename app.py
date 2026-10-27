@@ -2047,6 +2047,7 @@ def coach_invoice_detail_rows(start, end, coach_filter=None):
         rows.append({
             "date": session.course_date,
             "jour": WEEKDAY_LABELS[session.course_date.weekday()],
+            "completed": course_has_ended(session),
             "coach": coach,
             "statut": statut,
             "coach_initial": coach_initial or session.coach_name or "",
@@ -2094,6 +2095,33 @@ def apply_billing_duration_rule(rows):
             current_block.append(row)
         if current_block:
             apply_billing_duration_block(current_block)
+
+
+def coach_invoice_visual_groups(detail_rows):
+    groups = {}
+    for source in detail_rows:
+        row = dict(source)
+        group = groups.setdefault(row["coach"], {"coach": row["coach"], "rows": [], "performed": [], "cancelled": 0, "replacements": 0})
+        performed_status = row["statut"] in {"Cours effectué", "Remplacement effectué"}
+        row["performed"] = bool(performed_status and row["completed"])
+        row["display_status"] = row["statut"]
+        if performed_status and not row["completed"]:
+            row["display_status"] = "Remplacement prévu" if row["statut"] == "Remplacement effectué" else "Cours prévu"
+        row["cancelled"] = row["statut"] == "Cours annulé"
+        if row["cancelled"]:
+            group["cancelled"] += 1
+        if row["performed"]:
+            group["performed"].append(row)
+            if row["statut"] == "Remplacement effectué":
+                group["replacements"] += 1
+        group["rows"].append(row)
+    for group in groups.values():
+        # Only performed courses form billable blocks; cancelled/absent slots cannot connect them.
+        apply_billing_duration_rule(group["performed"])
+        group["total_label"] = format_duration_hours(sum(row["duration_hours"] for row in group["performed"]))
+        group["billed_label"] = format_duration_hours(sum(row["billed_hours"] for row in group["performed"]))
+        group["performed_count"] = len(group["performed"])
+    return sorted(groups.values(), key=lambda group: group["coach"])
 
 
 def apply_billing_duration_block(block):
@@ -5581,7 +5609,7 @@ def admin_coach_planning():
     invoice_rows = coach_monthly_invoice_rows(start, end)
     invoice_detail_rows = coach_invoice_detail_rows(start, end)
     invoice_summary_rows = coach_invoice_summary_rows(start, end)
-    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, coach_options=coach_options, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
+    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, coach_options=coach_options, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, invoice_groups=coach_invoice_visual_groups(invoice_detail_rows), year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/admin/coach-absence/<int:absence_id>/followup", methods=["POST"])
@@ -7250,6 +7278,19 @@ TEMPLATE_CONFIRM_PERSONAL_EMAIL = """
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('<div class="field"><label>Recherche</label>', """<div class="field"><label>Adresse email personnelle</label><select name="email_transition"><option value="">Tous</option><option value="work" {% if filter_values.email_transition == 'work' %}selected{% endif %}>Adresse Thales Group à remplacer</option>{% for key in ['todo','pending','confirmed'] %}<option value="{{ key }}" {% if filter_values.email_transition == key %}selected{% endif %}>{{ email_change_labels[key] }}</option>{% endfor %}</select></div><div class="field"><label>Recherche</label>""", 1)
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('<th>Compte</th>', '<th>Changement email</th><th>Compte</th>', 1)
 TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace("<td>{% if u.account_status == 'pending' %}", "<td>{{ email_change_labels[email_statuses.get(u.id, 'other')] }}</td><td>{% if u.account_status == 'pending' %}", 1)
+
+
+TEMPLATE_COACH_PLANNING = re.sub(
+    r'<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2>.*?</details></div>',
+    """<section><h2>Récapitulatif mensuel facturation</h2>
+<p class="muted">Période : {{ start.strftime('%d/%m/%Y') }} au {{ end.strftime('%d/%m/%Y') }}. Les totaux effectués excluent les cours futurs, les absences et les annulations.</p>
+<p class="muted">Facturation : un cours isolé ou un bloc continu d'1h ou moins compte 1h30. Deux cours accolés d'1h comptent 2h.</p>
+{% for group in invoice_groups %}<details open style="border-bottom:1px solid #d1d5db;padding:18px 0"><summary style="cursor:pointer"><strong style="font-size:22px">{{ group.coach }} · {{ group.total_label }} effectuées</strong><br><span class="muted">{{ group.billed_label }} facturables · {{ group.performed_count }} cours effectué(s), dont {{ group.replacements }} remplacement(s) · {{ group.cancelled }} cours annulé(s)</span></summary>
+<div style="overflow:auto;margin-top:12px"><table class="table"><tr><th>Date</th><th>Cours</th><th>Horaire</th><th>Statut</th><th>Heures effectuées</th><th>Heures facturables</th><th>Motif d'annulation / notes</th></tr>
+{% for row in group.rows %}<tr><td>{{ row.jour }} {{ row.date.strftime('%d/%m/%Y') }}</td><td>{{ row.cours }}</td><td>{{ row.horaire }}</td><td><span class="badge {% if row.cancelled %}full{% elif not row.performed %}wait{% endif %}">{{ row.display_status }}</span>{% if row.coach_initial != row.coach %}<br><small>En remplacement de {{ row.coach_initial }}</small>{% endif %}{% if row.remplacant and row.remplacant != row.coach %}<br><small>Remplacé par {{ row.remplacant }}</small>{% endif %}</td><td>{{ row.duration_label if row.performed else '0h' }}</td><td>{{ row.billed_label if row.performed else '0h' }}</td><td>{% if row.notes_admin %}{{ row.notes_admin }}{% endif %}{% if row.notes_coach %}{% if row.notes_admin %}<br>{% endif %}<small>Note coach : {{ row.notes_coach }}</small>{% endif %}{% if not row.notes_admin and not row.notes_coach %}{{ 'Motif non renseigné' if row.cancelled else '-' }}{% endif %}</td></tr>{% endfor %}
+</table></div></details>{% else %}<p class="muted">Aucun cours sur cette période.</p>{% endfor %}</section>""",
+    TEMPLATE_COACH_PLANNING, count=1, flags=re.S,
+)
 
 
 if __name__ == "__main__":

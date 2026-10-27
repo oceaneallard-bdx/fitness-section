@@ -173,6 +173,37 @@ class NonReservableAttendance(db.Model):
     session = db.relationship("CourseSession", backref="attendance_counts")
 
 
+class DeferredAbsenceEmail(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    booking_id = db.Column(db.Integer, unique=True, nullable=False)
+    state = db.Column(db.String(20), nullable=False, default="pending")
+
+
+class WaitlistEntry(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    booking_id = db.Column(db.Integer, unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class EmailCampaign(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    subject = db.Column(db.String(250), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    recipients_json = db.Column(db.Text, nullable=False)
+    attachments_json = db.Column(db.Text, nullable=False, default="[]")
+    scheduled_at = db.Column(db.DateTime, nullable=False)
+    state = db.Column(db.String(20), nullable=False, default="pending")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class CampaignDelivery(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("email_campaign.id"), nullable=False)
+    email = db.Column(db.String(254), nullable=False)
+    state = db.Column(db.String(20), nullable=False, default="pending")
+    __table_args__ = (db.UniqueConstraint("campaign_id", "email"),)
+
+
 class MembershipPeriod(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
@@ -1575,7 +1606,10 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
         for attachment_path in attachments:
             path = Path(attachment_path)
             if path.exists():
-                msg.add_attachment(path.read_bytes(), maintype="image", subtype="png", filename=path.name)
+                import mimetypes
+                mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                maintype, subtype = mime.split("/", 1)
+                msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=path.name)
 
         context = ssl.create_default_context(cafile=certifi.where())
 
@@ -2201,6 +2235,8 @@ def create_booking_for_user(user, session, by_admin=False):
         return None, "waitlist_full"
     booking = Booking(user_id=user.id, session_id=session.id, status="waiting_list")
     db.session.add(booking)
+    db.session.flush()
+    db.session.add(WaitlistEntry(booking_id=booking.id))
     db.session.commit()
     rank = waitlist_rank(booking)
     subject = "Inscription en liste d’attente" + (" par la Section Fitness" if by_admin else "")
@@ -2270,11 +2306,7 @@ def cancel_booking_and_promote(booking, cancelled_by_admin=False):
 
 def absence_count(user):
     three_months_ago = date.today() - timedelta(days=90)
-    return Booking.query.join(CourseSession).filter(
-        Booking.user_id == user.id,
-        Booking.status == "absent_unexcused",
-        CourseSession.course_date >= three_months_ago
-    ).count()
+    return len(unexcused_absence_bookings(user, since=three_months_ago))
 
 
 def unexcused_absence_bookings(user, since=None):
@@ -2284,7 +2316,8 @@ def unexcused_absence_bookings(user, since=None):
     )
     if since:
         query = query.filter(CourseSession.course_date >= since)
-    return query.order_by(CourseSession.course_date, CourseSession.start_time, Booking.id).all()
+    return [booking for booking in query.order_by(CourseSession.course_date, CourseSession.start_time, Booking.id).all()
+            if course_has_ended(booking.session)]
 
 
 def absence_block_status(user, reference_date=None):
@@ -2499,7 +2532,9 @@ def statistics_period_summary(start, end, course_filter=None):
     last_minute_cancelled = [b for b in cancelled if is_last_minute_cancellation(b)]
     promoted = [b for b in bookings if b.promoted_from_waitlist_at]
     absent = [b for b in bookings if b.status == "absent_unexcused" or b.attendance_status == "absent"]
-    waitlist_total = len(waiting) + len(promoted)
+    recorded_ids = {entry.booking_id for entry in WaitlistEntry.query.filter(WaitlistEntry.booking_id.in_([b.id for b in bookings])).all()} if bookings else set()
+    waitlisted = [b for b in bookings if b.id in recorded_ids or b.status == "waiting_list" or b.promoted_from_waitlist_at]
+    waitlist_total = len(waitlisted)
     member_ids = {b.user_id for b in bookings if b.status in ["booked", "waiting_list", "absent_unexcused", "cancelled"]}
     return {
         "members": len(member_ids),
@@ -2508,6 +2543,9 @@ def statistics_period_summary(start, end, course_filter=None):
         "bookings": len(confirmed),
         "last_minute_cancelled": len(last_minute_cancelled),
         "waiting": len(waiting),
+        "waitlist_total": waitlist_total,
+        "waitlist_members": len({b.user_id for b in waitlisted}),
+        "waitlist_cancelled": len([b for b in waitlisted if b.status == "cancelled" and not b.promoted_from_waitlist_at]),
         "promoted": len(promoted),
         "promoted_rate": (len(promoted) / waitlist_total * 100) if waitlist_total else 0,
         "absent": len(absent),
@@ -2701,7 +2739,9 @@ def is_last_minute_cancellation(booking, hours=24):
     if booking.status != "cancelled" or not booking.cancelled_at:
         return False
     session_dt = datetime.combine(booking.session.course_date, booking.session.start_time)
-    return timedelta(0) <= (session_dt - booking.cancelled_at) <= timedelta(hours=hours)
+    from zoneinfo import ZoneInfo
+    cancelled_local = booking.cancelled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Paris")).replace(tzinfo=None)
+    return cancelled_local.date() == booking.session.course_date and (session_dt - cancelled_local) >= timedelta(hours=2)
 
 
 def archived_reservation_data(args):
@@ -2879,6 +2919,16 @@ def admin_statistics():
     default_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
     stats_start = parse_iso_date(request.args.get("start_date", ""), default_start)
     stats_end = parse_iso_date(request.args.get("end_date", ""), default_end)
+    scale = request.args.get("scale", "month")
+    year = request.args.get("year", today.year, type=int)
+    month = request.args.get("month", today.month, type=int)
+    year = max(2000, min(2100, year))
+    month = max(1, min(12, month))
+    if scale == "year":
+        stats_start, stats_end = date(year, 1, 1), date(year, 12, 31)
+    elif scale != "custom":
+        scale = "month"
+        stats_start, stats_end = date(year, month, 1), date(year, month, monthrange(year, month)[1])
     if stats_end < stats_start:
         stats_end = stats_start
     course_filter = selected_course_filters(request.args)
@@ -2891,7 +2941,8 @@ def admin_statistics():
         "blocked": User.query.filter(User.blocked_until >= date.today()).count()
     }
     filter_values = {"start_date": stats_start.isoformat(), "end_date": stats_end.isoformat(), "course_filter": course_filter}
-    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), period_stats=period_stats, course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values)
+    history = statistics_course_history(stats_start, stats_end, course_filter)
+    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), period_stats=period_stats, course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values, history=history, annual_members=annual_membership_statistics(), scale=scale, selected_year=year, selected_month=month)
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -3035,8 +3086,16 @@ def member_coach_planning():
         CourseSession.course_date <= end,
     ).all()
     active_booking_by_session = {booking.session_id: booking for booking in active_bookings}
+    personal_bookings = Booking.query.join(CourseSession).filter(
+        Booking.user_id == current_user.id, Booking.status.in_(["booked", "waiting_list"]),
+        CourseSession.course_date >= date.today(),
+    ).order_by(CourseSession.course_date, CourseSession.start_time).all()
+    absence_block = refresh_absence_block_status(current_user)
+    db.session.commit()
     return render_template_string(
         TEMPLATE_MEMBER_COACH_PLANNING,
+        personal_bookings=personal_bookings,
+        absence_block=absence_block,
         abs_by_key=abs_by_key,
         active_booking_by_session=active_booking_by_session,
         booked_count=booked_count,
@@ -3434,15 +3493,14 @@ def mark_absent(booking_id):
         return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "absent_unexcused"
     booking.attendance_status = "absent"
+    notice = DeferredAbsenceEmail.query.filter_by(booking_id=booking.id).first()
+    if not notice:
+        db.session.add(DeferredAbsenceEmail(booking_id=booking.id))
+    elif notice.state == "cancelled":
+        notice.state = "pending"
     db.session.commit()
     if booking.user.role != "trial":
-        apply_absence_sanction(booking.user)
-        send_email(
-            booking.user.email,
-            "Absence enregistrée - Section Fitness",
-            f"Bonjour {booking.user.display_name()},\n\nVotre absence au cours {booking.session.course_name} du {booking.session.course_date.strftime('%d/%m/%Y')} a été enregistrée comme non excusée, car la réservation n'avait pas été annulée dans les délais.\n\nSection Fitness"
-        )
-        flash("Absence non excusée enregistrée.")
+        flash("Absence enregistrée. La notification sera envoyée après la fin du cours si l'absence n'a pas été corrigée en retard.")
     else:
         flash("Personne à l'essai marquée absente, sans pénalité.")
     return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
@@ -3460,6 +3518,9 @@ def mark_late(booking_id):
         return redirect(url_for("session_detail", session_id=booking.session_id) + f"#booking-{booking.id}")
     booking.status = "booked"
     booking.attendance_status = "late"
+    notice = DeferredAbsenceEmail.query.filter_by(booking_id=booking.id, state="pending").first()
+    if notice:
+        notice.state = "cancelled"
     if booking.user.role != "trial":
         refresh_absence_block_status(booking.user)
     db.session.commit()
@@ -3522,7 +3583,7 @@ def admin_edit_member(user_id):
     if repair_missing_prior_membership_periods(user):
         db.session.commit()
     membership_periods = membership_period_rows(MembershipPeriod.query.filter_by(user_id=user.id).order_by(MembershipPeriod.subscription_year.desc(), MembershipPeriod.start_date.desc()).all())
-    brevo_emails, brevo_error = brevo_member_email_summaries(user.email)
+    brevo_emails, brevo_error = [], ""
     return render_template_string(TEMPLATE_ADMIN_EDIT_MEMBER, user=user, current_year=date.today().year, membership_periods=membership_periods, subscription_options=SUBSCRIPTION_PRICES.keys(), split_name=split_name, brevo_emails=brevo_emails, brevo_error=brevo_error)
 
 
@@ -4114,28 +4175,7 @@ def admin_email_members():
     if not is_admin():
         flash("Accès réservé à l’admin.")
         return redirect(url_for("index"))
-    selected_ids = request.values.getlist("user_ids")
-    target_roles = request.values.getlist("target_roles") or ["adherent"]
-    valid_roles = {"adherent", "admin", "coach"}
-    target_roles = [role for role in target_roles if role in valid_roles] or ["adherent"]
-    if "adherent" in target_roles and "admin" not in target_roles:
-        target_roles.append("admin")
-    users = campaign_target_users(selected_ids, target_roles)
-    target_summary = campaign_target_summary(target_roles, selected_ids)
-    if request.method == "POST":
-        subject = request.form["subject"].strip()
-        body = request.form["body"].strip()
-        if not subject or not body:
-            flash("Merci de renseigner un objet et un message.")
-            return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles, target_summary=target_summary)
-        signed_body = admin_email_signature_body(body)
-        logo_url = url_for("static", filename="logo.png", _external=True) if LOGO_PATH.exists() else ""
-        signed_html = admin_email_signature_html(body, logo_url=logo_url)
-        user_ids = [u.id for u in users]
-        send_member_campaign_async(user_ids, subject, signed_body, signed_html)
-        flash(f"Campagne email lancée pour {len(user_ids)} destinataire(s) : {target_summary}. L'envoi continue en arrière-plan pour éviter une erreur serveur.")
-        return redirect(url_for("admin_members"))
-    return render_template_string(TEMPLATE_EMAIL_MEMBERS, users=users, target_roles=target_roles, target_summary=target_summary)
+    return redirect(url_for("campaign_editor", user_ids=request.values.getlist("user_ids")), code=307 if request.method == "POST" else 302)
 
 
 @app.route("/admin/blocked")
@@ -6594,6 +6634,303 @@ def start_scheduler():
 @app.context_processor
 def inject_helpers():
     return dict(shell=shell)
+
+
+TEMPLATE_CAMPAIGN_EDITOR = """
+{% set content %}
+<h1>Communication</h1>
+{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:24px;align-items:start">
+<section><h2>{{ 'Modifier la campagne' if campaign else 'Nouvelle campagne' }}</h2>
+<form method="post" enctype="multipart/form-data">
+{% if campaign %}<input type="hidden" name="edit" value="{{ campaign.id }}">{% endif %}
+{% for id in settings.selected %}<input type="hidden" name="user_ids" value="{{ id }}">{% endfor %}
+<fieldset><legend>Destinataires</legend>{% for key, label in [('adherent','Adhérents'),('admin','Administrateurs'),('coach','Coachs')] %}<label style="display:block"><input type="checkbox" name="target_roles" value="{{ key }}" {% if key in settings.roles %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
+<fieldset><legend>Catégories adhérents (toutes si aucune cochée)</legend>{% for key, label in categories.items() %}<label style="display:block"><input type="checkbox" name="categories" value="{{ key }}" {% if key in settings.categories %}checked{% endif %}> {{ label }}</label>{% endfor %}</fieldset>
+<p class="muted">Les catégories cochées sont réunies. Les administrateurs reçoivent aussi les campagnes adhérents. Destinataires en copie cachée.</p>
+<div class="field"><label>Objet</label><input name="subject" maxlength="250" required value="{{ request.form.get('subject', campaign.subject if campaign else '') }}"></div>
+<div class="field"><label>Message</label><textarea name="body" rows="12" required style="width:100%">{{ request.form.get('body', campaign.body if campaign else '') }}</textarea></div>
+<div class="field"><label>Pièces jointes (5 Mo par fichier, 8 Mo au total)</label><input type="file" name="attachments" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.png,.jpg,.jpeg,.txt"></div>
+{% if attachments %}<p>{% for attachment in attachments %}{{ attachment.name }}{% if not loop.last %}, {% endif %}{% endfor %}</p><label><input type="checkbox" name="remove_attachments"> Retirer les pièces jointes existantes</label>{% endif %}
+<div class="field"><label>Programmer l'envoi (heure de Paris ; vide : dès que possible)</label><input type="datetime-local" name="scheduled_at" value="{{ campaign.scheduled_at.strftime('%Y-%m-%dT%H:%M') if campaign else '' }}"></div><br>
+<button class="btn" type="submit">{{ 'Enregistrer les modifications' if campaign else "Enregistrer l'envoi" }}</button> <a class="btn secondary" href="{{ url_for('campaign_editor') }}">Nouvelle campagne</a>
+</form></section>
+<section><h2>Envois programmés et historique</h2>{% for item in campaigns %}{% set counts = delivery_counts(item) %}<article style="border-bottom:1px solid #ddd;padding:12px 0"><strong>{{ item.subject }}</strong><p>{{ item.scheduled_at.strftime('%d/%m/%Y %H:%M') }} (Paris) · {{ {'pending':'Programmé', 'sending':'En cours', 'sent':'Terminé', 'failed':'Échec partiel ou total'}.get(item.state, item.state) }}</p><p>{{ counts.sent }} accepté(s) par le service email · {{ counts.failed }} échec(s) · {{ counts.pending }} en attente</p>{% if item.state == 'pending' %}<a class="btn secondary" href="{{ url_for('campaign_editor', edit=item.id) }}">Modifier</a>{% endif %}</article>{% else %}<p>Aucune campagne enregistrée.</p>{% endfor %}</section></div>
+{% endset %}{{ shell(content, 'members')|safe }}
+"""
+
+TEMPLATE_MEMBER_COMMUNICATION = """
+{% set content %}<h1>Communication · {{ user.display_name() }}</h1>
+<a class="btn" href="{{ url_for('campaign_editor', user_ids=user.id) }}">Écrire à cet adhérent</a>
+<a class="btn secondary" href="{{ url_for('admin_members') }}">Retour aux adhérents</a>
+{% if error %}<div class="flash">{{ error }}</div>{% endif %}
+<h2>Emails transactionnels Brevo</h2><table class="table"><tr><th>Date d'envoi</th><th>Titre</th><th>Date du cours</th><th>Contenu</th></tr>
+{% for email in emails %}<tr><td>{{ email.sent_date or '-' }}</td><td>{{ email.subject }}</td><td>{{ email.course_date or '-' }}</td><td>{% if email.uuid or email.message_id %}<a class="btn secondary" href="{{ url_for('admin_member_brevo_email_content', user_id=user.id, uuid=email.uuid or '', message_id=email.message_id or '') }}">Voir contenu</a>{% endif %}</td></tr>{% else %}<tr><td colspan="4">Aucun email trouvé.</td></tr>{% endfor %}</table>
+{% endset %}{{ shell(content, 'members')|safe }}
+"""
+
+# Keep the personal booking tools on the booking page, not the admin dashboard.
+TEMPLATE_INDEX = TEMPLATE_INDEX.replace("{% if current_user.role in ['adherent','admin'] %}<div class=\"card\" style=\"box-shadow:none;background:#f9fafb;margin-bottom:18px\"><h2>Suivi absences injustifiées", "{% if current_user.role == 'adherent' %}<div class=\"card\" style=\"box-shadow:none;background:#f9fafb;margin-bottom:18px\"><h2>Suivi absences injustifiées")
+TEMPLATE_MEMBER_COACH_PLANNING = TEMPLATE_MEMBER_COACH_PLANNING.replace("{% set content %}", """{% set content %}
+{% if current_user.role == 'admin' %}<section><h2>Mes cours réservés</h2><table class="table"><tr><th>Date</th><th>Cours</th><th>Statut</th><th>Action</th></tr>{% for booking in personal_bookings %}<tr><td>{{ booking.session.course_date.strftime('%d/%m/%Y') }} {{ booking.session.start_time.strftime('%H:%M') }}</td><td>{{ booking.session.course_name }}</td><td>{{ 'Confirmé' if booking.status == 'booked' else "Liste d'attente - rang " ~ waitlist_rank(booking) }}</td><td><a class="btn secondary" href="{{ url_for('cancel', booking_id=booking.id) }}">Annuler</a></td></tr>{% else %}<tr><td colspan="4">Aucune réservation à venir.</td></tr>{% endfor %}</table>
+<h2>Mes absences injustifiées</h2><p>{{ absence_block.recent_absences|length }} absence(s) sur 90 jours. {% if current_user.is_blocked() %}Réservations bloquées jusqu'au {{ current_user.blocked_until.strftime('%d/%m/%Y') }}.{% endif %}</p>{% for booking in absence_block.recent_absences %}<p>{{ booking.session.course_date.strftime('%d/%m/%Y') }} · {{ booking.session.course_name }}</p>{% endfor %}</section>{% endif %}
+""", 1)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(">Modifier</a>", ">Gérer le profil</a>").replace(">Réservations</a>", ">Gérer les réservations</a>")
+_MEMBER_ACCOUNT_LINKS = """<a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=u.id) }}">Lien activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=u.id) }}">Réinitialiser MDP</a>"""
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace(_MEMBER_ACCOUNT_LINKS, """<a class="btn secondary" href="{{ url_for('member_communication', user_id=u.id) }}">Communication</a>""")
+TEMPLATE_ADMIN_EDIT_MEMBER = TEMPLATE_ADMIN_EDIT_MEMBER.replace("<h1>Modifier l'adhérent</h1>", """<h1>Gérer le profil</h1><p><a class="btn secondary" href="{{ url_for('admin_send_activation', user_id=user.id) }}">Lien d'activation</a> <a class="btn secondary" href="{{ url_for('admin_send_password_reset', user_id=user.id) }}">Réinitialisation du mot de passe</a></p>""")
+TEMPLATE_ADMIN_EDIT_MEMBER = re.sub(r'<br><div class="card" style="box-shadow:none;background:#f9fafb"><div class="top"><div><h2>Emails transactionnels Brevo</h2>.*?</table></div>', '', TEMPLATE_ADMIN_EDIT_MEMBER, count=1, flags=re.S)
+
+TEMPLATE_STATISTICS = """
+{% set content %}<h1>Statistiques</h1>
+<section><h2>Adhérents par année</h2><p class="muted">Chaque personne est comptée une seule fois par année et par type d'abonnement. Catégorie et statut correspondent à sa fiche actuelle.</p>
+{% for row in annual_members %}<h3>{{ row.year }} · {{ row.total }} adhérent(s)</h3><div class="grid"><div><h4>Statuts</h4>{% for label, count in row.statuses %}<p>{{ label }} : {{ count }}</p>{% endfor %}</div><div><h4>Catégories</h4>{% for label, count in row.profiles %}<p>{{ label }} : {{ count }}</p>{% endfor %}</div><div><h4>Abonnements</h4>{% for label, count in row.subscriptions %}<p>{{ label }} : {{ count }}</p>{% endfor %}</div></div>{% else %}<p>Aucune adhésion enregistrée.</p>{% endfor %}</section>
+<section><h2>Activité des cours</h2><form method="get"><div class="form-grid">
+<div class="field"><label>Échelle</label><select name="scale"><option value="month" {% if scale == 'month' %}selected{% endif %}>Mois</option><option value="year" {% if scale == 'year' %}selected{% endif %}>Année</option><option value="custom" {% if scale == 'custom' %}selected{% endif %}>De date à date</option></select></div>
+<div class="field"><label>Année</label><input name="year" type="number" value="{{ selected_year }}" min="2000" max="2100"></div><div class="field"><label>Mois</label><select name="month">{% for month in range(1,13) %}<option value="{{ month }}" {% if month == selected_month %}selected{% endif %}>{{ month }}</option>{% endfor %}</select></div>
+<div class="field"><label>Début (de date à date)</label><input type="date" name="start_date" value="{{ filter_values.start_date }}"></div><div class="field"><label>Fin (de date à date)</label><input type="date" name="end_date" value="{{ filter_values.end_date }}"></div>
+<div class="field"><label>Cours</label><select name="course_filter" multiple>{% for name in course_options %}<option {% if name in filter_values.course_filter %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></div></div><button class="btn" type="submit">Afficher</button>
+<a class="btn secondary" href="{{ url_for('export_statistics_excel', start_date=filter_values.start_date, end_date=filter_values.end_date, course_filter=filter_values.course_filter) }}">Exporter Excel</a></form>
+<p>Du {{ filter_values.start_date }} au {{ filter_values.end_date }}</p>
+<dl><dt>Cours terminés et non annulés</dt><dd>{{ history|selectattr('held')|list|length }}</dd><dt>Dont cours avec réservation</dt><dd>{{ history|selectattr('held')|selectattr('session.is_reservable')|list|length }}</dd>
+<dt>Adhérents passés en liste d'attente</dt><dd>{{ period_stats.waitlist_members }} personne(s) · {{ period_stats.waitlist_total }} inscription(s)</dd><dt>Promotions sur liste principale</dt><dd>{{ period_stats.promoted }} ({{ '%.1f'|format(period_stats.promoted_rate) }} % des inscriptions en attente)</dd><dt>Restées en liste d'attente</dt><dd>{{ period_stats.waiting }}</dd><dt>Annulées depuis la liste d'attente</dt><dd>{{ period_stats.waitlist_cancelled }}</dd>
+<dt>Annulations le jour même, au moins 2 heures avant le cours</dt><dd>{{ period_stats.last_minute_cancelled }}</dd><dt>Absences injustifiées</dt><dd>{{ period_stats.absent }} ({{ '%.1f'|format(period_stats.absent_rate) }} % des réservations confirmées)</dd></dl>
+<p class="muted">Les anciennes inscriptions en attente annulées sans promotion ne sont pas reconstituables si leur historique n'a pas été conservé.</p>
+<h2>Historique des cours</h2>{% for row in history %}<details style="padding:12px 0;border-bottom:1px solid #ddd"><summary>{{ row.session.course_date.strftime('%d/%m/%Y') }} · {{ row.session.start_time.strftime('%H:%M') }} · {{ row.session.course_name }} · {{ row.coach }} · {{ row.state }}</summary>
+{% if row.session.is_reservable %}<p>Mensuels : {{ '%.1f'|format(row.mensuels) }} % · Cadres : {{ '%.1f'|format(row.cadres) }} % (hors essais).</p><table class="table"><tr><th>Participant</th><th>Statut</th><th>Catégorie</th><th>Présence</th></tr>{% for booking in row.participants %}<tr><td>{{ booking.user.display_name() }}</td><td>{{ booking.user.status }}</td><td>{{ booking.user.member_profile or '-' }}</td><td>{{ booking.attendance_status or booking.status }}</td></tr>{% else %}<tr><td colspan="4">Aucun participant.</td></tr>{% endfor %}</table>{% else %}<p>Effectif déclaré par le coach : {{ row.attendance }}</p>{% endif %}</details>{% else %}<p>Aucun cours terminé sur cette période.</p>{% endfor %}</section>
+<section><h2>Préférences adhérents</h2><div class="grid">{% for title, values in [('Cours', preference_stats.course), ('Coachs', preference_stats.coach), ('Créneaux', preference_stats.slot)] %}<div><h3>{{ title }}</h3>{% for label, count in values %}<p>{{ label }} : {{ count }}</p>{% else %}<p>Aucune donnée.</p>{% endfor %}</div>{% endfor %}</div></section>
+{% endset %}{{ shell(content, 'statistics')|safe }}
+"""
+
+
+def annual_membership_statistics():
+    years = {}
+    subscriptions = {}
+    for period in MembershipPeriod.query.all():
+        if period.user.email == DEMO_ADHERENT_EMAIL or period.user.role not in ["admin", "adherent"]:
+            continue
+        years.setdefault(period.subscription_year, {})[period.user_id] = period.user
+        key = (period.subscription_year, normalize_subscription_type(period.subscription_type))
+        subscriptions.setdefault(key, set()).add(period.user_id)
+    for user in User.query.filter(User.subscription_year.isnot(None), User.role.in_(["admin", "adherent"])).all():
+        if user.email == DEMO_ADHERENT_EMAIL:
+            continue
+        years.setdefault(user.subscription_year, {})[user.id] = user
+        if user.subscription_type:
+            subscriptions.setdefault((user.subscription_year, normalize_subscription_type(user.subscription_type)), set()).add(user.id)
+    rows = []
+    for year, members in sorted(years.items(), reverse=True):
+        users = list(members.values())
+        rows.append({"year": year, "total": len(users),
+            "statuses": [(label, sum(user.status == value for user in users)) for value, label in [("cadre", "Cadres"), ("mensuel", "Mensuels"), ("autre", "Autres")]],
+            "profiles": [(label, sum((user.member_profile or "ouvrant_droit") == value for user in users)) for value, label in MEMBER_PROFILE_LABELS.items()],
+            "subscriptions": [(label, len(ids)) for (period_year, label), ids in sorted(subscriptions.items()) if period_year == year]})
+    return rows
+
+
+def statistics_course_history(start, end, filters):
+    sessions = filtered_sessions_query(start, end, filters).order_by(CourseSession.course_date, CourseSession.start_time).all()
+    absences = CoachAbsence.query.filter(CoachAbsence.absence_date >= start, CoachAbsence.absence_date <= end).all()
+    abs_by_key = {(absence.coach_name, absence.absence_date, absence.session_id): absence for absence in absences}
+    rows = []
+    for session in sessions:
+        if not course_has_ended(session):
+            continue
+        absence = abs_by_key.get((session.coach_name, session.course_date, session.id)) or abs_by_key.get((session.coach_name, session.course_date, None))
+        participants = [booking for booking in session.bookings if booking.status in ["booked", "absent_unexcused"]]
+        members = [booking for booking in participants if booking.user.role != "trial"]
+        attendance = NonReservableAttendance.query.filter_by(session_id=session.id).order_by(NonReservableAttendance.recorded_at.desc()).first()
+        rows.append({"session": session, "coach": effective_coach_for_session(session, abs_by_key),
+            "state": absence_display_label(absence) or "Cours terminé", "held": not absence_blocks_booking(absence),
+            "participants": participants, "attendance": attendance_count_label(attendance),
+            "mensuels": 100 * sum(b.user.status == "mensuel" for b in members) / len(members) if members else 0,
+            "cadres": 100 * sum(b.user.status == "cadre" for b in members) / len(members) if members else 0})
+    return rows
+
+
+def local_now():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Europe/Paris")).replace(tzinfo=None)
+
+
+def course_has_ended(session):
+    end = datetime.combine(session.course_date, session.end_time)
+    if session.end_time < session.start_time:
+        end += timedelta(days=1)
+    return local_now() >= end
+
+
+def process_deferred_emails():
+    """Persist claims before sending: a second worker must not send the same mail."""
+    for notice in DeferredAbsenceEmail.query.filter_by(state="pending").all():
+        booking = db.session.get(Booking, notice.booking_id)
+        if not booking or booking.status != "absent_unexcused" or booking.user.role == "trial":
+            notice.state = "cancelled"
+            db.session.commit()
+            continue
+        if not course_has_ended(booking.session):
+            continue
+        claimed = DeferredAbsenceEmail.query.filter_by(id=notice.id, state="pending").update({"state": "sending"})
+        db.session.commit()
+        if not claimed:
+            continue
+        db.session.refresh(booking)
+        if booking.status != "absent_unexcused" or booking.attendance_status == "late":
+            notice.state = "cancelled"
+        else:
+            apply_absence_sanction(booking.user)
+            ok = send_email(booking.user.email, "Absence enregistrée - Section Fitness",
+                f"Bonjour {booking.user.display_name()},\n\nVotre absence non excusée au cours {booking.session.course_name} du {booking.session.course_date:%d/%m/%Y}, de {booking.session.start_time:%H:%M} à {booking.session.end_time:%H:%M}, a été confirmée après la fin du cours.\n\nSection Fitness")
+            notice.state = "sent" if ok else "failed"
+        db.session.commit()
+    for campaign in EmailCampaign.query.filter(EmailCampaign.state.in_(["pending", "sending"]), EmailCampaign.scheduled_at <= local_now()).all():
+        if campaign.state == "pending":
+            claimed = EmailCampaign.query.filter_by(id=campaign.id, state="pending").update({"state": "sending"})
+            db.session.commit()
+            if not claimed:
+                continue
+            db.session.refresh(campaign)
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for attachment in json.loads(campaign.attachments_json):
+                path = Path(directory) / attachment["name"]
+                path.write_bytes(base64.b64decode(attachment["data"]))
+                paths.append(path)
+            for delivery in CampaignDelivery.query.filter_by(campaign_id=campaign.id, state="pending").all():
+                claimed = CampaignDelivery.query.filter_by(id=delivery.id, state="pending").update({"state": "sending"})
+                db.session.commit()
+                if not claimed:
+                    continue
+                public_url = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+                ok = send_email(delivery.email, campaign.subject, admin_email_signature_body(campaign.body),
+                    attachments=paths, html_body=admin_email_signature_html(campaign.body, logo_url=public_url + "/static/logo.png" if public_url else ""))
+                delivery.state = "sent" if ok else "failed"
+                db.session.commit()
+        if CampaignDelivery.query.filter(CampaignDelivery.campaign_id == campaign.id, CampaignDelivery.state.in_(["sending", "pending"])).count():
+            continue
+        campaign.state = "failed" if CampaignDelivery.query.filter_by(campaign_id=campaign.id, state="failed").count() else "sent"
+        db.session.commit()
+
+
+def deferred_email_worker():
+    import time as time_module
+    while True:
+        try:
+            with app.app_context():
+                process_deferred_emails()
+        except Exception:
+            app.logger.exception("Erreur du traitement des emails différés")
+        time_module.sleep(60)
+
+
+_email_worker_started = False
+from threading import Lock
+_email_worker_lock = Lock()
+
+
+@app.before_request
+def start_deferred_email_worker():
+    global _email_worker_started
+    if request.method == "HEAD" or app.testing or os.getenv("EMAIL_WORKER_ENABLED", "1") != "1":
+        return
+    with _email_worker_lock:
+        if not _email_worker_started:
+            Thread(target=deferred_email_worker, daemon=True).start()
+            _email_worker_started = True
+
+
+@app.cli.command("process-emails")
+def process_emails_command():
+    ensure_schema()
+    process_deferred_emails()
+
+
+@app.route("/admin/members/<int:user_id>/communication")
+@login_required
+def member_communication(user_id):
+    if not is_admin():
+        return redirect(url_for("index"))
+    user = User.query.get_or_404(user_id)
+    emails, error = brevo_member_email_summaries(user.email)
+    return render_template_string(TEMPLATE_MEMBER_COMMUNICATION, user=user, emails=emails, error=error)
+
+
+@app.route("/admin/campaigns", methods=["GET", "POST"])
+@login_required
+def campaign_editor():
+    if not is_admin():
+        return redirect(url_for("index"))
+    if request.content_length and request.content_length > 12 * 1024 * 1024:
+        flash("Envoi trop volumineux : 8 Mo de pièces jointes maximum.")
+        return redirect(url_for("campaign_editor"))
+    from werkzeug.utils import secure_filename
+    campaign = db.session.get(EmailCampaign, request.values.get("edit", type=int)) if request.values.get("edit") else None
+    if request.values.get("edit") and (not campaign or campaign.state != "pending"):
+        flash("Seuls les envois en attente peuvent être modifiés.")
+        return redirect(url_for("campaign_editor"))
+    if request.method == "POST":
+        try:
+            roles = [role for role in request.form.getlist("target_roles") if role in {"admin", "adherent", "coach"}]
+            if not roles:
+                raise ValueError("Sélectionnez au moins un groupe destinataire.")
+            selected = request.form.getlist("user_ids")
+            categories = request.form.getlist("categories")
+            users = campaign_target_users(selected, roles)
+            users = [user for user in users if user.role != "adherent" or not categories or
+                     user.member_profile in categories or user.status in categories]
+            subject, body = request.form.get("subject", "").strip(), request.form.get("body", "").strip()
+            if not subject or not body or len(subject) > 250 or not users:
+                raise ValueError("Objet (250 caractères maximum), message et destinataires sont obligatoires.")
+            scheduled = datetime.fromisoformat(request.form["scheduled_at"]) if request.form.get("scheduled_at") else local_now()
+            if scheduled.tzinfo:
+                raise ValueError("Utilisez une date et une heure locales (Paris).")
+            attachments = json.loads(campaign.attachments_json) if campaign else []
+            if request.form.get("remove_attachments"):
+                attachments = []
+            for upload in request.files.getlist("attachments"):
+                if not upload.filename:
+                    continue
+                name = secure_filename(upload.filename)
+                if not name or Path(name).suffix.lower() not in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".png", ".jpg", ".jpeg", ".txt"}:
+                    raise ValueError("Format de pièce jointe non autorisé.")
+                data = upload.read(5 * 1024 * 1024 + 1)
+                if len(data) > 5 * 1024 * 1024:
+                    raise ValueError("Chaque pièce jointe doit faire au maximum 5 Mo.")
+                attachments.append({"name": name, "data": base64.b64encode(data).decode("ascii")})
+            if sum(len(base64.b64decode(a["data"])) for a in attachments) > 8 * 1024 * 1024:
+                raise ValueError("Les pièces jointes doivent faire au maximum 8 Mo au total.")
+            if len({a["name"] for a in attachments}) != len(attachments):
+                raise ValueError("Les pièces jointes doivent avoir des noms différents.")
+            if campaign:
+                claimed = EmailCampaign.query.filter_by(id=campaign.id, state="pending").update({"state": "editing"})
+                if not claimed:
+                    db.session.rollback()
+                    raise ValueError("L'envoi vient de commencer : modification impossible.")
+                CampaignDelivery.query.filter_by(campaign_id=campaign.id).delete()
+            else:
+                campaign = EmailCampaign()
+                db.session.add(campaign)
+            campaign.subject, campaign.body = subject, body
+            campaign.scheduled_at, campaign.state = scheduled, "pending"
+            campaign.recipients_json = json.dumps({"roles": roles, "categories": categories, "selected": selected})
+            campaign.attachments_json = json.dumps(attachments)
+            db.session.flush()
+            addresses = {(user.email or "").strip().lower() for user in users if user.email}
+            for address in addresses:
+                db.session.add(CampaignDelivery(campaign_id=campaign.id, email=address))
+            db.session.commit()
+            flash(f"Campagne enregistrée pour {len(addresses)} destinataires : {campaign_target_summary(roles, selected)}. Traitement à partir du {scheduled:%d/%m/%Y %H:%M} (Paris).")
+            return redirect(url_for("campaign_editor"))
+        except (ValueError, TypeError) as error:
+            db.session.rollback()
+            flash(str(error))
+    settings = json.loads(campaign.recipients_json) if campaign else {"roles": ["adherent"], "categories": [], "selected": request.args.getlist("user_ids")}
+    return render_template_string(TEMPLATE_CAMPAIGN_EDITOR, campaign=campaign, settings=settings,
+        campaigns=EmailCampaign.query.order_by(EmailCampaign.created_at.desc()).limit(50).all(),
+        categories={"ouvrant_droit": "Ouvrant droit", "ayant_droit": "Ayant droit", "cadre": "Cadre", "mensuel": "Mensuel", "retraite": "Retraité", "exterieur": "Extérieur"},
+        attachments=json.loads(campaign.attachments_json) if campaign else [],
+        delivery_counts=lambda item: {state: CampaignDelivery.query.filter_by(campaign_id=item.id, state=state).count() for state in ["pending", "sent", "failed", "sending"]})
 
 
 if __name__ == "__main__":

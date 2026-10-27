@@ -1604,8 +1604,6 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
         msg["From"] = mail_from_header()
         msg["Bcc"] = to
         msg["Subject"] = subject
-        from email.utils import make_msgid
-        msg["Message-ID"] = make_msgid()
         msg.set_content(body)
         if html_body:
             msg.add_alternative(html_body, subtype="html")
@@ -1639,7 +1637,7 @@ def send_email(to, subject, body, attachments=None, html_body=None, inline_image
             print("Envoi SMTP refusé pour le destinataire.")
             return False
         if receipt is not None:
-            receipt.update(transport="smtp", message_id=msg["Message-ID"])
+            receipt.update(transport="smtp", message_id="")
 
         return True
 
@@ -6670,6 +6668,7 @@ TEMPLATE_CAMPAIGN_EDITOR = """
 <p class="muted">Les catégories cochées sont réunies. Les administrateurs reçoivent aussi les campagnes adhérents. Destinataires en copie cachée.</p>
 <div class="field"><label>Objet</label><input name="subject" maxlength="250" required value="{{ request.form.get('subject', campaign.subject if campaign else '') }}"></div>
 <div class="field"><label>Message</label><textarea name="body" rows="12" required style="width:100%">{{ request.form.get('body', campaign.body if campaign else '') }}</textarea></div>
+<div class="field"><label>Format du message</label><select name="message_format"><option value="html" {% if request.form.get('message_format', settings.get('message_format', 'html')) == 'html' %}selected{% endif %}>Standard avec signature et logo</option><option value="text" {% if request.form.get('message_format', settings.get('message_format', 'html')) == 'text' %}selected{% endif %}>Texte seul, sans logo</option></select></div>
 <div class="field"><label>Pièces jointes (5 Mo par fichier, 8 Mo au total)</label><input type="file" name="attachments" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.png,.jpg,.jpeg,.txt"></div>
 {% if attachments %}<p>{% for attachment in attachments %}{{ attachment.name }}{% if not loop.last %}, {% endif %}{% endfor %}</p><label><input type="checkbox" name="remove_attachments"> Retirer les pièces jointes existantes</label>{% endif %}
 <div class="field"><label>Programmer l'envoi (heure de Paris ; vide : dès que possible)</label><input type="datetime-local" name="scheduled_at" value="{{ campaign.scheduled_at.strftime('%Y-%m-%dT%H:%M') if campaign else '' }}"></div><br>
@@ -6714,7 +6713,7 @@ TEMPLATE_STATISTICS = """
 <a class="btn secondary" href="{{ url_for('export_statistics_excel', start_date=filter_values.start_date, end_date=filter_values.end_date, course_filter=filter_values.course_filter) }}">Exporter Excel</a></form>
 <p>Du {{ filter_values.start_date }} au {{ filter_values.end_date }}</p>
 <dl><dt>Cours terminés et non annulés</dt><dd>{{ history|selectattr('held')|list|length }}</dd><dt>Dont cours avec réservation</dt><dd>{{ history|selectattr('held')|selectattr('session.is_reservable')|list|length }}</dd>
-<dt>Adhérents passés en liste d'attente</dt><dd>{{ period_stats.waitlist_members }} personne(s) · {{ period_stats.waitlist_total }} inscription(s)</dd><dt>Promotions sur liste principale</dt><dd>{{ period_stats.promoted }} ({{ '%.1f'|format(period_stats.promoted_rate) }} % des inscriptions en attente)</dd><dt>Restées en liste d'attente</dt><dd>{{ period_stats.waiting }}</dd><dt>Annulées depuis la liste d'attente</dt><dd>{{ period_stats.waitlist_cancelled }}</dd>
+<dt>Inscriptions en liste d'attente</dt><dd>{{ period_stats.waitlist_total }} inscription(s)</dd><dt>Inscriptions passées sur liste principale (place confirmée)</dt><dd>{{ period_stats.promoted }} ({{ '%.1f'|format(period_stats.promoted_rate) }} % des inscriptions en attente)</dd><dt>Inscriptions restées en liste d'attente</dt><dd>{{ period_stats.waiting }}</dd><dt>Inscriptions annulées depuis la liste d'attente</dt><dd>{{ period_stats.waitlist_cancelled }}</dd>
 <dt>Annulations le jour même, au moins 2 heures avant le cours</dt><dd>{{ period_stats.last_minute_cancelled }}</dd><dt>Absences injustifiées</dt><dd>{{ period_stats.absent }} ({{ '%.1f'|format(period_stats.absent_rate) }} % des réservations confirmées)</dd></dl>
 <p class="muted">Les anciennes inscriptions en attente annulées sans promotion ne sont pas reconstituables si leur historique n'a pas été conservé.</p>
 <h2>Historique des cours</h2>{% for row in history %}<details style="padding:12px 0;border-bottom:1px solid #ddd"><summary>{{ row.session.course_date.strftime('%d/%m/%Y') }} · {{ row.session.start_time.strftime('%H:%M') }} · {{ row.session.course_name }} · {{ row.coach }} · {{ row.state }}</summary>
@@ -6825,8 +6824,9 @@ def process_deferred_emails():
                     continue
                 public_url = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
                 receipt = {}
+                text_only = json.loads(campaign.recipients_json).get("message_format") == "text"
                 ok = send_email(delivery.email, campaign.subject, admin_email_signature_body(campaign.body),
-                    attachments=paths, html_body=admin_email_signature_html(campaign.body, logo_url=public_url + "/static/logo.png" if public_url else ""), receipt=receipt)
+                    attachments=paths, html_body=None if text_only else admin_email_signature_html(campaign.body, logo_url=public_url + "/static/logo.png" if public_url else ""), receipt=receipt)
                 if ok and receipt:
                     db.session.add(CampaignEmailReceipt(delivery_id=delivery.id, transport=receipt["transport"], message_id=receipt.get("message_id")))
                 delivery.state = "sent" if ok else "failed"
@@ -6962,6 +6962,9 @@ def campaign_editor():
             users = [user for user in users if user.role != "adherent" or not categories or
                      user.member_profile in categories or user.status in categories]
             subject, body = request.form.get("subject", "").strip(), request.form.get("body", "").strip()
+            message_format = request.form.get("message_format", "html")
+            if message_format not in {"html", "text"}:
+                raise ValueError("Format de message non reconnu.")
             if not subject or not body or len(subject) > 250 or not (users or manual_emails):
                 raise ValueError("Objet (250 caractères maximum), message et destinataires sont obligatoires.")
             scheduled = datetime.fromisoformat(request.form["scheduled_at"]) if request.form.get("scheduled_at") else local_now()
@@ -6995,7 +6998,7 @@ def campaign_editor():
                 db.session.add(campaign)
             campaign.subject, campaign.body = subject, body
             campaign.scheduled_at, campaign.state = scheduled, "pending"
-            campaign.recipients_json = json.dumps({"roles": roles, "categories": categories, "selected": selected, "manual_emails": manual_emails})
+            campaign.recipients_json = json.dumps({"roles": roles, "categories": categories, "selected": selected, "manual_emails": manual_emails, "message_format": message_format})
             campaign.attachments_json = json.dumps(attachments)
             db.session.flush()
             addresses = {(user.email or "").strip().lower() for user in users if user.email}

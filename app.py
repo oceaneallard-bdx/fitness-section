@@ -318,6 +318,36 @@ class AppSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(120), unique=True, nullable=False)
     value = db.Column(db.String(500), nullable=True)
+
+
+class StoredDocument(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(20), nullable=False)
+    owner_id = db.Column(db.Integer, nullable=False)
+    slot = db.Column(db.String(40), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    content = db.Column(db.LargeBinary, nullable=False)
+    __table_args__ = (db.UniqueConstraint("kind", "owner_id", "slot"),)
+
+
+class CoachSeniority(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, unique=True, nullable=False)
+    start_date = db.Column(db.Date, nullable=True)
+
+
+class ReplacementInvitation(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    absence_id = db.Column(db.Integer, db.ForeignKey("coach_absence.id", ondelete="CASCADE"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False)
+    kind = db.Column(db.String(20), nullable=False)
+    answer = db.Column(db.String(20), nullable=False, default="pending")
+    email_state = db.Column(db.String(20), nullable=False, default="queued")
+    notes = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    user = db.relationship("User")
+    absence = db.relationship("CoachAbsence")
+    __table_args__ = (db.UniqueConstraint("absence_id", "user_id"),)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -1339,21 +1369,9 @@ def notify_replacement_assigned(absence):
 
 
 def notify_coaches_replacement_needed(absence):
-    subject = "Remplacement à trouver - Section Fitness"
-    body = (
-        "Bonjour,\n\n"
-        f"Un remplacement est recherché pour {absence.coach_name} "
-        f"le {absence.absence_date.strftime('%d/%m/%Y')} ({absence_session_label(absence)}).\n\n"
-        "Merci de répondre via vos canaux habituels (adresse professionnelle / groupe WhatsApp) si vous pouvez assurer ce créneau.\n\n"
-        "Section Fitness"
-    )
-    sent = 0
-    for user in User.query.filter_by(role="coach", coach_type="titulaire").order_by(User.full_name, User.email).all():
-        if user.display_name() == absence.coach_name:
-            continue
-        if send_email(user.email, subject, body):
-            sent += 1
-    return sent
+    count = queue_replacement_round(absence, "titulaire")
+    db.session.commit()
+    return count
 
 
 def admin_email_signature_body(body):
@@ -1736,6 +1754,11 @@ def save_inventory_document(file, prefix):
         return None
     if not allowed_document(file.filename):
         raise ValueError("Format non accepté. Utilisez PDF, image, Word ou Excel.")
+    file.stream.seek(0, 2)
+    size = file.stream.tell()
+    file.stream.seek(0)
+    if not size or size > 5 * 1024 * 1024:
+        raise ValueError("Document vide ou supérieur à 5 Mo.")
     original = secure_filename(file.filename)
     filename = f"{prefix}_{secrets.token_hex(8)}_{original}"
     path = UPLOAD_DIR / filename
@@ -1748,6 +1771,11 @@ def save_useful_document(file):
         raise ValueError("Merci de choisir un document à téléverser.")
     if not allowed_document(file.filename):
         raise ValueError("Format non accepté. Utilisez PDF, image, Word ou Excel.")
+    file.stream.seek(0, 2)
+    size = file.stream.tell()
+    file.stream.seek(0)
+    if not size or size > 5 * 1024 * 1024:
+        raise ValueError("Document vide ou supérieur à 5 Mo.")
     original = secure_filename(file.filename)
     filename = f"infos_utiles_{secrets.token_hex(8)}_{original}"
     path = UPLOAD_DIR / filename
@@ -3007,7 +3035,8 @@ def admin_statistics():
     }
     filter_values = {"start_date": stats_start.isoformat(), "end_date": stats_end.isoformat(), "course_filter": course_filter}
     history = statistics_course_history(stats_start, stats_end, course_filter)
-    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), period_stats=period_stats, course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values, history=history, annual_members=annual_membership_statistics(), scale=scale, selected_year=year, selected_month=month)
+    booking_months = monthly_booking_counts(stats_start, stats_end, course_filter)
+    return render_template_string(TEMPLATE_STATISTICS, stats=stats, preference_stats=preference_stats(), section_stats=section_admin_stats(), period_stats=period_stats, course_rows=course_rows, course_monthly_rows=course_monthly_rows, course_options=course_name_options(), filter_values=filter_values, history=history, annual_members=annual_membership_statistics(), scale=scale, selected_year=year, selected_month=month, booking_months=booking_months, booking_total=sum(row["confirmed"] for row in booking_months))
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -4002,6 +4031,8 @@ def admin_delete_coach(user_id):
     if user.role != "coach":
         flash("Ce compte n'est pas un compte coach.")
         return redirect(url_for("admin_coaches"))
+    ReplacementInvitation.query.filter_by(user_id=user.id).delete()
+    CoachSeniority.query.filter_by(user_id=user.id).delete()
     db.session.delete(user)
     db.session.commit()
     flash("Coach supprimé.")
@@ -4144,6 +4175,7 @@ def delete_coach_absence(absence_id):
         return redirect(url_for("index"))
     coach_name = absence.coach_name
     absence_date = absence.absence_date
+    ReplacementInvitation.query.filter_by(absence_id=absence.id).delete()
     db.session.delete(absence)
     db.session.commit()
     flash("Absence supprimée.")
@@ -4428,6 +4460,8 @@ def useful_info():
             uploaded_by=current_user.display_name(),
         )
         db.session.add(doc)
+        db.session.flush()
+        store_document_upload("useful", doc.id, "file", request.files.get("document_file"))
         db.session.commit()
         flash("Document ajouté aux infos utiles.")
         return redirect(url_for("useful_info"))
@@ -4443,6 +4477,7 @@ def delete_useful_document(document_id):
         return redirect(url_for("useful_info"))
     ensure_useful_documents_schema()
     document = UsefulDocument.query.get_or_404(document_id)
+    StoredDocument.query.filter_by(kind="useful", owner_id=document.id).delete()
     db.session.delete(document)
     db.session.commit()
     flash("Document retiré des infos utiles.")
@@ -4498,6 +4533,8 @@ def shell(content, active=""):
             f'<a class="{"active" if active=="coach_schedule" else ""}" href="{url_for("coach_schedule")}">Planning</a>'
             f'<a class="{"active" if active=="coach_profile" else ""}" href="{url_for("coach_profile")}">Absence</a>'
         )
+    if current_user.is_authenticated and current_user.role == "coach":
+        coach_links += f'<a href="{url_for("coach_replacement_requests")}">Remplacements</a>'
     return f"""
 <!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{BASE_TEMPLATE_STYLE}<title>Section Fitness</title></head>
 <body><div class="layout"><aside class="side">{f'<img class="logo" src="{logo}">' if logo else '<div class="logo"></div>'}<div class="nav">
@@ -5609,7 +5646,7 @@ def admin_coach_planning():
     invoice_rows = coach_monthly_invoice_rows(start, end)
     invoice_detail_rows = coach_invoice_detail_rows(start, end)
     invoice_summary_rows = coach_invoice_summary_rows(start, end)
-    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, coach_options=coach_options, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, invoice_groups=coach_invoice_visual_groups(invoice_detail_rows), year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
+    return render_template_string(TEMPLATE_COACH_PLANNING, sessions=sessions, absences=absences, abs_by_key=abs_by_key, coaches=coaches, coach_options=coach_options, replacement_coaches=coach_replacement_options(), coach_names=coach_names, month_days=month_days, coach_agenda=coach_agenda, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, invoice_groups=coach_invoice_visual_groups(invoice_detail_rows), pending_absences=[a for a in absences if replacement_is_open(a)], resolved_absences=[a for a in absences if not replacement_is_open(a)], year=year, month=month, view_mode=view_mode, start=start, end=end, range_label=range_label, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/admin/coach-absence/<int:absence_id>/followup", methods=["POST"])
@@ -5641,6 +5678,7 @@ def update_coach_absence_followup(absence_id):
                     duplicate.admin_notes = absence.admin_notes
                     duplicate.reviewed_at = absence.reviewed_at
                     duplicate.reviewed_by = absence.reviewed_by
+                    ReplacementInvitation.query.filter_by(absence_id=absence.id).delete()
                     db.session.delete(absence)
                     absence = duplicate
                 else:
@@ -5680,7 +5718,7 @@ def update_coach_absence_followup(absence_id):
     if notify_search:
         sent = notify_coaches_replacement_needed(absence)
         if sent:
-            sent_parts.append(f"{sent} coach(s) contacté(s) pour remplacement")
+            sent_parts.append(f"{sent} sollicitation(s) de coach ajoutée(s) à la file d'envoi")
     flash("Suivi de la demande mis à jour." + (f" Emails : {', '.join(sent_parts)}." if sent_parts else ""))
     return redirect(url_for("admin_coach_planning", view_mode=request.form.get("view_mode", "rolling"), start_date=request.form.get("start_date", ""), end_date=request.form.get("end_date", ""), year=request.form.get("year", absence.absence_date.year), month=request.form.get("month", absence.absence_date.month)))
 
@@ -6252,6 +6290,9 @@ def admin_inventory():
             return redirect(url_for("admin_inventory"))
         item = InventoryItem(name=request.form["name"].strip(), category=request.form.get("category", "").strip(), quantity=int(request.form.get("quantity", 0)), alert_threshold=int(request.form.get("alert_threshold", 1)), unit_cost=float((request.form.get("unit_cost") or "0").replace(",", ".")), acquisition_year=int(request.form.get("acquisition_year") or date.today().year), invoice_file=invoice_file, purchase_request_file=purchase_request_file, notes=request.form.get("notes", "").strip(), updated_at=datetime.utcnow())
         db.session.add(item)
+        db.session.flush()
+        store_document_upload("inventory", item.id, "invoice_file", request.files.get("invoice_file"))
+        store_document_upload("inventory", item.id, "purchase_request_file", request.files.get("purchase_request_file"))
         db.session.commit()
         flash("Article ajouté à l'inventaire.")
         return redirect(url_for("admin_inventory"))
@@ -6849,6 +6890,7 @@ def course_has_ended(session):
 
 def process_deferred_emails():
     """Persist claims before sending: a second worker must not send the same mail."""
+    process_replacement_invitations()
     for notice in DeferredAbsenceEmail.query.filter_by(state="pending").all():
         booking = db.session.get(Booking, notice.booking_id)
         if not booking or booking.status != "absent_unexcused" or booking.user.role == "trial":
@@ -7291,6 +7333,328 @@ TEMPLATE_COACH_PLANNING = re.sub(
 </table></div></details>{% else %}<p class="muted">Aucun cours sur cette période.</p>{% endfor %}</section>""",
     TEMPLATE_COACH_PLANNING, count=1, flags=re.S,
 )
+
+
+def store_document_upload(kind, owner_id, slot, upload):
+    if not upload or not upload.filename:
+        return
+    if not allowed_document(upload.filename):
+        raise ValueError("Format de document non accepté.")
+    upload.stream.seek(0)
+    data = upload.read(5 * 1024 * 1024 + 1)
+    if not data or len(data) > 5 * 1024 * 1024:
+        raise ValueError("Document vide ou supérieur à 5 Mo.")
+    stored = StoredDocument.query.filter_by(kind=kind, owner_id=owner_id, slot=slot).first()
+    if not stored:
+        stored = StoredDocument(kind=kind, owner_id=owner_id, slot=slot)
+        db.session.add(stored)
+    stored.filename = secure_filename(upload.filename)[:255]
+    stored.content = data
+
+
+@app.route("/documents/<kind>/<int:owner_id>/<slot>", methods=["GET", "POST"])
+@login_required
+def managed_document(kind, owner_id, slot):
+    from flask import abort
+    if kind == "inventory" and slot in {"invoice_file", "purchase_request_file"}:
+        if not is_admin():
+            abort(403)
+        owner = InventoryItem.query.get_or_404(owner_id)
+        path = getattr(owner, slot)
+        back = "admin_inventory"
+    elif kind == "useful" and slot == "file":
+        owner = UsefulDocument.query.get_or_404(owner_id)
+        path, back = owner.file_path, "useful_info"
+    else:
+        abort(404)
+    if request.method == "POST":
+        if not is_admin() or not personal_email_csrf_valid():
+            abort(403)
+        try:
+            upload = request.files.get("file")
+            if not upload or not upload.filename:
+                raise ValueError("Choisissez un fichier à remettre en ligne.")
+            store_document_upload(kind, owner.id, slot, upload)
+            if kind == "inventory" and not getattr(owner, slot):
+                setattr(owner, slot, "database/" + secure_filename(upload.filename))
+            db.session.commit()
+            flash("Pièce jointe remplacée et conservée en base de données.")
+        except ValueError as error:
+            db.session.rollback()
+            flash(str(error))
+        return redirect(url_for(back))
+    stored = StoredDocument.query.filter_by(kind=kind, owner_id=owner.id, slot=slot).first()
+    if stored:
+        return send_file(BytesIO(stored.content), as_attachment=True, download_name=stored.filename)
+    candidate = (STATIC_DIR / (path or "")).resolve()
+    if STATIC_DIR.resolve() in candidate.parents and candidate.is_file():
+        # Preserve legacy files in the durable store on their next download.
+        from sqlalchemy.exc import IntegrityError
+        try:
+            with db.session.begin_nested():
+                db.session.add(StoredDocument(kind=kind, owner_id=owner.id, slot=slot, filename=candidate.name, content=candidate.read_bytes()))
+                db.session.flush()
+        except IntegrityError:
+            pass
+        db.session.commit()
+        return send_file(candidate, as_attachment=True, download_name=candidate.name)
+    flash("Cette pièce jointe n'est plus présente sur le serveur. Un admin doit remettre le fichier en ligne depuis cette ligne.")
+    return redirect(url_for(back))
+
+
+@app.route("/admin/coach-invoice.xlsx")
+@login_required
+def export_single_coach_invoice():
+    from flask import abort
+    if not is_admin():
+        abort(403)
+    _, start, end, _, _ = coach_planning_period(request.args)
+    coach = request.args.get("coach", "")
+    groups = coach_invoice_visual_groups(coach_invoice_detail_rows(start, end, coach_filter=coach))
+    group = next((item for item in groups if item["coach"] == coach), None)
+    if not group:
+        abort(404)
+    book = Workbook()
+    summary = book.active
+    summary.title = "Synthèse"
+    summary.append(["Coach", "Début", "Fin", "Heures effectuées", "Heures facturables"])
+    summary.append([coach, start.isoformat(), end.isoformat(), group["total_label"], group["billed_label"]])
+    sheet = book.create_sheet("Cours")
+    sheet.append(["Date", "Cours", "Horaire", "Statut", "Coach initial", "Remplaçant", "Heures effectuées", "Heures facturables", "Notes admin / motif", "Notes coach"])
+    for row in group["rows"]:
+        sheet.append([row["date"].isoformat(), row["cours"], row["horaire"], row["display_status"], row["coach_initial"], row["remplacant"], row["duration_hours"] if row["performed"] else 0, row["billed_hours"] if row["performed"] else 0, row["notes_admin"], row["notes_coach"]])
+    for sheet in book:
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column in sheet.columns:
+            for cell in column:
+                if isinstance(cell.value, str) and cell.value.startswith(("=", "+", "-", "@")):
+                    cell.data_type = "s"
+            sheet.column_dimensions[column[0].column_letter].width = min(60, max(18, max(len(str(cell.value or "")) for cell in column) + 2))
+    output = BytesIO()
+    book.save(output)
+    output.seek(0)
+    return send_file(output, as_attachment=True, download_name=f"facturation_{secure_filename(coach)}_{start}_{end}.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def replacement_is_open(absence):
+    return bool(absence and absence.absence_date >= date.today() and not replacement_is_confirmed(absence)
+                and absence.status != "cancelled" and absence.followup_status != "annule")
+
+
+def queue_replacement_round(absence, kind):
+    if not replacement_is_open(absence):
+        return 0
+    coaches = User.query.filter_by(role="coach", account_status="active", coach_type=kind).all()
+    coaches = [user for user in coaches if user.display_name() != absence.coach_name and not user.email.endswith(".local")]
+    if not coaches and kind == "titulaire":
+        return queue_replacement_round(absence, "remplacant")
+    count = 0
+    for user in coaches:
+        if not ReplacementInvitation.query.filter_by(absence_id=absence.id, user_id=user.id).first():
+            db.session.add(ReplacementInvitation(absence_id=absence.id, user_id=user.id, kind=kind))
+            count += 1
+    return count
+
+
+def process_replacement_invitations():
+    for invitation in ReplacementInvitation.query.filter_by(email_state="queued").order_by(ReplacementInvitation.id).limit(20).all():
+        if not replacement_is_open(invitation.absence) or not invitation.user or invitation.user.account_status != "active":
+            invitation.email_state = "cancelled"
+            db.session.commit()
+            continue
+        claimed = ReplacementInvitation.query.filter_by(id=invitation.id, email_state="queued").update({"email_state": "sending"})
+        db.session.commit()
+        if not claimed:
+            continue
+        base = os.getenv("PUBLIC_BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+        link = base + "/coach/remplacements" if base else "Connectez-vous au site Fitness, rubrique Remplacements."
+        absence = invitation.absence
+        body = (f"Bonjour {invitation.user.display_name()},\n\nÊtes-vous disponible pour remplacer {absence.coach_name} le {absence.absence_date:%d/%m/%Y}, {absence_session_label(absence)} ?\n\n"
+                f"Indiquez votre disponibilité depuis votre espace coach :\n{link}\n\nUne réponse positive ne vaut pas attribution : le bureau confirme le choix du remplaçant.\n\nBureau Fitness")
+        invitation.email_state = "sent" if send_email(invitation.user.email, "Disponibilité pour un remplacement - Section Fitness", body) else "failed"
+        db.session.commit()
+
+
+@app.route("/admin/replacements/<int:absence_id>", methods=["GET", "POST"])
+@login_required
+def replacement_followup(absence_id):
+    from flask import abort
+    if not is_admin():
+        abort(403)
+    absence = CoachAbsence.query.get_or_404(absence_id)
+    if request.method == "POST":
+        if not personal_email_csrf_valid():
+            abort(403)
+        action = request.form.get("action")
+        if not replacement_is_open(absence):
+            flash("Cette recherche est terminée ou le cours est passé.")
+        elif action == "start":
+            queue_replacement_round(absence, "titulaire")
+            db.session.commit()
+            flash("Sollicitation des titulaires enregistrée, sans renvoi des invitations déjà envoyées.")
+        elif action == "escalate":
+            replies = ReplacementInvitation.query.filter_by(absence_id=absence.id, kind="titulaire").all()
+            eligible_titulars = [user for user in User.query.filter_by(role="coach", account_status="active", coach_type="titulaire").all() if user.display_name() != absence.coach_name and not user.email.endswith(".local")]
+            if not replies and eligible_titulars:
+                queue_replacement_round(absence, "titulaire")
+                db.session.commit()
+                flash("Les titulaires doivent être sollicités en premier : leurs invitations viennent d'être enregistrées.")
+            elif any(item.answer == "available" for item in replies):
+                flash("Un titulaire est disponible : choisissez d'abord parmi les titulaires.")
+            elif any(item.answer == "pending" for item in replies) and not request.form.get("reason", "").strip():
+                flash("Des réponses titulaires sont attendues. Renseignez un motif pour passer aux remplaçants sans attendre.")
+            else:
+                queue_replacement_round(absence, "remplacant")
+                if request.form.get("reason", "").strip():
+                    absence.admin_notes = ((absence.admin_notes or "") + "\nPassage aux remplaçants : " + request.form["reason"].strip())[:500]
+                db.session.commit()
+                flash("Sollicitation des remplaçants enregistrée.")
+        elif action == "seniority":
+            user = User.query.filter_by(id=request.form.get("user_id", type=int), role="coach").first_or_404()
+            profile = CoachSeniority.query.filter_by(user_id=user.id).first()
+            if not profile:
+                profile = CoachSeniority(user_id=user.id)
+                db.session.add(profile)
+            try:
+                profile.start_date = date.fromisoformat(request.form["start_date"]) if request.form.get("start_date") else None
+                db.session.commit()
+                flash("Ancienneté mise à jour.")
+            except ValueError:
+                db.session.rollback()
+                flash("Date d'ancienneté invalide.")
+        elif action == "retry":
+            invitation = ReplacementInvitation.query.filter_by(id=request.form.get("invitation_id", type=int), absence_id=absence.id, email_state="failed").first_or_404()
+            invitation.email_state = "queued"
+            db.session.commit()
+        return redirect(url_for("replacement_followup", absence_id=absence.id))
+    invites = ReplacementInvitation.query.filter_by(absence_id=absence.id).all()
+    seniority = {item.user_id: item.start_date for item in CoachSeniority.query.all()}
+    invites.sort(key=lambda item: (item.kind != "titulaire", seniority.get(item.user_id) or date.max, item.user.display_name()))
+    return render_template_string(TEMPLATE_REPLACEMENT_FOLLOWUP, absence=absence, invites=invites, seniority=seniority, csrf_token=personal_email_csrf(), open_search=replacement_is_open(absence))
+
+
+@app.route("/coach/remplacements", methods=["GET", "POST"])
+@login_required
+def coach_replacement_requests():
+    from flask import abort
+    if current_user.role != "coach":
+        abort(403)
+    if request.method == "POST":
+        if not personal_email_csrf_valid():
+            abort(403)
+        invite = ReplacementInvitation.query.filter_by(id=request.form.get("invitation_id", type=int), user_id=current_user.id).first_or_404()
+        answer = request.form.get("answer")
+        if answer in {"available", "unavailable"} and replacement_is_open(invite.absence):
+            invite.answer = answer
+            invite.notes = request.form.get("notes", "")[:500]
+            db.session.flush()
+            titular = ReplacementInvitation.query.filter_by(absence_id=invite.absence_id, kind="titulaire").all()
+            if titular and all(item.answer == "unavailable" for item in titular):
+                queue_replacement_round(invite.absence, "remplacant")
+            db.session.commit()
+            flash("Disponibilité enregistrée. Le bureau confirme l'attribution du remplacement.")
+        return redirect(url_for("coach_replacement_requests"))
+    invites = ReplacementInvitation.query.filter_by(user_id=current_user.id).order_by(ReplacementInvitation.id.desc()).all()
+    return render_template_string(TEMPLATE_REPLACEMENT_REQUESTS, invites=[item for item in invites if replacement_is_open(item.absence)], csrf_token=personal_email_csrf())
+
+
+@app.context_processor
+def inject_admin_update_helpers():
+    return {"secure_action_token": personal_email_csrf}
+
+
+MEMBER_DIRECTORY_TABLE = """
+<details style="margin:12px 0"><summary class="btn secondary">Colonnes visibles</summary><div id="member-column-controls" style="display:flex;gap:16px;flex-wrap:wrap;padding:12px 0"></div><button type="button" class="btn secondary" id="reset-member-columns">Tout afficher</button></details>
+<div style="overflow:auto"><table class="table" id="member-directory"><thead><tr>
+<th data-col="selection"><input type="checkbox" aria-label="Sélectionner les lignes visibles" id="select-visible-members"></th>
+{% for key, label in [('photo','Photo'),('name','Nom'),('email','Email'),('status','Statut'),('profile','Profil'),('subscription','Abonnement'),('year','Année'),('absences','Absences 90j'),('transition','Changement email'),('account','Compte'),('blocked','Blocage'),('actions','Actions')] %}<th data-col="{{ key }}" data-label="{{ label }}">{{ label }}</th>{% endfor %}</tr>
+<tr id="member-column-filters"><th data-col="selection"></th>{% for key, label in [('photo','Photo'),('name','Nom'),('email','Email'),('status','Statut'),('profile','Profil'),('subscription','Abonnement'),('year','Année'),('absences','Absences 90j'),('transition','Changement email'),('account','Compte'),('blocked','Blocage'),('actions','Actions')] %}<th data-col="{{ key }}">{% if key not in ['photo','actions'] %}{% if key in ['name','email'] %}<input type="search" data-filter="{{ key }}" aria-label="Filtrer {{ label }}" placeholder="Filtrer" style="min-width:130px;width:100%">{% else %}<select data-filter="{{ key }}" aria-label="Filtrer {{ label }}"><option value="">Tous</option></select>{% endif %}{% endif %}</th>{% endfor %}</tr></thead>
+<tbody>{% for u in users %}<tr data-member-row><td data-col="selection"><input class="member-check" type="checkbox" name="user_ids" value="{{ u.id }}"></td>
+<td data-col="photo">{% if u.profile_photo or u.profile_photo_data %}<img class="admin-photo" src="{{ url_for('profile_photo_file', user_id=u.id) }}" alt="Photo {{ u.display_name() }}">{% else %}-{% endif %}</td>
+<td data-col="name">{{ u.display_name() }}</td><td data-col="email">{{ u.email }}</td><td data-col="status">{{ u.status }}</td><td data-col="profile">{{ member_profile_labels.get(u.member_profile, u.member_profile or '-') }}{% if u.rights_holder_name %}<br><small>{{ u.rights_holder_name }}</small>{% endif %}</td><td data-col="subscription">{{ u.subscription_type or '-' }}</td><td data-col="year">{{ u.subscription_year or '-' }}</td><td data-col="absences">{{ absence_count(u) }}</td><td data-col="transition">{{ email_change_labels[email_statuses.get(u.id, 'other')] }}</td><td data-col="account">{{ {'active':'Actif','pending':'Activation à faire','archived':'Archivé'}.get(u.account_status,u.account_status) }}</td><td data-col="blocked">{{ "Bloqué jusqu'au " ~ u.blocked_until if u.is_blocked() else 'Non bloqué' }}</td>
+<td data-col="actions"><a class="btn secondary" href="{{ url_for('admin_edit_member', user_id=u.id) }}">Gérer le profil</a> <a class="btn secondary" href="{{ url_for('admin_member_reservations', user_id=u.id) }}">Gérer les réservations</a> <a class="btn secondary" href="{{ url_for('member_communication', user_id=u.id) }}">Communication</a> <a class="btn secondary" href="{{ url_for('download_card', user_id=u.id) }}">Carte</a>{% if u.role == 'adherent' %} <a class="btn danger" href="{{ url_for('admin_delete_member', user_id=u.id) }}" onclick="return confirm('Supprimer cet adhérent ?')">Supprimer</a>{% endif %}</td></tr>{% else %}<tr><td colspan="13">Aucun adhérent.</td></tr>{% endfor %}</tbody></table></div>
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+const table=document.getElementById('member-directory'), rows=Array.from(table.querySelectorAll('[data-member-row]'));
+const key='fitness-member-columns:{{ current_user.id }}';let hidden=[];
+try{hidden=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(hidden))hidden=[];}catch(e){}
+const normal=value=>value.trim().toLocaleLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'');
+const text=(row,col)=>{const cell=row.querySelector('[data-col="'+col+'"]');return cell.dataset.filterValue||cell.textContent.trim();};
+function filter(){const controls=Array.from(table.querySelectorAll('[data-filter]'));rows.forEach(row=>{row.hidden=!controls.every(control=>!control.value||(control.tagName==='SELECT'?text(row,control.dataset.filter)===control.value:normal(text(row,control.dataset.filter)).includes(normal(control.value))));});}
+table.querySelectorAll('select[data-filter]').forEach(control=>{Array.from(new Set(rows.map(row=>text(row,control.dataset.filter)))).sort((a,b)=>a.localeCompare(b,'fr',{numeric:true})).forEach(value=>{const option=document.createElement('option');option.value=value;option.textContent=value;control.appendChild(option);});});
+table.querySelectorAll('[data-filter]').forEach(control=>{control.addEventListener('input',filter);control.addEventListener('change',filter);control.addEventListener('keydown',event=>{if(event.key==='Enter')event.preventDefault();});});
+function columns(){table.querySelectorAll('[data-col]').forEach(cell=>{cell.hidden=hidden.includes(cell.dataset.col);});try{localStorage.setItem(key,JSON.stringify(hidden));}catch(e){}}
+const panel=document.getElementById('member-column-controls');table.querySelectorAll('thead tr:first-child th[data-label]').forEach(cell=>{const label=document.createElement('label'),box=document.createElement('input');box.type='checkbox';box.checked=!hidden.includes(cell.dataset.col);box.dataset.column=cell.dataset.col;label.append(box,document.createTextNode(' '+cell.dataset.label));panel.appendChild(label);box.addEventListener('change',()=>{hidden=hidden.filter(col=>col!==cell.dataset.col);if(!box.checked)hidden.push(cell.dataset.col);const control=table.querySelector('[data-filter="'+cell.dataset.col+'"]');if(!box.checked&&control)control.value='';filter();columns();});});
+document.getElementById('reset-member-columns').addEventListener('click',()=>{hidden=[];panel.querySelectorAll('input').forEach(box=>box.checked=true);columns();});
+document.getElementById('select-visible-members').addEventListener('change',event=>{rows.filter(row=>!row.hidden).forEach(row=>{const box=row.querySelector('.member-check');box.checked=event.target.checked;box.dispatchEvent(new Event('change'));});});columns();
+const emailForm=document.getElementById('member-email-form');if(emailForm)emailForm.addEventListener('submit',event=>{const saved=typeof selectedMemberIds==='function'?selectedMemberIds().size:0;if(!saved&&!table.querySelector('.member-check:checked')){event.preventDefault();alert('Sélectionnez au moins un adhérent.');}});
+});</script>
+"""
+TEMPLATE_MEMBERS = re.sub(r'<table class="table"><tr><th><input type="checkbox".*?</table>', lambda match: MEMBER_DIRECTORY_TABLE, TEMPLATE_MEMBERS, count=1, flags=re.S)
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('<td data-col="profile">', '<td data-col="profile" data-filter-value="{{ member_profile_labels.get(u.member_profile, u.member_profile or \'-\') }}">')
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('<div style="overflow:auto"><table class="table" id="member-directory">', '<style>.main{min-width:0}#member-directory input,#member-directory select{max-width:100%}</style><div style="overflow:auto;max-width:100%"><table class="table" id="member-directory">')
+TEMPLATE_MEMBERS = TEMPLATE_MEMBERS.replace('Nom, email, ID, ouvrant droit', 'Nom, prénom, email, ouvrant droit')
+TEMPLATE_CAMPAIGN_EDITOR = TEMPLATE_CAMPAIGN_EDITOR.replace('''<a class="btn secondary" href="{{ url_for('campaign_delivery_detail', campaign_id=item.id) }}">Suivi des destinataires</a> ''', '')
+
+
+TEMPLATE_REPLACEMENT_FOLLOWUP = """
+{% set content %}<h1>Recherche de remplacement</h1><h2>{{ absence.coach_name }} · {{ absence.absence_date.strftime('%d/%m/%Y') }} · {{ absence_session_label(absence) }}</h2>
+{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}
+<a class="btn secondary" href="{{ url_for('admin_coach_planning', view_mode='month', year=absence.absence_date.year, month=absence.absence_date.month) }}">Retour au planning</a>
+<p>Priorité aux titulaires, puis aux remplaçants. Les réponses sont triées par date d'ancienneté renseignée ; le bureau décide de l'attribution.</p>
+{% if open_search %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn" name="action" value="start">Solliciter les titulaires</button></form>
+<form method="post" style="margin:16px 0"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Motif si réponses titulaires encore attendues <input name="reason" maxlength="300"></label> <button class="btn secondary" name="action" value="escalate">Solliciter les remplaçants</button></form>{% else %}<div class="flash">Recherche terminée ou cours passé : {{ absence_display_label(absence) }} {{ absence.replacement_name or '' }}.</div>{% endif %}
+<div style="overflow:auto"><table class="table"><tr><th>Coach</th><th>Groupe</th><th>Ancienneté depuis</th><th>Réponse</th><th>Email</th><th>Notes</th><th>Décision admin</th></tr>
+{% for invite in invites %}<tr><td>{{ invite.user.display_name() }}</td><td>{{ invite.kind }}</td><td><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="seniority"><input type="hidden" name="user_id" value="{{ invite.user_id }}"><input name="start_date" type="date" value="{{ seniority[invite.user_id].isoformat() if seniority.get(invite.user_id) else '' }}"><button type="submit" class="btn secondary">Enregistrer</button></form></td><td>{{ {'pending':'En attente','available':'Disponible','unavailable':'Indisponible'}.get(invite.answer,invite.answer) }}</td><td>{{ {'queued':'À envoyer','sent':'Accepté par le serveur','failed':'Échec','sending':'En cours / incertain','cancelled':'Annulé'}.get(invite.email_state,invite.email_state) }}{% if invite.email_state == 'failed' and open_search %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="invitation_id" value="{{ invite.id }}"><button name="action" value="retry" class="btn secondary">Réessayer</button></form>{% endif %}</td><td>{{ invite.notes or '-' }}</td><td>{% if invite.answer == 'available' and open_search %}<form method="post" action="{{ url_for('update_coach_absence_followup', absence_id=absence.id) }}"><input type="hidden" name="replacement_name" value="{{ invite.user.display_name() }}"><input type="hidden" name="followup_status" value="remplacement_trouve"><input type="hidden" name="admin_notes" value="{{ absence.admin_notes or '' }}"><input type="hidden" name="year" value="{{ absence.absence_date.year }}"><input type="hidden" name="month" value="{{ absence.absence_date.month }}"><button class="btn" type="submit">Attribuer ce remplacement</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="7">Aucun coach sollicité pour le moment.</td></tr>{% endfor %}</table></div>
+{% endset %}{{ shell(content, 'coach_planning')|safe }}
+"""
+TEMPLATE_REPLACEMENT_REQUESTS = """
+{% set content %}<h1>Demandes de remplacement</h1>{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}
+{% for invite in invites %}<section style="padding:16px 0;border-bottom:1px solid #ddd"><h2>{{ invite.absence.absence_date.strftime('%d/%m/%Y') }} · {{ invite.absence.coach_name }}</h2><p>{{ absence_session_label(invite.absence) }}</p><p>Votre réponse : {{ {'pending':'En attente','available':'Disponible','unavailable':'Indisponible'}.get(invite.answer,invite.answer) }}</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="invitation_id" value="{{ invite.id }}"><label>Note <input name="notes" maxlength="500" value="{{ invite.notes or '' }}"></label> <button class="btn" name="answer" value="available">Disponible</button> <button class="btn secondary" name="answer" value="unavailable">Indisponible</button></form><p class="muted">Le bureau confirme l'attribution ; votre disponibilité ne modifie pas le planning à elle seule.</p></section>{% else %}<p>Aucune demande ouverte.</p>{% endfor %}
+{% endset %}{{ shell(content, 'replacement_requests')|safe }}
+"""
+
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace('<details open style="border-bottom:1px solid #d1d5db;padding:18px 0"><summary style="cursor:pointer">', '<details class="coach-invoice" style="border-bottom:1px solid #d1d5db;padding:18px 0"><summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span style="flex:1;min-width:220px">')
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace('{{ group.cancelled }} cours annulé(s)</span></summary>', '''{{ group.cancelled }} cours annulé(s)</span></span><a class="btn secondary" onclick="event.stopPropagation()" href="{{ url_for('export_single_coach_invoice', coach=group.coach, view_mode='range', start_date=start.isoformat(), end_date=end.isoformat()) }}">Excel</a><span class="invoice-chevron" aria-hidden="true">▾</span></summary>''')
+TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace('{% set content %}', '{% set content %}<style>.coach-invoice summary::-webkit-details-marker{display:none}.coach-invoice[open] .invoice-chevron{transform:rotate(180deg)}.invoice-chevron{margin-left:auto;font-size:24px}</style>', 1)
+_followup_start = TEMPLATE_COACH_PLANNING.find('<h2>Suivi des absences / congés</h2>')
+if _followup_start >= 0:
+    _followup_end = TEMPLATE_COACH_PLANNING.find('</table>', _followup_start) + len('</table>')
+    _followup = TEMPLATE_COACH_PLANNING[_followup_start:_followup_end]
+    _pending = _followup.replace('Suivi des absences / congés', 'Remplacements à trouver').replace('{% for a in absences %}', '{% for a in pending_absences %}')
+    _pending = _pending.replace("{{ a.notes or '' }}", '''{{ a.notes or '' }}<br><a class="btn secondary" href="{{ url_for('replacement_followup', absence_id=a.id) }}">Recherche et réponses coachs</a>''')
+    _resolved = '<details><summary class="btn secondary">Absences traitées / passées</summary>' + _followup.replace('{% for a in absences %}', '{% for a in resolved_absences %}') + '</details>'
+    TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING[:_followup_start] + _resolved + TEMPLATE_COACH_PLANNING[_followup_end:]
+    TEMPLATE_COACH_PLANNING = TEMPLATE_COACH_PLANNING.replace('<section><h2>Récapitulatif mensuel facturation</h2>', '{% if pending_absences %}<section style="overflow:auto">' + _pending + '</section>{% endif %}<section><h2>Récapitulatif mensuel facturation</h2>', 1)
+
+_inventory_documents = '''<td>{% for slot, label in [('invoice_file','Facture'),('purchase_request_file','Demande CSE')] %}<div style="margin-bottom:10px">{% if i[slot] %}<a class="btn secondary" href="{{ url_for('managed_document', kind='inventory', owner_id=i.id, slot=slot) }}">Télécharger {{ label }}</a>{% endif %}<details><summary>Remettre {{ label }}</summary><form method="post" enctype="multipart/form-data" action="{{ url_for('managed_document', kind='inventory', owner_id=i.id, slot=slot) }}"><input type="hidden" name="csrf_token" value="{{ secure_action_token() }}"><input type="file" name="file" required><button class="btn secondary" type="submit">Remettre en ligne</button></form></details></div>{% endfor %}</td>'''
+TEMPLATE_INVENTORY = re.sub(r'<td>\{% if i.invoice_file %\}.*?</td>', lambda match: _inventory_documents, TEMPLATE_INVENTORY, count=1, flags=re.S)
+TEMPLATE_USEFUL_INFO = TEMPLATE_USEFUL_INFO.replace("{{ url_for('static', filename=d.file_path) }}", "{{ url_for('managed_document', kind='useful', owner_id=d.id, slot='file') }}").replace('target="_blank">Ouvrir</a>', '>Télécharger</a>')
+TEMPLATE_USEFUL_INFO = TEMPLATE_USEFUL_INFO.replace("{% if current_user.role == 'admin' %} <a class=\"btn danger\"", '''{% if current_user.role == 'admin' %}<details><summary>Remplacer la pièce jointe</summary><form method="post" enctype="multipart/form-data" action="{{ url_for('managed_document', kind='useful', owner_id=d.id, slot='file') }}"><input type="hidden" name="csrf_token" value="{{ secure_action_token() }}"><input type="file" name="file" required><button type="submit" class="btn secondary">Remettre en ligne</button></form></details> <a class="btn danger"''')
+
+
+def monthly_booking_counts(start, end, filters):
+    rows = {}
+    cursor = start.replace(day=1)
+    while cursor <= end:
+        rows[cursor.strftime("%Y-%m")] = {"month": cursor.strftime("%m/%Y"), "confirmed": 0, "registrations": 0, "waiting": 0, "cancelled": 0}
+        cursor = date(cursor.year + (cursor.month == 12), cursor.month % 12 + 1, 1)
+    sessions = filtered_sessions_query(start, end, filters).all()
+    for session in sessions:
+        row = rows[session.course_date.strftime("%Y-%m")]
+        for booking in session.bookings:
+            if booking.user.role not in {"adherent", "admin"}:
+                continue
+            row["registrations"] += 1
+            row["confirmed"] += booking.status in {"booked", "absent_unexcused"}
+            row["waiting"] += booking.status == "waiting_list"
+            row["cancelled"] += booking.status == "cancelled"
+    return list(rows.values())
+
+
+TEMPLATE_STATISTICS = TEMPLATE_STATISTICS.replace('<h2>Historique des cours</h2>', '''<h2>Réservations sur la période : {{ booking_total }}</h2><p class="muted">Réservations confirmées, hors annulations et liste d'attente. Répartition selon le mois du cours, pas la date du clic de réservation.</p><table class="table"><tr><th>Mois du cours</th><th>Réservations confirmées</th><th>Inscriptions totales</th><th>En attente</th><th>Annulées</th></tr>{% for month in booking_months %}<tr><td>{{ month.month }}</td><td>{{ month.confirmed }}</td><td>{{ month.registrations }}</td><td>{{ month.waiting }}</td><td>{{ month.cancelled }}</td></tr>{% endfor %}</table><br><details id="course-history"><summary class="btn secondary">Archives · Historique des cours</summary>''', 1)
+TEMPLATE_STATISTICS = TEMPLATE_STATISTICS.replace('Aucun cours terminé sur cette période.</p>{% endfor %}</section>', 'Aucun cours terminé sur cette période.</p>{% endfor %}</details></section>', 1)
 
 
 if __name__ == "__main__":

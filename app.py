@@ -4161,9 +4161,10 @@ def coach_schedule():
             else:
                 replacements.append({"absence": absence, "session": None})
     invoice_rows = coach_monthly_invoice_rows(start, end, coach_filter=current_user.display_name())
-    invoice_detail_rows = coach_invoice_detail_rows(start, end, coach_filter=current_user.display_name())
+    invoice_detail_rows = personal_coach_invoice_details(current_user, start, end)
     invoice_summary_rows = coach_invoice_summary_rows(start, end, coach_filter=current_user.display_name())
-    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
+    invoice_groups = coach_invoice_visual_groups(invoice_detail_rows) or [{"coach": current_user.display_name(), "rows": [], "total_label": "0h", "billed_label": "0h", "performed_count": 0, "replacements": 0, "cancelled": 0}]
+    return render_template_string(TEMPLATE_COACH_SCHEDULE, sessions=sessions, replacements=replacements, abs_by_key=abs_by_key, invoice_rows=invoice_rows, invoice_detail_rows=invoice_detail_rows, invoice_summary_rows=invoice_summary_rows, invoice_groups=invoice_groups, start=start, end=end, year=year, month=month, weekday_labels=WEEKDAY_LABELS)
 
 
 @app.route("/coach/profile/delete/<int:absence_id>")
@@ -7414,6 +7415,11 @@ def export_single_coach_invoice():
     group = next((item for item in groups if item["coach"] == coach), None)
     if not group:
         abort(404)
+    return invoice_excel_response(group, start, end)
+
+
+def invoice_excel_response(group, start, end):
+    coach = group["coach"]
     book = Workbook()
     summary = book.active
     summary.title = "Synthèse"
@@ -7655,6 +7661,42 @@ def monthly_booking_counts(start, end, filters):
 
 TEMPLATE_STATISTICS = TEMPLATE_STATISTICS.replace('<h2>Historique des cours</h2>', '''<h2>Réservations sur la période : {{ booking_total }}</h2><p class="muted">Réservations confirmées, hors annulations et liste d'attente. Répartition selon le mois du cours, pas la date du clic de réservation.</p><table class="table"><tr><th>Mois du cours</th><th>Réservations confirmées</th><th>Inscriptions totales</th><th>En attente</th><th>Annulées</th></tr>{% for month in booking_months %}<tr><td>{{ month.month }}</td><td>{{ month.confirmed }}</td><td>{{ month.registrations }}</td><td>{{ month.waiting }}</td><td>{{ month.cancelled }}</td></tr>{% endfor %}</table><br><details id="course-history"><summary class="btn secondary">Archives · Historique des cours</summary>''', 1)
 TEMPLATE_STATISTICS = TEMPLATE_STATISTICS.replace('Aucun cours terminé sur cette période.</p>{% endfor %}</section>', 'Aucun cours terminé sur cette période.</p>{% endfor %}</details></section>', 1)
+
+
+def personal_coach_invoice_details(user, start, end):
+    identities = coach_identity_names(user)
+    details = []
+    for source in coach_invoice_detail_rows(start, end):
+        if source["coach"] in identities:
+            row = dict(source)
+            row["coach"] = user.display_name()
+            if row.get("coach_initial") in identities:
+                row["coach_initial"] = user.display_name()
+            if row.get("remplacant") in identities:
+                row["remplacant"] = user.display_name()
+            details.append(row)
+    return details
+
+
+@app.route("/coach/facturation.xlsx")
+@login_required
+def export_personal_coach_invoice():
+    from flask import abort
+    if current_user.role != "coach":
+        abort(403)
+    if request.args.get("coach") and request.args["coach"] not in coach_identity_names(current_user):
+        abort(403)
+    _, start, end, _, _ = coach_planning_period(request.args)
+    groups = coach_invoice_visual_groups(personal_coach_invoice_details(current_user, start, end))
+    group = groups[0] if groups else {"coach": current_user.display_name(), "rows": [], "total_label": "0h", "billed_label": "0h"}
+    return invoice_excel_response(group, start, end)
+
+
+_invoice_section = re.search(r'<section><h2>Récapitulatif mensuel facturation</h2>.*?</section>', TEMPLATE_COACH_PLANNING, flags=re.S)
+if _invoice_section:
+    _personal_invoice_section = _invoice_section.group(0).replace("'export_single_coach_invoice'", "'export_personal_coach_invoice'")
+    _personal_invoice_section = '<style>.coach-invoice summary::-webkit-details-marker{display:none}.coach-invoice[open] .invoice-chevron{transform:rotate(180deg)}.invoice-chevron{margin-left:auto;font-size:24px}</style>' + _personal_invoice_section
+    TEMPLATE_COACH_SCHEDULE = re.sub(r'<div class="card" style="box-shadow:none;background:#f9fafb"><h2>Récapitulatif mensuel facturation</h2>.*?</details></div>', lambda match: _personal_invoice_section, TEMPLATE_COACH_SCHEDULE, count=1, flags=re.S)
 
 
 if __name__ == "__main__":
